@@ -28,17 +28,47 @@ enum Field {
     Type,
 }
 
+/// The fields a term can name, in the order completion offers them.
+const FIELD_NAMES: [(&str, Field); 4] = [
+    ("title", Field::Title),
+    ("repo", Field::Repository),
+    ("reason", Field::Reason),
+    ("type", Field::Type),
+];
+
 impl Field {
     /// The field `name` stands for in `name:text`, ignoring case.
     fn named(name: &str) -> Option<Self> {
-        match name.to_ascii_lowercase().as_str() {
-            "title" => Some(Self::Title),
-            "repo" => Some(Self::Repository),
-            "reason" => Some(Self::Reason),
-            "type" => Some(Self::Type),
-            _ => None,
+        FIELD_NAMES
+            .iter()
+            .find(|(field_name, _)| field_name.eq_ignore_ascii_case(name))
+            .map(|&(_, field)| field)
+    }
+}
+
+/// The ways the last word of `input` can be completed, each as the whole input with that word completed, in the
+/// order to offer them: the `field:` prefixes the word could be the start of, ignoring case. None when the word
+/// can't start a field: it has a `:` or a `"` already (a word inside quotes has the opening one).
+pub fn completions(input: &str) -> Vec<String> {
+    let mut word_start = 0;
+    let mut in_quotes = false;
+    for (at, character) in input.char_indices() {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => word_start = at + c.len_utf8(),
+            _ => {}
         }
     }
+    let (before, word) = input.split_at(word_start);
+    if word.contains([':', '"']) {
+        return Vec::new();
+    }
+    let word = word.to_ascii_lowercase();
+    FIELD_NAMES
+        .iter()
+        .filter(|(name, _)| name.starts_with(&word))
+        .map(|(name, _)| format!("{before}{name}:"))
+        .collect()
 }
 
 impl Search {
@@ -179,6 +209,42 @@ mod tests {
         assert!(matches(r#"title:"polling to""#));
         assert!(!matches(r#"title:"polling inbox""#));
         assert!(matches(r#"title:"add poll"#), "unclosed while typing");
+    }
+
+    #[test]
+    fn completion_offers_the_fields_a_word_could_start() {
+        let fields = ["title:", "repo:", "reason:", "type:"];
+        assert_eq!(completions(""), fields);
+        assert_eq!(completions("re"), ["repo:", "reason:"]);
+        assert_eq!(completions("TI"), ["title:"]);
+        assert_eq!(completions("title"), ["title:"]);
+        assert_eq!(completions("poll t"), ["poll title:", "poll type:"]);
+        assert_eq!(
+            completions("poll "),
+            fields.map(|field| format!("poll {field}"))
+        );
+        assert_eq!(
+            completions(r#"title:"add polling" r"#),
+            [
+                r#"title:"add polling" repo:"#,
+                r#"title:"add polling" reason:"#
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_offers_nothing_where_no_field_can_start() {
+        for input in [
+            "poll",
+            "title:",
+            "title:po",
+            "fix:",
+            r#""add "#,
+            r#"title:"add po"#,
+            r#""quoted""#,
+        ] {
+            assert!(completions(input).is_empty(), "{input:?}");
+        }
     }
 
     #[test]

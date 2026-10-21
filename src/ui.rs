@@ -19,7 +19,7 @@ use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::github::GitHub;
 use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
-use crate::search::Search;
+use crate::search::{self, Search};
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: u16 = 32;
@@ -201,19 +201,31 @@ const HELP_ORDER: [Command; 13] = [
     Command::Quit,
 ];
 
-/// What the help says about typing in the search prompt, where keys work differently.
-const SEARCH_PROMPT_HELP: &str =
-    "In the search prompt: Enter keeps it, Esc puts back the one before.";
+/// The keys that work differently in the search prompt, as the help lists them after the commands.
+const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
+    KeyHelp {
+        keys: "Tab  Shift-Tab",
+        does: "complete a field's name, or the next or previous one",
+    },
+    KeyHelp {
+        keys: "Enter",
+        does: "keep the search",
+    },
+    KeyHelp {
+        keys: "Esc",
+        does: "put back the search there was before",
+    },
+];
 
-/// A command's line in the help.
-struct CommandHelp {
-    /// The keys for the command, separated by two spaces.
+/// A line in the help.
+struct KeyHelp {
+    /// The keys, separated by two spaces.
     keys: &'static str,
     does: &'static str,
 }
 
 impl Command {
-    fn help(self) -> CommandHelp {
+    fn help(self) -> KeyHelp {
         let (keys, does) = match self {
             Self::SelectNext => ("j  ↓", "select the next Notification"),
             Self::SelectPrevious => ("k  ↑", "select the previous Notification"),
@@ -229,7 +241,7 @@ impl Command {
             Self::Help => ("?", "show these keys"),
             Self::Quit => ("q  Ctrl-C", "quit"),
         };
-        CommandHelp { keys, does }
+        KeyHelp { keys, does }
     }
 }
 
@@ -307,6 +319,23 @@ struct App {
 struct SearchPrompt {
     /// The Search input when the prompt opened, put back if the user cancels.
     input_before: String,
+    /// The ways to complete the word being typed, while the user goes through them with Tab and Shift-Tab.
+    completion: Option<Completion>,
+}
+
+/// The ways to complete the word being typed, and the one in the input now.
+struct Completion {
+    /// Each a whole input, as [`search::completions`] gives them; never empty.
+    inputs: Vec<String>,
+    /// Index into `inputs`.
+    at: usize,
+}
+
+/// Which way Tab and Shift-Tab go through the completions.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Next,
+    Previous,
 }
 
 impl App {
@@ -385,10 +414,18 @@ impl App {
     }
 
     /// Edits the Search in the prompt with `key`, the View on screen narrowing as it changes. A character adds to
-    /// it and Backspace takes the last one off; Enter closes the prompt, keeping the Search, and Esc closes it,
+    /// it and Backspace takes the last one off; Tab and Shift-Tab complete the word being typed, going through the
+    /// ways to complete it when pressed again; Enter closes the prompt, keeping the Search, and Esc closes it,
     /// putting back the Search there was before.
     fn type_search(&mut self, key: KeyEvent) {
+        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && let Some(prompt) = &mut self.search_prompt
+        {
+            prompt.completion = None;
+        }
         match key.code {
+            KeyCode::Tab => self.complete(Step::Next),
+            KeyCode::BackTab => self.complete(Step::Previous),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -411,6 +448,37 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Completes the word being typed with the first (`Step::Next`) or last way to, or goes on to the next or
+    /// previous way if the user is going through them already. Does nothing if the word can't be completed.
+    fn complete(&mut self, step: Step) {
+        let Some(prompt) = &mut self.search_prompt else {
+            return;
+        };
+        let completion = match &mut prompt.completion {
+            Some(completion) => {
+                let count = completion.inputs.len();
+                completion.at = match step {
+                    Step::Next => (completion.at + 1) % count,
+                    Step::Previous => (completion.at + count - 1) % count,
+                };
+                completion
+            }
+            None => {
+                let inputs = search::completions(&self.search_input);
+                let at = match step {
+                    Step::Next => 0,
+                    Step::Previous => inputs.len().saturating_sub(1),
+                };
+                if inputs.is_empty() {
+                    return;
+                }
+                prompt.completion.insert(Completion { inputs, at })
+            }
+        };
+        let input = completion.inputs[completion.at].clone();
+        self.set_search(input);
     }
 
     /// Runs `change`, keeping each View's selection on the same Notification if the View still shows it.
@@ -481,6 +549,7 @@ impl App {
             Command::Search => {
                 self.search_prompt = Some(SearchPrompt {
                     input_before: self.search_input.clone(),
+                    completion: None,
                 });
                 None
             }
@@ -619,11 +688,26 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        if self.is_typing_search() {
-            let prompt = format!("/{}", self.search_input);
-            let width = u16::try_from(prompt.chars().count()).unwrap_or(u16::MAX);
+        if let Some(prompt) = &self.search_prompt {
+            let typed = format!("/{}", self.search_input);
+            let width = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
-            frame.render_widget(Line::from(prompt), area);
+            let mut spans = vec![Span::raw(typed)];
+            // The completed words to go through, the one in the input highlighted.
+            if let Some(completion) = &prompt.completion {
+                spans.push(Span::raw("  "));
+                for (index, input) in completion.inputs.iter().enumerate() {
+                    let word = input.rsplit(char::is_whitespace).next().unwrap_or(input);
+                    let word = Span::raw(word.to_owned());
+                    spans.push(if index == completion.at {
+                        word.reversed()
+                    } else {
+                        word.dim()
+                    });
+                    spans.push(Span::raw(" "));
+                }
+            }
+            frame.render_widget(Line::from(spans), area);
             return;
         }
         let status = match &self.status {
@@ -667,22 +751,22 @@ impl App {
 
 /// Draws the help over the middle of `frame`: every command's keys and what it does.
 fn render_help(frame: &mut Frame) {
-    let keys_width = HELP_ORDER
+    let commands: Vec<KeyHelp> = HELP_ORDER.iter().map(|command| command.help()).collect();
+    let keys_width = commands
         .iter()
-        .map(|command| command.help().keys.chars().count())
+        .chain(&SEARCH_PROMPT_HELP)
+        .map(|help| help.keys.chars().count())
         .max()
         .unwrap_or(0);
-    let mut lines: Vec<Line> = HELP_ORDER
-        .iter()
-        .map(|command| {
-            let help = command.help();
-            Line::from(vec![
-                Span::raw(format!("{:keys_width$}  ", help.keys)).bold(),
-                Span::raw(help.does),
-            ])
-        })
-        .collect();
-    lines.extend([Line::default(), Line::from(SEARCH_PROMPT_HELP).dim()]);
+    let line = |help: &KeyHelp| {
+        Line::from(vec![
+            Span::raw(format!("{:keys_width$}  ", help.keys)).bold(),
+            Span::raw(help.does),
+        ])
+    };
+    let mut lines: Vec<Line> = commands.iter().map(line).collect();
+    lines.extend([Line::default(), Line::from("In the search prompt:").dim()]);
+    lines.extend(SEARCH_PROMPT_HELP.iter().map(line));
 
     // Two cells of border and two of padding around the text.
     let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
@@ -1385,6 +1469,64 @@ mod tests {
     }
 
     #[test]
+    fn tab_goes_through_the_fields_a_word_could_start() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "re");
+
+        assert!(app.press(key_named("Tab")).is_none());
+        assert_eq!(app.search_input, "repo:");
+        assert_eq!(app.current, 0, "Tab completes rather than switching Views");
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with("/repo:  repo: reason: "), "{lines:#?}");
+
+        type_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_input, "reason:");
+        type_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_input, "repo:", "wraps around");
+        type_key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.search_input, "reason:");
+
+        type_text(&mut app, "review");
+        assert!(
+            !screen(&mut app)[4].contains("repo:"),
+            "done going through them"
+        );
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
+        type_key(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.search_input, "reason:review",
+            "nothing to complete after a field"
+        );
+    }
+
+    #[test]
+    fn shift_tab_starts_from_the_last_field() {
+        let mut app = app();
+        app.execute(Command::Search);
+
+        type_key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.search_input, "type:");
+        type_key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.search_input, "reason:");
+        type_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_input, "type:");
+    }
+
+    #[test]
+    fn tab_with_nothing_to_complete_changes_nothing() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "poll");
+
+        type_key(&mut app, KeyCode::Tab);
+
+        assert_eq!(app.search_input, "poll");
+        assert!(app.is_typing_search());
+        assert_eq!(screen(&mut app)[4].trim_end(), "/poll");
+    }
+
+    #[test]
     fn selection_stays_put_while_the_search_still_shows_it() {
         let mut app = app();
         app.execute(Command::SelectNext);
@@ -1506,11 +1648,13 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("e          mark Done (GitHub can't undo it)")),
+                .any(|line| line.contains(&format!("{:14}  mark Done (GitHub can't undo it)", "e"))),
             "{lines:#?}"
         );
         assert!(
-            lines.iter().any(|line| line.contains(SEARCH_PROMPT_HELP)),
+            lines
+                .iter()
+                .any(|line| line.contains("Tab  Shift-Tab  complete a field's name")),
             "{lines:#?}"
         );
     }
