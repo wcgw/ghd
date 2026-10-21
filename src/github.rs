@@ -55,13 +55,27 @@ impl Account {
         if host == "ghe.com" || host.ends_with(".ghe.com") {
             bail!("GHE.com hosts like \"{host}\" aren't supported yet");
         }
-        if user.is_some_and(str::is_empty) {
-            bail!("`user` can't be empty; leave it out to use `gh`'s active account");
+        if user.is_some_and(|user| {
+            user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }) {
+            bail!(
+                "`user` should be a GitHub login, letters, digits and `-`; leave it out to use `gh`'s active account"
+            );
         }
         Ok(Self {
             host,
             user: user.map(str::to_owned),
         })
+    }
+
+    /// `github.com`, or a GitHub Enterprise Server's hostname, lowercase.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The user's login; `None` for whichever account `gh` has active on the host.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     fn is_github_com(&self) -> bool {
@@ -174,9 +188,25 @@ impl GitHub {
     ///
     /// Cancel safe: dropping the future discards the pages fetched so far, and nothing changes on GitHub.
     pub async fn inbox(&self) -> anyhow::Result<Inbox> {
-        self.fetch_inbox(None)
+        let unconditional = "GitHub answered 304 Not Modified to an unconditional request";
+        let first = self
+            .inbox_page(Uri::from_static(INBOX_FIRST_PAGE), None)
             .await?
-            .ok_or_else(|| anyhow!("GitHub answered 304 Not Modified to an unconditional request"))
+            .context(unconditional)?;
+        let mut notifications = first.notifications;
+        let mut next = first.next;
+        while let Some(uri) = next {
+            let page = self.inbox_page(uri, None).await?.context(unconditional)?;
+            notifications.extend(page.notifications);
+            next = page.next;
+        }
+
+        // Only now that every page has arrived, so that a fetch that failed half-way is retried in full.
+        self.polling().last_modified = first.last_modified;
+        Ok(notifications
+            .into_iter()
+            .map(|api| self.notification_from_api(api))
+            .collect())
     }
 
     /// The whole Inbox if it changed since the last one fetched; `None` when GitHub says it hasn't, an answer that
@@ -190,47 +220,25 @@ impl GitHub {
     ///
     /// Cancel safe, as [`GitHub::inbox`] is.
     pub async fn inbox_if_changed(&self) -> anyhow::Result<Option<Inbox>> {
-        let last_modified = self.polling().last_modified.clone();
-        self.fetch_inbox(last_modified).await
+        let Some(last_modified) = self.polling().last_modified.clone() else {
+            return self.inbox().await.map(Some);
+        };
+        // GitHub answers a conditional request with only the threads updated since `If-Modified-Since`, on a single
+        // page, rather than with the whole Inbox: its answer only tells whether to fetch the Inbox whole again.
+        let changed = self
+            .inbox_page(Uri::from_static(INBOX_FIRST_PAGE), Some(last_modified))
+            .await?
+            .is_some();
+        if !changed {
+            return Ok(None);
+        }
+        self.inbox().await.map(Some)
     }
 
     /// How long GitHub wants clients to wait between polls of the Inbox: the last `X-Poll-Interval` it sent, or 60
     /// seconds until it sends one.
     pub fn poll_interval(&self) -> Duration {
         self.polling().interval
-    }
-
-    /// The whole Inbox; `None` if GitHub answers that it hasn't changed since `if_modified_since`.
-    async fn fetch_inbox(
-        &self,
-        if_modified_since: Option<HeaderValue>,
-    ) -> anyhow::Result<Option<Inbox>> {
-        let Some(first) = self
-            .inbox_page(Uri::from_static(INBOX_FIRST_PAGE), if_modified_since)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let mut notifications = first.notifications;
-        let mut next = first.next;
-        // Once the first page has changed, every page needs fetching again: the rest are asked unconditionally.
-        while let Some(uri) = next {
-            let page = self
-                .inbox_page(uri, None)
-                .await?
-                .context("GitHub answered 304 Not Modified to an unconditional request")?;
-            notifications.extend(page.notifications);
-            next = page.next;
-        }
-
-        // Only now that every page has arrived, so that a fetch that failed half-way is retried in full.
-        self.polling().last_modified = first.last_modified;
-        Ok(Some(
-            notifications
-                .into_iter()
-                .map(|api| self.notification_from_api(api))
-                .collect(),
-        ))
     }
 
     /// The Inbox page at `uri`; `None` if GitHub answers that it hasn't changed since `if_modified_since`. Notes the
@@ -694,31 +702,65 @@ mod tests {
         );
     }
 
+    fn is_conditional(request: &Request) -> bool {
+        request.headers.contains_key("if-modified-since")
+    }
+
+    fn is_unconditional(request: &Request) -> bool {
+        !is_conditional(request)
+    }
+
+    /// Asked for the Inbox with `If-Modified-Since`, GitHub answers with only the threads updated since then, on a
+    /// single page, rather than with the whole Inbox (seen against the real API on 2026-10-21).
     #[tokio::test]
-    async fn changed_inbox_is_fetched_whole() {
+    async fn changed_inbox_is_fetched_whole_again() {
+        const LATER: &str = "Wed, 21 Oct 2026 19:51:47 GMT";
         let server = MockServer::start().await;
+        let link_to_page_2 = format!(
+            r#"<{}/notifications?all=true&per_page=50&page=2>; rel="next""#,
+            server.uri()
+        );
+        let whole_first_page = |last_modified: &str, notifications: Value| {
+            ResponseTemplate::new(200)
+                .insert_header("last-modified", last_modified)
+                .insert_header("link", link_to_page_2.as_str())
+                .set_body_json(notifications)
+        };
+        // Before thread 3 arrives, the Inbox holds threads 2 and 1, one per page.
         Mock::given(method("GET"))
-            .respond_with(first_page())
+            .and(query_param_is_missing("page"))
+            .and(is_unconditional)
+            .respond_with(whole_first_page(
+                LAST_MODIFIED_AT,
+                json!([api_notification(2, "mention", "2026-10-21T09:00:00Z")]),
+            ))
             .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Then thread 3 arrives: asked what changed, GitHub answers with that thread alone.
+        Mock::given(method("GET"))
+            .and(is_conditional)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", LATER)
+                    .set_body_json(json!([api_notification(
+                        3,
+                        "mention",
+                        "2026-10-21T10:00:00Z"
+                    )])),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(query_param_is_missing("page"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        "link",
-                        format!(
-                            r#"<{}/notifications?all=true&per_page=50&page=2>; rel="next""#,
-                            server.uri()
-                        ),
-                    )
-                    .set_body_json(json!([api_notification(
-                        2,
-                        "mention",
-                        "2026-10-21T09:00:00Z"
-                    )])),
-            )
+            .and(is_unconditional)
+            .respond_with(whole_first_page(
+                LATER,
+                json!([
+                    api_notification(3, "mention", "2026-10-21T10:00:00Z"),
+                    api_notification(2, "mention", "2026-10-21T09:00:00Z"),
+                ]),
+            ))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -733,19 +775,25 @@ mod tests {
             .mount(&server)
             .await;
         let github = github_for(&server).await;
+        let threads = |inbox: &Inbox| inbox.iter().map(|n| n.thread.0).collect::<Vec<_>>();
 
-        github.inbox().await.expect("GitHub answers 200");
-        let changed = github
+        let before = github.inbox().await.expect("GitHub answers 200");
+        let after = github
             .inbox_if_changed()
             .await
             .expect("GitHub answers 200")
             .expect("the Inbox changed");
 
-        assert_eq!(changed.iter().count(), 2);
+        assert_eq!(threads(&before), [2, 1]);
+        assert_eq!(
+            threads(&after),
+            [3, 2, 1],
+            "the whole Inbox, not just what changed"
+        );
         assert_eq!(
             conditions(&server).await,
-            [None, Some(LAST_MODIFIED_AT.to_owned()), None],
-            "only the first page is asked conditionally"
+            [None, None, Some(LAST_MODIFIED_AT.to_owned()), None, None],
+            "asked whether it changed, then fetched whole"
         );
     }
 
@@ -1027,6 +1075,8 @@ mod tests {
         ] {
             assert!(Account::new(Some(host), None).is_err(), "{host:?}");
         }
-        assert!(Account::new(None, Some("")).is_err());
+        for user in ["", "../alexsnaps", "alex snaps", "alex@snaps"] {
+            assert!(Account::new(None, Some(user)).is_err(), "{user:?}");
+        }
     }
 }

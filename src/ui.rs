@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::mem;
 use std::time::Duration;
 
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::{Context as _, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::future::OptionFuture;
@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Table
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 
+use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::github::GitHub;
@@ -31,13 +32,14 @@ const QUIT_GRACE: Duration = Duration::from_secs(10);
 
 /// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`. Meanwhile it
 /// keeps the Inbox up to date from `github`, polling as often as GitHub allows, and sends it the changes the user
-/// makes.
+/// makes. Until the first fetch arrives, it shows what `cache` kept from last time; on quitting, it keeps the Inbox
+/// there for next time.
 ///
 /// # Errors
 ///
-/// Fails if the terminal can't be drawn on or read from, or if changes made just before quitting were refused or
-/// didn't reach GitHub in time. Failing to fetch the Inbox, or a refused change while the UI runs, isn't an error
-/// here: the screen shows it, and the next poll tries again.
+/// Fails if the terminal can't be drawn on or read from, if changes made just before quitting were refused or
+/// didn't reach GitHub in time, or if the Inbox can't be kept in `cache`. Failing to fetch the Inbox, or a refused
+/// change while the UI runs, isn't an error here: the screen shows it, and the next poll tries again.
 ///
 /// # Panics
 ///
@@ -47,8 +49,12 @@ pub async fn run(
     github: &GitHub,
     views: Vec<View>,
     theme: Theme,
+    cache: &Cache,
 ) -> anyhow::Result<()> {
     let mut app = App::new(views, theme);
+    if let Some(snapshot) = cache.load().await {
+        app.restore(snapshot, Utc::now());
+    }
     let mut events = EventStream::new();
     // The fetch under way, if any; never more than one. Polled alongside terminal events, so the UI keeps drawing
     // and can be quit while pages arrive.
@@ -93,34 +99,40 @@ pub async fn run(
         }
     }
 
+    let mut problems = Vec::new();
+
     // Dropping the changes still in flight could lose ones the screen already showed as made.
-    if in_flight.is_empty() {
-        return Ok(());
+    if !in_flight.is_empty() {
+        let unconfirmed = in_flight.len();
+        app.status = Some(StatusMessage::Info(format!(
+            "Sending {unconfirmed} change(s) to GitHub…"
+        )));
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .context("drawing the terminal")?;
+        match tokio::time::timeout(QUIT_GRACE, in_flight.collect::<Vec<_>>()).await {
+            Ok(replies) => {
+                for reply in replies {
+                    if let Err(error) = &reply.accepted {
+                        problems.push(format!("GitHub refused to {}: {error:#}", reply.change));
+                    }
+                    // Undoes a refused change, so that the Inbox kept for next time doesn't have it.
+                    app.settle(reply);
+                }
+            }
+            Err(_) => problems.push(format!(
+                "GitHub didn't confirm {unconfirmed} change(s) made just before quitting; they may not have been made"
+            )),
+        }
     }
-    let unconfirmed = in_flight.len();
-    app.status = Some(StatusMessage::Info(format!(
-        "Sending {unconfirmed} change(s) to GitHub…"
-    )));
-    terminal
-        .draw(|frame| app.render(frame, false))
-        .context("drawing the terminal")?;
-    let replies = tokio::time::timeout(QUIT_GRACE, in_flight.collect::<Vec<_>>())
-        .await
-        .map_err(|_| {
-            anyhow!("GitHub didn't confirm {unconfirmed} change(s) made just before quitting; they may not have been made")
-        })?;
-    let refused: Vec<String> = replies
-        .into_iter()
-        .filter_map(|reply| {
-            let error = reply.accepted.err()?;
-            Some(format!("couldn't {}: {error:#}", reply.change))
-        })
-        .collect();
-    if !refused.is_empty() {
-        bail!(
-            "GitHub refused changes made just before quitting:\n{}",
-            refused.join("\n")
-        );
+
+    if let Some(snapshot) = app.into_snapshot(Utc::now())
+        && let Err(error) = cache.save(&snapshot).await
+    {
+        problems.push(format!("couldn't keep the Inbox for next time: {error:#}"));
+    }
+    if !problems.is_empty() {
+        bail!("{}", problems.join("\n"));
     }
     Ok(())
 }
@@ -282,6 +294,8 @@ enum StatusMessage {
     Error(String),
     /// Why the latest fetch failed; it goes away when one succeeds.
     FetchFailed(String),
+    /// That the Inbox on screen is the one kept from last time; it goes away when a fetched one arrives.
+    Cached(String),
 }
 
 /// What the app has of the Inbox so far.
@@ -385,7 +399,10 @@ impl App {
             Ok(Some(mut inbox)) => {
                 self.recent.reapply(&mut inbox, fetched.began);
                 self.replace_inbox(inbox);
-                if matches!(self.status, Some(StatusMessage::FetchFailed(_))) {
+                if matches!(
+                    self.status,
+                    Some(StatusMessage::FetchFailed(_) | StatusMessage::Cached(_))
+                ) {
                     self.status = None;
                 }
             }
@@ -488,15 +505,69 @@ impl App {
         self.set_search(input);
     }
 
+    /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives, with the View that was on screen and
+    /// each View's selection as they were, where they still can be.
+    fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
+        self.inbox = InboxState::Loaded(snapshot.inbox);
+        if let Some(index) = self
+            .views
+            .iter()
+            .position(|shown_view| shown_view.view.name == snapshot.view)
+        {
+            self.current = index;
+        }
+        let selected = self
+            .views
+            .iter()
+            .map(|shown_view| snapshot.selected.get(&shown_view.view.name).copied())
+            .collect();
+        self.select_threads(selected);
+        let when = match age(snapshot.saved_at, now).as_str() {
+            "now" => "just now".to_owned(),
+            age => format!("{age} ago"),
+        };
+        self.status = Some(StatusMessage::Cached(format!(
+            "Showing the Inbox from {when} until the latest arrives"
+        )));
+    }
+
+    /// What to keep for next time, as of `now`: the Inbox, the View on screen and each View's selection; `None`
+    /// until there's an Inbox.
+    fn into_snapshot(self, now: DateTime<Utc>) -> Option<Snapshot> {
+        let selected = self
+            .views
+            .iter()
+            .filter_map(|shown_view| {
+                let notification = selected_in(&self.inbox, shown_view, &self.search)?;
+                Some((shown_view.view.name.clone(), notification.thread))
+            })
+            .collect();
+        let view = self.views[self.current].view.name.clone();
+        let InboxState::Loaded(inbox) = self.inbox else {
+            return None;
+        };
+        Some(Snapshot {
+            inbox,
+            saved_at: now,
+            view,
+            selected,
+        })
+    }
+
     /// Runs `change`, keeping each View's selection on the same Notification if the View still shows it.
     fn keeping_selections(&mut self, change: impl FnOnce(&mut Self)) {
-        let selected: Vec<Option<ThreadId>> = self
+        let selected = self
             .views
             .iter()
             .map(|shown_view| selected_in(&self.inbox, shown_view, &self.search).map(|n| n.thread))
             .collect();
         change(self);
-        for (shown_view, thread) in self.views.iter_mut().zip(selected) {
+        self.select_threads(selected);
+    }
+
+    /// Selects in each View the Notification of the thread at the View's index in `threads`, if the View shows it.
+    fn select_threads(&mut self, threads: Vec<Option<ThreadId>>) {
+        for (shown_view, thread) in self.views.iter_mut().zip(threads) {
             let row = thread.and_then(|thread| {
                 shown(&self.inbox, &shown_view.view, &self.search).position(|n| n.thread == thread)
             });
@@ -726,7 +797,9 @@ impl App {
         }
         let status = match &self.status {
             None => return,
-            Some(StatusMessage::Info(text)) => Line::styled(text.as_str(), self.theme.status),
+            Some(StatusMessage::Info(text) | StatusMessage::Cached(text)) => {
+                Line::styled(text.as_str(), self.theme.status)
+            }
             Some(StatusMessage::Error(text) | StatusMessage::FetchFailed(text)) => {
                 Line::styled(text.as_str(), self.theme.error)
             }
@@ -917,6 +990,9 @@ fn age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use anyhow::anyhow;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1782,6 +1858,101 @@ mod tests {
         let key = cell_at(buffer, y, "e ");
         assert_eq!(key.fg, Color::Rgb(2, 2, 2));
         assert_eq!(cell_at(buffer, y, "mark Done").bg, Color::Rgb(1, 1, 1));
+    }
+
+    /// What [`app`] would keep with "Read" on screen and "Old news" selected in the Inbox View, two hours before
+    /// `now`.
+    fn snapshot(now: DateTime<Utc>) -> Snapshot {
+        Snapshot {
+            inbox: notifications().into_iter().collect(),
+            saved_at: now - TimeDelta::hours(2),
+            view: "Read".to_owned(),
+            selected: BTreeMap::from([
+                ("Inbox".to_owned(), ThreadId(2)),
+                ("Read".to_owned(), ThreadId(2)),
+                ("Gone".to_owned(), ThreadId(1)),
+            ]),
+        }
+    }
+
+    /// [`app`] before its Inbox arrives.
+    fn app_without_inbox() -> App {
+        let mut app = app();
+        app.inbox = InboxState::Loading;
+        app
+    }
+
+    #[test]
+    fn kept_inbox_shows_until_the_latest_arrives() {
+        let now = Utc::now();
+        let mut app = app_without_inbox();
+
+        app.restore(snapshot(now), now);
+
+        assert_eq!(app.current, 2, "the View that was on screen");
+        assert_eq!(selected_title(&app), Some("Old news"));
+        app.execute(Command::ShowView(0));
+        assert_eq!(
+            selected_title(&app),
+            Some("Old news"),
+            "each View's selection"
+        );
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Add polling", "Old news"]);
+        assert!(
+            lines[4].starts_with("Showing the Inbox from 2h ago until the latest arrives"),
+            "{lines:#?}"
+        );
+
+        app.fetched(fetched(notifications()));
+        assert_eq!(screen(&mut app)[4].trim(), "", "the latest has arrived");
+        assert_eq!(selected_title(&app), Some("Old news"));
+    }
+
+    #[test]
+    fn kept_inbox_stays_when_the_first_fetch_fails() {
+        let now = Utc::now();
+        let mut app = app_without_inbox();
+        app.restore(snapshot(now), now);
+
+        app.fetched(fetch_failed());
+
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Old news"], "the Read View");
+        assert!(
+            lines[4].starts_with("Couldn't refresh the Inbox"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_has_the_view_on_screen_and_each_selection() {
+        let now = Utc::now();
+        let mut app = app();
+        app.execute(Command::SelectNext);
+        app.execute(Command::ShowView(2));
+        app.execute(Command::Search);
+        type_text(&mut app, "old");
+
+        let snapshot = app.into_snapshot(now).expect("the Inbox has arrived");
+
+        assert_eq!(snapshot.view, "Read");
+        assert_eq!(snapshot.saved_at, now);
+        assert_eq!(
+            snapshot.selected,
+            BTreeMap::from([
+                ("Inbox".to_owned(), ThreadId(2)),
+                ("Read".to_owned(), ThreadId(2))
+            ]),
+            "Reviews shows nothing under the search"
+        );
+        let threads: Vec<u64> = snapshot.inbox.iter().map(|n| n.thread.0).collect();
+        assert_eq!(threads, [1, 2]);
+    }
+
+    #[test]
+    fn nothing_to_keep_before_an_inbox() {
+        assert!(app_without_inbox().into_snapshot(Utc::now()).is_none());
     }
 
     #[test]

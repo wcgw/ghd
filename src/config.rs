@@ -10,16 +10,14 @@
 //! filter = "reason:review-requested reason:team-mention -is:read"
 //! ```
 
-use std::env;
 use std::io::ErrorKind;
-use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 use serde::Deserialize;
 
 use crate::filter::Filter;
 use crate::github::Account;
-use crate::theme;
+use crate::{theme, xdg};
 
 /// The built-in View's name.
 const INBOX_VIEW: &str = "Inbox";
@@ -50,7 +48,7 @@ impl Config {
     /// Fails if the file exists but can't be read, or isn't a valid configuration. The error names the file, and
     /// what's wrong in it: the host or user, or the View and the part of its filter.
     pub async fn load() -> anyhow::Result<Self> {
-        let Some(path) = dir().map(|dir| dir.join("config.toml")) else {
+        let Some(path) = xdg::config_dir().map(|dir| dir.join("config.toml")) else {
             return Ok(Self::default());
         };
         match tokio::fs::read_to_string(&path).await {
@@ -147,18 +145,6 @@ struct ViewEntry {
     filter: String,
 }
 
-/// The directory of ghd's configuration file and themes: `$XDG_CONFIG_HOME/ghd`, or `~/.config/ghd` when
-/// `XDG_CONFIG_HOME` isn't set; `None` when neither it nor `HOME` is.
-pub fn dir() -> Option<PathBuf> {
-    let set = |name| {
-        env::var_os(name)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    let config_home = set("XDG_CONFIG_HOME").or_else(|| Some(set("HOME")?.join(".config")))?;
-    Some(config_home.join("ghd"))
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -209,7 +195,8 @@ mod tests {
     fn bad_host_or_user_is_rejected() {
         assert!(rejection("host = \"https://github.example.com\"").contains("hostname"));
         assert!(rejection("host = \"octocorp.ghe.com\"").contains("aren't supported yet"));
-        assert!(rejection("user = \"\"").contains("can't be empty"));
+        assert!(rejection("user = \"\"").contains("should be a GitHub login"));
+        assert!(rejection("user = \"../alexsnaps\"").contains("should be a GitHub login"));
     }
 
     #[test]

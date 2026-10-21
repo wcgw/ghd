@@ -6,7 +6,7 @@ use std::fmt::{self, Write as _};
 use chrono::{DateTime, Utc};
 
 /// The user's Notifications that haven't been marked Done, read or not, most recently updated first.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inbox {
     /// Sorted by `updated_at`, newest first.
     notifications: Vec<Notification>,
@@ -119,6 +119,19 @@ impl SubjectKind {
         }
     }
 
+    /// The subject type as the API names it; [`SubjectKind::from_api`] maps it back.
+    pub fn api_name(&self) -> &str {
+        match self {
+            Self::PullRequest => "PullRequest",
+            Self::Issue => "Issue",
+            Self::Release => "Release",
+            Self::Discussion => "Discussion",
+            Self::Commit => "Commit",
+            Self::CheckSuite => "CheckSuite",
+            Self::Other(name) => name,
+        }
+    }
+
     /// Maps a subject type as the API names it (`PullRequest`, `Issue`, …); an unknown name becomes
     /// [`SubjectKind::Other`].
     pub fn from_api(name: &str) -> Self {
@@ -160,8 +173,8 @@ macro_rules! reasons {
                 }
             }
 
-            /// The reason as the API names it.
-            fn api_name(&self) -> &str {
+            /// The reason as the API names it; [`Reason::from_api`] maps it back.
+            pub fn api_name(&self) -> &str {
                 match self {
                     $(Self::$variant => $api_name,)+
                     Self::Other(name) => name,
@@ -344,6 +357,28 @@ mod tests {
         let reason = Reason::from_api("brand_new_reason");
         assert_eq!(reason, Reason::Other("brand_new_reason".to_owned()));
         assert_eq!(reason.to_string(), "brand_new_reason");
+    }
+
+    #[test]
+    fn api_names_map_back() {
+        let kinds = [
+            SubjectKind::PullRequest,
+            SubjectKind::Issue,
+            SubjectKind::Release,
+            SubjectKind::Discussion,
+            SubjectKind::Commit,
+            SubjectKind::CheckSuite,
+            SubjectKind::Other("RepositoryAdvisory".to_owned()),
+        ];
+        for kind in kinds {
+            assert_eq!(SubjectKind::from_api(kind.api_name()), kind);
+        }
+        for reason in [
+            Reason::ReviewRequested,
+            Reason::Other("brand_new_reason".to_owned()),
+        ] {
+            assert_eq!(Reason::from_api(reason.api_name()), reason);
+        }
     }
 
     #[test]
