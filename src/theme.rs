@@ -26,6 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
 use crate::inbox::SubjectKind;
+use crate::state::SubjectState;
 
 /// The theme used unless the configuration names another.
 pub const DEFAULT: &str = "tokyonight-moon";
@@ -90,6 +91,13 @@ theme! {
     kind_check_suite = "kind.check_suite",
     /// A kind of Subject ghd doesn't know.
     kind_other = "kind.other",
+    /// The kind column of a pull request or an issue in that State, over the kind's own style.
+    state_open = "state.open",
+    state_draft = "state.draft",
+    state_merged = "state.merged",
+    state_closed = "state.closed",
+    state_completed = "state.completed",
+    state_not_planned = "state.not_planned",
     repository = "repository",
     title = "title",
     reason = "reason",
@@ -172,6 +180,18 @@ impl Theme {
             SubjectKind::Commit => self.kind_commit,
             SubjectKind::CheckSuite => self.kind_check_suite,
             SubjectKind::Other(_) => self.kind_other,
+        }
+    }
+
+    /// The style for Subjects in `state`, over their kind's.
+    pub fn state(&self, state: SubjectState) -> Style {
+        match state {
+            SubjectState::Open => self.state_open,
+            SubjectState::Draft => self.state_draft,
+            SubjectState::Merged => self.state_merged,
+            SubjectState::Closed => self.state_closed,
+            SubjectState::Completed => self.state_completed,
+            SubjectState::NotPlanned => self.state_not_planned,
         }
     }
 

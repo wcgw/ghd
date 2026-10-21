@@ -68,3 +68,12 @@ discussion = { fg = "purple" }
 commit = { fg = "teal" }
 check_suite = { fg = "orange" }
 other = { fg = "dark5" }
+
+# Like GitHub: green open, grey draft or not planned, purple merged or completed, red closed.
+[styles.state]
+open = { fg = "green" }
+draft = { fg = "dark5" }
+merged = { fg = "magenta" }
+closed = { fg = "red" }
+completed = { fg = "magenta" }
+not_planned = { fg = "dark5" }

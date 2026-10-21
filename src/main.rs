@@ -7,6 +7,7 @@ mod filter;
 mod github;
 mod inbox;
 mod search;
+mod state;
 mod theme;
 mod ui;
 mod xdg;

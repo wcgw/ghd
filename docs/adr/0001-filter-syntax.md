@@ -38,4 +38,4 @@ evaluate are rejected rather than matching nothing: `is:done` (the Inbox never h
   still shown, with the reason as GitHub sent it, but no `reason:` value selects it until ghd learns that reason;
   negated `-reason:` Filters still let it through.
 - `author:` and subject state (e.g. merged) are valid GitHub qualifiers that ghd can't evaluate yet: they need the
-  Subject's details, which aren't fetched yet.
+  Subject's details. Pull requests' and issues' State is now looked up (to color them), but Filters don't use it yet.

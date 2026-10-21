@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::github::Account;
 use crate::inbox::{Inbox, Notification, Reason, SubjectKind, ThreadId};
+use crate::state::{Known, States, SubjectState};
 use crate::xdg;
 
 /// The version of the cache file's format; a file of another version is ignored.
@@ -24,6 +25,8 @@ pub struct Snapshot {
     pub view: String,
     /// The Notification at each View's cursor, by the View's name; a View showing nothing isn't there.
     pub cursors: BTreeMap<String, ThreadId>,
+    /// The Subjects' States known.
+    pub states: States,
 }
 
 /// Where one Account's [`Snapshot`] is kept.
@@ -104,6 +107,17 @@ struct File {
     view: String,
     cursors: BTreeMap<String, u64>,
     inbox: Vec<CachedNotification>,
+    /// Missing from files saved before States were kept.
+    #[serde(default)]
+    states: Vec<CachedState>,
+}
+
+/// A Subject's State, as written: by its name, which a State of a newer ghd might not have.
+#[derive(Serialize, Deserialize)]
+struct CachedState {
+    thread: u64,
+    state: Option<String>,
+    as_of: DateTime<Utc>,
 }
 
 /// A Notification, as written: its Reason and Subject kind by the API's names, so a new ghd still reads them.
@@ -144,6 +158,15 @@ impl File {
                     updated_at: n.updated_at,
                 })
                 .collect(),
+            states: snapshot
+                .states
+                .iter()
+                .map(|(thread, known)| CachedState {
+                    thread: thread.0,
+                    state: known.state.map(|state| state.name().to_owned()),
+                    as_of: known.as_of,
+                })
+                .collect(),
         }
     }
 
@@ -169,6 +192,24 @@ impl File {
                 .cursors
                 .into_iter()
                 .map(|(view, thread)| (view, ThreadId(thread)))
+                .collect(),
+            // A State this ghd doesn't know is left out, to be looked up again.
+            states: self
+                .states
+                .into_iter()
+                .filter_map(|cached| {
+                    let state = match cached.state {
+                        Some(name) => Some(SubjectState::from_name(&name)?),
+                        None => None,
+                    };
+                    Some((
+                        ThreadId(cached.thread),
+                        Known {
+                            state,
+                            as_of: cached.as_of,
+                        },
+                    ))
+                })
                 .collect(),
         }
     }
@@ -229,6 +270,24 @@ mod tests {
                 ("Inbox".to_owned(), ThreadId(2)),
                 ("Reviews".to_owned(), ThreadId(1)),
             ]),
+            states: [
+                (
+                    ThreadId(1),
+                    Known {
+                        state: Some(SubjectState::Merged),
+                        as_of: "2026-10-21T11:00:00Z".parse().expect("valid RFC 3339"),
+                    },
+                ),
+                (
+                    ThreadId(2),
+                    Known {
+                        state: None,
+                        as_of: "2026-10-21T12:00:00Z".parse().expect("valid RFC 3339"),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -286,6 +345,23 @@ mod tests {
         let path = cache.path.as_ref().expect("a cache directory");
         let mode = std::fs::metadata(path).expect("saved").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn file_without_states_still_reads() {
+        let dir = ScratchDir::new("cache-without-states");
+        let cache = Cache::in_dir(Some(&dir.0), &Account::default());
+        let path = cache.path.clone().expect("a cache directory");
+        std::fs::create_dir_all(path.parent().expect("in a directory"))
+            .expect("the directory is writable");
+        let mut older = serde_json::to_value(File::from_snapshot(&snapshot())).expect("encodable");
+        older.as_object_mut().expect("an object").remove("states");
+        std::fs::write(&path, older.to_string()).expect("the directory is writable");
+
+        let loaded = cache.load().await.expect("still readable");
+
+        assert_eq!(loaded.inbox, snapshot().inbox);
+        assert_eq!(loaded.states, States::default());
     }
 
     #[tokio::test]

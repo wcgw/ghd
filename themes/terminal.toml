@@ -11,3 +11,11 @@ completion = { dim = true }
 completion_current = { reversed = true }
 help_keys = { bold = true }
 help_heading = { dim = true }
+
+[styles.state]
+open = { fg = "green" }
+draft = { dim = true }
+merged = { fg = "magenta" }
+closed = { fg = "red" }
+completed = { fg = "magenta" }
+not_planned = { dim = true }

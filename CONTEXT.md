@@ -14,6 +14,10 @@ An entry in the user's GitHub notifications inbox, about a single **Subject**.
 **Subject**:
 The GitHub item a **Notification** is about: an issue, pull request, release, discussion, commit or check suite.
 
+**State**:
+Where a **Subject** stands on GitHub: a pull request open, draft, merged or closed; an issue open, or closed as completed or as not planned. Other kinds of **Subject** have none here.
+_Avoid_: status
+
 **Reason**:
 Why GitHub notified the user about a **Subject** (e.g. review requested, mentioned, author, subscribed).
 
@@ -52,6 +56,7 @@ _Avoid_: folder, bucket, tab, filter
 
 - An **Inbox** belongs to exactly one **Account**
 - A **Notification** is about exactly one **Subject** and carries one **Reason**
+- A **Subject**'s **State** isn't part of its **Notification**: ghd looks it up apart, again whenever the **Notification** has new activity, and shows the last one it knows
 - Opening a **Notification** clears **Unread**; marking it **Done** removes it from the **Inbox** and so from every **View**
 - A **View** has exactly one **Filter**
 - There is always one built-in **View**, named "Inbox", that shows the whole **Inbox**; it comes first and can't be removed or redefined, and configured **Views** follow in config order

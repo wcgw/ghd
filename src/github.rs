@@ -5,6 +5,8 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use std::collections::HashMap;
+
 use anyhow::{Context as _, anyhow, bail};
 use chrono::{DateTime, Local};
 use http::header::{HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED};
@@ -13,7 +15,10 @@ use octocrab::models::activity::Notification as ApiNotification;
 use octocrab::secrecy::SecretString;
 use octocrab::{FromResponse as _, GitHubError, Octocrab, Page};
 
+use serde::Deserialize;
+
 use crate::inbox::{Inbox, Notification, Reason, SubjectKind, ThreadId};
+use crate::state::SubjectState;
 
 /// github.com's hostname.
 const GITHUB_HOST: &str = "github.com";
@@ -26,6 +31,13 @@ const INBOX_FIRST_PAGE: &str = "/notifications?all=true&per_page=50";
 
 /// How long to wait between polls of the Inbox until GitHub says.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many Subjects' States one GraphQL query looks up.
+const STATES_PER_QUERY: usize = 50;
+
+/// What a GraphQL query asks of each Subject, by its page: a pull request's or an issue's State.
+const STATE_FRAGMENT: &str = "fragment State on UniformResourceLocatable { __typename \
+     ... on PullRequest { state isDraft } ... on Issue { state stateReason } }";
 
 /// GitHub's response header for the shortest time between polls of the Inbox, in seconds.
 const X_POLL_INTERVAL: HeaderName = HeaderName::from_static("x-poll-interval");
@@ -133,6 +145,8 @@ pub struct GitHub {
     host: String,
     /// Where the website lives, without a trailing `/`; Subjects' pages are below it.
     web_root: String,
+    /// Where GraphQL queries go.
+    graphql_url: String,
     /// What GitHub has said so far about polling the Inbox.
     polling: Mutex<Polling>,
 }
@@ -169,6 +183,7 @@ impl GitHub {
             client,
             host: account.host.clone(),
             web_root: account.web_root(),
+            graphql_url: graphql_url(api_root),
             polling: Mutex::new(Polling {
                 last_modified: None,
                 interval: DEFAULT_POLL_INTERVAL,
@@ -330,6 +345,65 @@ impl GitHub {
             .map_err(|error| self.explain(error))
     }
 
+    /// The States of the Subjects in `subjects`, each a Notification's thread and its Subject's page, looked up
+    /// [`STATES_PER_QUERY`] at a time. A Subject GitHub has no State for (not a pull request or an issue, gone, or
+    /// out of the token's sight) isn't in the result.
+    ///
+    /// # Errors
+    ///
+    /// Fails if GitHub can't be reached or refuses a query; what was looked up until then is lost.
+    ///
+    /// # Cancel Safety
+    ///
+    /// Cancel safe: it only reads.
+    pub async fn subject_states(
+        &self,
+        subjects: &[(ThreadId, &str)],
+    ) -> anyhow::Result<HashMap<ThreadId, SubjectState>> {
+        let mut found = HashMap::new();
+        for batch in subjects.chunks(STATES_PER_QUERY) {
+            // One aliased `resource` per Subject: `s0: resource(url: $u0) { ...State }`, and so on.
+            let parameters: Vec<String> =
+                (0..batch.len()).map(|i| format!("$u{i}: URI!")).collect();
+            let fields: Vec<String> = (0..batch.len())
+                .map(|i| format!("s{i}: resource(url: $u{i}) {{ ...State }}"))
+                .collect();
+            let query = format!(
+                "query({}) {{ {} }} {STATE_FRAGMENT}",
+                parameters.join(", "),
+                fields.join(" ")
+            );
+            let variables: serde_json::Map<String, serde_json::Value> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, (_, url))| (format!("u{i}"), (*url).into()))
+                .collect();
+            let response: GraphQlResponse = self
+                .client
+                .post(
+                    &self.graphql_url,
+                    Some(&serde_json::json!({ "query": query, "variables": variables })),
+                )
+                .await
+                .map_err(|error| self.explain(error))?;
+            // Subjects GitHub can't find come back as null, with an error each: the rest are still worth having.
+            let Some(data) = response.data else {
+                bail!(
+                    "GitHub couldn't look up pull requests' and issues' states: {}",
+                    serde_json::Value::from(response.errors.unwrap_or_default())
+                );
+            };
+            for (i, (thread, _)) in batch.iter().enumerate() {
+                if let Some(Some(resource)) = data.get(&format!("s{i}"))
+                    && let Some(state) = resource.state()
+                {
+                    found.insert(*thread, state);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Puts `error` in the user's terms: what GitHub answered, or that it couldn't be reached, and what to do about
     /// it where there's something to do.
     fn explain(&self, error: octocrab::Error) -> anyhow::Error {
@@ -432,6 +506,67 @@ impl GitHub {
     }
 }
 
+/// Where GraphQL queries go, for the REST API rooted at `api_root`: `/graphql` beside the API on github.com, but
+/// `/api/graphql` beside `/api/v3` on GitHub Enterprise Server.
+fn graphql_url(api_root: &str) -> String {
+    let api_root = api_root.trim_end_matches('/');
+    match api_root.strip_suffix("/api/v3") {
+        Some(server) => format!("{server}/api/graphql"),
+        None => format!("{api_root}/graphql"),
+    }
+}
+
+/// A GraphQL answer to a States query: by alias, each Subject found, or `None` for one that wasn't.
+#[derive(Deserialize)]
+struct GraphQlResponse {
+    data: Option<HashMap<String, Option<Resource>>>,
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+/// A Subject, as a States query describes it.
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum Resource {
+    PullRequest {
+        state: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+    },
+    Issue {
+        state: String,
+        #[serde(rename = "stateReason")]
+        state_reason: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+impl Resource {
+    /// The Subject's State; `None` for a kind of Subject with none, or a state ghd doesn't know.
+    fn state(&self) -> Option<SubjectState> {
+        match self {
+            Self::PullRequest { state, is_draft } => match state.as_str() {
+                "OPEN" if *is_draft => Some(SubjectState::Draft),
+                "OPEN" => Some(SubjectState::Open),
+                "MERGED" => Some(SubjectState::Merged),
+                "CLOSED" => Some(SubjectState::Closed),
+                _ => None,
+            },
+            Self::Issue {
+                state,
+                state_reason,
+            } => match (state.as_str(), state_reason.as_deref()) {
+                ("OPEN", _) => Some(SubjectState::Open),
+                // Closed as a duplicate shows as not planned, as on GitHub; with no reason, as completed.
+                ("CLOSED", Some("NOT_PLANNED" | "DUPLICATE")) => Some(SubjectState::NotPlanned),
+                ("CLOSED", _) => Some(SubjectState::Completed),
+                _ => None,
+            },
+            Self::Other => None,
+        }
+    }
+}
+
 /// One page of the Inbox, as the API sent it.
 struct InboxPage {
     notifications: Vec<ApiNotification>,
@@ -487,6 +622,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
+    use crate::state::SubjectState;
 
     /// A notification as the API sends it.
     fn api_notification(id: u64, reason: &str, updated_at: &str) -> Value {
@@ -834,6 +970,147 @@ mod tests {
 
         assert!(inbox.is_some(), "fetched, not taken as unchanged");
         assert_eq!(conditions(&server).await, [None, None, None, None]);
+    }
+
+    #[test]
+    fn graphql_goes_beside_the_rest_api() {
+        assert_eq!(
+            graphql_url("https://api.github.com"),
+            "https://api.github.com/graphql"
+        );
+        assert_eq!(
+            graphql_url("https://github.example.com/api/v3"),
+            "https://github.example.com/api/graphql"
+        );
+        assert_eq!(
+            graphql_url("http://127.0.0.1:1234/"),
+            "http://127.0.0.1:1234/graphql"
+        );
+    }
+
+    /// The pages a States query asked about, by variable (`u0`, `u1`, …).
+    fn asked_pages(request: &Request) -> serde_json::Map<String, Value> {
+        let body: Value = serde_json::from_slice(&request.body).expect("a JSON body");
+        body["variables"].as_object().expect("variables").clone()
+    }
+
+    #[tokio::test]
+    async fn states_come_from_graphql() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "s0": { "__typename": "PullRequest", "state": "MERGED", "isDraft": false },
+                    "s1": { "__typename": "PullRequest", "state": "OPEN", "isDraft": true },
+                    "s2": { "__typename": "PullRequest", "state": "OPEN", "isDraft": false },
+                    "s3": { "__typename": "PullRequest", "state": "CLOSED", "isDraft": false },
+                    "s4": { "__typename": "Issue", "state": "CLOSED", "stateReason": "COMPLETED" },
+                    "s5": { "__typename": "Issue", "state": "CLOSED", "stateReason": "NOT_PLANNED" },
+                    "s6": { "__typename": "Issue", "state": "CLOSED", "stateReason": "DUPLICATE" },
+                    "s7": { "__typename": "Issue", "state": "OPEN", "stateReason": "REOPENED" },
+                    "s8": { "__typename": "Issue", "state": "CLOSED", "stateReason": null },
+                    "s9": { "__typename": "Release" },
+                    "s10": null,
+                },
+                "errors": [{ "type": "NOT_FOUND", "path": ["s10"], "message": "Could not resolve to a node" }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let pages: Vec<String> = (0..11)
+            .map(|i| format!("https://github.com/wcgw/ghd/pull/{i}"))
+            .collect();
+        let subjects: Vec<(ThreadId, &str)> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| (ThreadId(i as u64), page.as_str()))
+            .collect();
+
+        let found = github_for(&server)
+            .await
+            .subject_states(&subjects)
+            .await
+            .expect("GitHub answers");
+
+        use SubjectState::*;
+        let expected = [
+            Merged, Draft, Open, Closed, Completed, NotPlanned, NotPlanned, Open, Completed,
+        ];
+        for (i, state) in expected.into_iter().enumerate() {
+            assert_eq!(found.get(&ThreadId(i as u64)), Some(&state), "s{i}");
+        }
+        assert_eq!(
+            found.len(),
+            9,
+            "nothing for the release, nor for what GitHub couldn't find"
+        );
+        let requests = server.received_requests().await.expect("recorded");
+        let pages_asked = asked_pages(&requests[0]);
+        assert_eq!(pages_asked["u10"], "https://github.com/wcgw/ghd/pull/10");
+    }
+
+    #[tokio::test]
+    async fn states_are_looked_up_fifty_at_a_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(|request: &Request| {
+                let data: serde_json::Map<String, Value> = asked_pages(request)
+                    .keys()
+                    .map(|variable| {
+                        let alias = variable.replacen('u', "s", 1);
+                        (alias, json!({ "__typename": "PullRequest", "state": "OPEN", "isDraft": false }))
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+            })
+            .mount(&server)
+            .await;
+        let pages: Vec<String> = (0..120)
+            .map(|i| format!("https://github.com/wcgw/ghd/pull/{i}"))
+            .collect();
+        let subjects: Vec<(ThreadId, &str)> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| (ThreadId(i as u64), page.as_str()))
+            .collect();
+
+        let found = github_for(&server)
+            .await
+            .subject_states(&subjects)
+            .await
+            .expect("GitHub answers");
+
+        assert_eq!(found.len(), 120);
+        let sizes: Vec<usize> = server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .map(|request| asked_pages(request).len())
+            .collect();
+        assert_eq!(sizes, [50, 50, 20]);
+    }
+
+    #[tokio::test]
+    async fn states_query_without_data_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": [{ "message": "Parse error on \"}\"" }],
+            })))
+            .mount(&server)
+            .await;
+
+        let error = github_for(&server)
+            .await
+            .subject_states(&[(ThreadId(1), "https://github.com/wcgw/ghd/pull/1")])
+            .await
+            .expect_err("no data");
+
+        assert!(format!("{error:#}").contains("Parse error"), "{error:#}");
     }
 
     #[tokio::test]

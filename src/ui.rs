@@ -1,7 +1,7 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use crate::config::View;
 use crate::github::GitHub;
 use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
 use crate::search::{self, Search};
+use crate::state::{Lookup, States, SubjectState};
 use crate::theme::Theme;
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
@@ -66,13 +67,26 @@ pub async fn run(
     let mut next_poll = Instant::now();
     // Changes already on screen, on their way to GitHub.
     let mut in_flight = FuturesUnordered::new();
+    // The lookup of Subjects' States under way, if any; never more than one.
+    let mut lookup = None;
 
     loop {
+        if lookup.is_none() {
+            let wanted = app.states_to_look_up();
+            if !wanted.is_empty() {
+                lookup = Some(Box::pin(look_up_states(github, wanted)));
+            }
+        }
+        let fetching = fetch.is_some() || lookup.is_some();
         terminal
-            .draw(|frame| app.render(frame, fetch.is_some()))
+            .draw(|frame| app.render(frame, fetching))
             .context("drawing the terminal")?;
 
         tokio::select! {
+            Some(looked_up) = OptionFuture::from(lookup.as_mut()), if lookup.is_some() => {
+                lookup = None;
+                app.states_looked_up(looked_up);
+            }
             Some(fetched) = OptionFuture::from(fetch.as_mut()), if fetch.is_some() => {
                 fetch = None;
                 app.fetched(fetched);
@@ -180,6 +194,28 @@ enum Outcome {
     Refresh,
     /// Send these changes to GitHub; the screen shows them made already. Never empty.
     Send(Vec<Change>),
+}
+
+/// The outcome of looking up Subjects' States.
+struct LookedUp {
+    asked: Vec<Lookup>,
+    found: anyhow::Result<HashMap<ThreadId, SubjectState>>,
+}
+
+/// Looks up on `github` the States of the Subjects `asked` about.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::subject_states`] is.
+async fn look_up_states(github: &GitHub, asked: Vec<Lookup>) -> LookedUp {
+    let found = {
+        let subjects: Vec<(ThreadId, &str)> = asked
+            .iter()
+            .map(|lookup| (lookup.thread, lookup.subject_url.as_str()))
+            .collect();
+        github.subject_states(&subjects).await
+    };
+    LookedUp { asked, found }
 }
 
 /// What a key press can ask for.
@@ -354,6 +390,10 @@ struct App {
     help_shown: bool,
     theme: Theme,
     kind_labels: KindLabels,
+    /// The Subjects' States known so far.
+    states: States,
+    /// An Inbox arrived since Subjects' States were last looked up: the ones it changed want looking up.
+    states_wanted: bool,
 }
 
 /// The prompt the user types a Search into.
@@ -411,6 +451,8 @@ impl App {
             help_shown: false,
             theme,
             kind_labels,
+            states: States::default(),
+            states_wanted: false,
         }
     }
 
@@ -443,9 +485,12 @@ impl App {
         }
     }
 
-    /// Shows `inbox` instead of the Inbox on screen. What it doesn't hold any more leaves the Selection.
+    /// Shows `inbox` instead of the Inbox on screen. What it doesn't hold any more leaves the Selection and the
+    /// States, and what it changed wants its State looked up.
     fn replace_inbox(&mut self, inbox: Inbox) {
         self.selection.retain(|&thread| inbox.contains(thread));
+        self.states.retain_in(&inbox);
+        self.states_wanted = true;
         self.keeping_cursors(|app| app.inbox = InboxState::Loaded(inbox));
     }
 
@@ -530,10 +575,34 @@ impl App {
         self.set_search(input);
     }
 
+    /// The Subjects whose State to look up now: the ones the latest Inbox changed, once after it arrives. Empty
+    /// otherwise, so that a lookup that failed waits for the next Inbox.
+    fn states_to_look_up(&mut self) -> Vec<Lookup> {
+        if !mem::take(&mut self.states_wanted) {
+            return Vec::new();
+        }
+        self.inbox()
+            .map(|inbox| self.states.stale(inbox))
+            .unwrap_or_default()
+    }
+
+    /// Takes in Subjects' States looked up; a failed lookup is reported until an Inbox is fetched again.
+    fn states_looked_up(&mut self, looked_up: LookedUp) {
+        match looked_up.found {
+            Ok(found) => self.states.found(&looked_up.asked, &found),
+            Err(error) => {
+                self.status = Some(StatusMessage::FetchFailed(format!(
+                    "Couldn't look up the state of pull requests and issues: {error:#}"
+                )));
+            }
+        }
+    }
+
     /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives, with the View that was on screen and
     /// each View's cursor as they were, where they still can be.
     fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
         self.inbox = InboxState::Loaded(snapshot.inbox);
+        self.states = snapshot.states;
         if let Some(index) = self
             .views
             .iter()
@@ -574,6 +643,7 @@ impl App {
         Some(Snapshot {
             inbox,
             saved_at: now,
+            states: self.states,
             view,
             cursors,
         })
@@ -881,14 +951,13 @@ impl App {
                 Paragraph::new("Nothing in your Inbox matches this View.").style(theme.message)
             }
             InboxState::Loaded(_) => {
-                let table = notifications_table(
-                    &rows,
-                    &self.selection,
-                    Utc::now(),
+                let look = RowLook {
                     theme,
-                    self.kind_labels,
-                )
-                .block(block);
+                    kind_labels: self.kind_labels,
+                    selection: &self.selection,
+                    states: &self.states,
+                };
+                let table = notifications_table(&rows, Utc::now(), &look).block(block);
                 frame.render_stateful_widget(table, area, &mut current.cursor);
                 return;
             }
@@ -1030,25 +1099,39 @@ fn shown<'a>(
         .filter(|n| view.filter.matches(n) && search.matches(n))
 }
 
-/// One row per Notification in `notifications`, in `theme`: selection marker, unread marker, Subject kind,
-/// repository, title, Reason, and age relative to `now`, the kinds named with `kind_labels`. Those whose thread is in
-/// `selection` are marked selected.
+/// What decides how Notifications' rows look, besides the Notifications themselves.
+struct RowLook<'a> {
+    theme: &'a Theme,
+    kind_labels: KindLabels,
+    /// The threads to mark selected.
+    selection: &'a HashSet<ThreadId>,
+    states: &'a States,
+}
+
+/// One row per Notification in `notifications`, as `look` says: selection marker, unread marker, Subject kind (in
+/// its State's color, and icon if any), repository, title, Reason, and age relative to `now`.
 fn notifications_table<'a>(
     notifications: &[&'a Notification],
-    selection: &HashSet<ThreadId>,
     now: DateTime<Utc>,
-    theme: &Theme,
-    kind_labels: KindLabels,
+    look: &RowLook,
 ) -> Table<'a> {
+    let theme = look.theme;
     let rows = notifications.iter().map(|n| {
-        let selected = selection.contains(&n.thread);
+        let selected = look.selection.contains(&n.thread);
+        let subject_state = look.states.get(n);
         // Whether it's read goes over the column's own style, so a theme can, say, grey out read rows; whether it's
         // selected goes over that.
-        let mut state = if n.unread { theme.unread } else { theme.read };
+        let mut row_style = if n.unread { theme.unread } else { theme.read };
         if selected {
-            state = state.patch(theme.selected);
+            row_style = row_style.patch(theme.selected);
         }
-        let cell = |text: Cow<'a, str>, column: Style| Cell::from(text).style(column.patch(state));
+        let cell =
+            |text: Cow<'a, str>, column: Style| Cell::from(text).style(column.patch(row_style));
+        let kind_style = subject_state.map_or(theme.kind(&n.subject_kind), |subject_state| {
+            theme
+                .kind(&n.subject_kind)
+                .patch(theme.state(subject_state))
+        });
         Row::new([
             cell(
                 Cow::Borrowed(if selected { "▌" } else { " " }),
@@ -1059,8 +1142,8 @@ fn notifications_table<'a>(
                 theme.unread_marker,
             ),
             cell(
-                Cow::Borrowed(kind_labels.label(&n.subject_kind)),
-                theme.kind(&n.subject_kind),
+                Cow::Borrowed(look.kind_labels.label(&n.subject_kind, subject_state)),
+                kind_style,
             ),
             cell(Cow::Borrowed(&n.repository), theme.repository),
             cell(Cow::Borrowed(&n.subject_title), theme.title),
@@ -1082,7 +1165,7 @@ fn notifications_table<'a>(
     let widths = [
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(kind_labels.width()),
+        Constraint::Length(look.kind_labels.width()),
         Constraint::Length(
             u16::try_from(repository_width)
                 .map_or(MAX_REPOSITORY_WIDTH, |w| w.min(MAX_REPOSITORY_WIDTH)),
@@ -1107,11 +1190,23 @@ pub enum KindLabels {
 }
 
 impl KindLabels {
-    /// The label for `kind`, at most [`KindLabels::width`] cells wide.
-    fn label(self, kind: &SubjectKind) -> &'static str {
-        // The icons' names in Nerd Fonts: oct-git_pull_request, oct-issue_opened, oct-tag, oct-comment_discussion,
-        // oct-git_commit, oct-checklist and oct-question.
+    /// The label for `kind` in `state`, at most [`KindLabels::width`] cells wide. Text labels are the same in any
+    /// State: the theme colors it.
+    fn label(self, kind: &SubjectKind, state: Option<SubjectState>) -> &'static str {
+        // The icons' names in Nerd Fonts: oct-git_pull_request(_draft, _closed), oct-git_merge, oct-issue_opened,
+        // oct-issue_closed, oct-skip, oct-tag, oct-comment_discussion, oct-git_commit, oct-checklist and oct-question.
         match (self, kind) {
+            (Self::Icons, SubjectKind::PullRequest) => match state {
+                Some(SubjectState::Draft) => "\u{f4dd}",
+                Some(SubjectState::Merged) => "\u{f419}",
+                Some(SubjectState::Closed) => "\u{f4dc}",
+                _ => "\u{f407}",
+            },
+            (Self::Icons, SubjectKind::Issue) => match state {
+                Some(SubjectState::Completed) => "\u{f41d}",
+                Some(SubjectState::NotPlanned) => "\u{f517}",
+                _ => "\u{f41b}",
+            },
             (Self::Text, SubjectKind::PullRequest) => "PR",
             (Self::Text, SubjectKind::Issue) => "ISS",
             (Self::Text, SubjectKind::Release) => "REL",
@@ -1119,8 +1214,6 @@ impl KindLabels {
             (Self::Text, SubjectKind::Commit) => "CMT",
             (Self::Text, SubjectKind::CheckSuite) => "CI",
             (Self::Text, SubjectKind::Other(_)) => "?",
-            (Self::Icons, SubjectKind::PullRequest) => "\u{f407}",
-            (Self::Icons, SubjectKind::Issue) => "\u{f41b}",
             (Self::Icons, SubjectKind::Release) => "\u{f412}",
             (Self::Icons, SubjectKind::Discussion) => "\u{f442}",
             (Self::Icons, SubjectKind::Commit) => "\u{f417}",
@@ -1170,6 +1263,7 @@ mod tests {
     use super::*;
     use crate::filter::Filter;
     use crate::inbox::{Reason, ThreadId};
+    use crate::state::Known;
 
     #[test]
     fn age_truncates_to_the_largest_whole_unit() {
@@ -2058,6 +2152,16 @@ mod tests {
                 ("Read".to_owned(), ThreadId(2)),
                 ("Gone".to_owned(), ThreadId(1)),
             ]),
+            // "Add polling" was merged, as of before its latest activity.
+            states: [(
+                ThreadId(1),
+                Known {
+                    state: Some(SubjectState::Merged),
+                    as_of: now - TimeDelta::hours(3),
+                },
+            )]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -2331,15 +2435,165 @@ mod tests {
             SubjectKind::CheckSuite,
             SubjectKind::Other("RepositoryAdvisory".to_owned()),
         ];
+        let states = [
+            None,
+            Some(SubjectState::Open),
+            Some(SubjectState::Draft),
+            Some(SubjectState::Merged),
+            Some(SubjectState::Closed),
+            Some(SubjectState::Completed),
+            Some(SubjectState::NotPlanned),
+        ];
         for labels in [KindLabels::Text, KindLabels::Icons] {
             for kind in &kinds {
-                let width = labels.label(kind).chars().count();
-                assert!(
-                    width >= 1 && width <= labels.width().into(),
-                    "{labels:?} {kind:?}"
-                );
+                for state in states {
+                    let width = labels.label(kind, state).chars().count();
+                    assert!(
+                        width >= 1 && width <= labels.width().into(),
+                        "{labels:?} {kind:?} {state:?}"
+                    );
+                }
             }
         }
+    }
+
+    fn lookup_threads(lookups: &[Lookup]) -> Vec<u64> {
+        let mut threads: Vec<u64> = lookups.iter().map(|lookup| lookup.thread.0).collect();
+        threads.sort_unstable();
+        threads
+    }
+
+    #[test]
+    fn states_are_looked_up_once_for_each_inbox() {
+        let mut app = app();
+        // The very Notifications the app holds: `notifications()` would give them newer timestamps.
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+
+        let asked = app.states_to_look_up();
+        assert_eq!(
+            lookup_threads(&asked),
+            [1, 2],
+            "a pull request and an issue"
+        );
+        assert!(app.states_to_look_up().is_empty(), "until the next Inbox");
+
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([(ThreadId(1), SubjectState::Merged)])),
+        });
+        app.fetched(fetched(held[1..].to_vec()));
+        assert!(app.states_to_look_up().is_empty(), "nothing new or changed");
+
+        let mut newer = held;
+        newer[0].updated_at += TimeDelta::minutes(5);
+        app.fetched(fetched(newer));
+        assert_eq!(
+            lookup_threads(&app.states_to_look_up()),
+            [1],
+            "new activity, new State maybe"
+        );
+    }
+
+    #[test]
+    fn states_color_the_kind_and_choose_its_icon() {
+        let theme = Theme {
+            kind_pull_request: Style::new().fg(Color::Rgb(1, 1, 1)),
+            state_merged: Style::new().fg(Color::Rgb(8, 8, 8)),
+            state_not_planned: Style::new().fg(Color::Rgb(9, 9, 9)),
+            ..Theme::default()
+        };
+        let mut app = app_in(theme);
+        app.kind_labels = KindLabels::Icons;
+        let asked = app.states_to_look_up();
+
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([
+                (ThreadId(1), SubjectState::Merged),
+                (ThreadId(2), SubjectState::NotPlanned),
+            ])),
+        });
+        let mut terminal =
+            Terminal::new(TestBackend::new(SCREEN_WIDTH, 5)).expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            cell_at(buffer, 1, "\u{f419}").fg,
+            Color::Rgb(8, 8, 8),
+            "merged, over the kind's color"
+        );
+        assert_eq!(
+            cell_at(buffer, 2, "\u{f517}").fg,
+            Color::Rgb(9, 9, 9),
+            "not planned"
+        );
+    }
+
+    #[test]
+    fn failed_lookup_waits_for_the_next_inbox() {
+        let mut app = app();
+        let asked = app.states_to_look_up();
+
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Err(anyhow!("timed out")),
+        });
+
+        assert!(
+            screen(&mut app)[4]
+                .starts_with("Couldn't look up the state of pull requests and issues: timed out")
+        );
+        assert!(
+            app.states_to_look_up().is_empty(),
+            "not straight away again"
+        );
+        app.fetched(fetched(notifications()));
+        assert_eq!(screen(&mut app)[4].trim(), "");
+        assert_eq!(lookup_threads(&app.states_to_look_up()), [1, 2]);
+    }
+
+    #[test]
+    fn states_leave_with_their_notifications() {
+        let mut app = app();
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let asked = app.states_to_look_up();
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([
+                (ThreadId(1), SubjectState::Merged),
+                (ThreadId(2), SubjectState::Completed),
+            ])),
+        });
+
+        app.fetched(fetched(held[1..].to_vec()));
+
+        let kept = app.into_snapshot(Utc::now()).expect("an Inbox").states;
+        assert_eq!(
+            kept.iter().map(|(thread, _)| thread.0).collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
+    #[test]
+    fn kept_states_show_at_once() {
+        let now = Utc::now();
+        let mut app = app_without_inbox();
+        app.kind_labels = KindLabels::Icons;
+
+        app.restore(snapshot(now), now);
+        app.execute(Command::ShowView(0));
+
+        assert!(
+            screen(&mut app)[1].contains("\u{f419} wcgw/ghd"),
+            "merged, from the cache"
+        );
+        assert_eq!(
+            app.into_snapshot(now).expect("an Inbox").states,
+            snapshot(now).states
+        );
     }
 
     #[test]
