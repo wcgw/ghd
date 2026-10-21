@@ -21,4 +21,8 @@ on top of what GitHub lists:
 - The `last_read_at` guess is not GitHub's word. On 2026-10-21 ghd listed 112 where github.com showed 83: at least 29
   threads marked Done elsewhere have a `last_read_at`, and stay. A read notification that isn't Done but has no
   `last_read_at` would be hidden; none was known to.
+- What ghd takes for Done is its Done list (`D`), not GitHub's: Done threads that still have a `last_read_at` aren't in
+  it. A thread can be brought back from it to ghd's Inbox, but only in ghd: GitHub's API has no way to move a thread
+  back to the inbox (checked on 2026-10-21: neither REST nor the public GraphQL schema has one). ghd remembers that
+  word, over the `last_read_at` guess, until the thread gets newer activity or is listed unread.
 - Should GitHub's API ever say which threads are Done, both inferences go.

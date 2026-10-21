@@ -17,7 +17,7 @@ use octocrab::{FromResponse as _, GitHubError, Octocrab, Page};
 
 use serde::Deserialize;
 
-use crate::inbox::{Inbox, Notification, Reason, SubjectKind, ThreadId};
+use crate::inbox::{Listing, Notification, Reason, SubjectKind, ThreadId};
 use crate::state::SubjectState;
 
 /// github.com's hostname.
@@ -191,8 +191,9 @@ impl GitHub {
         })
     }
 
-    /// The whole Inbox, read and unread, fetched page by page. Remembers when GitHub says it last changed, for
-    /// [`GitHub::inbox_if_changed`].
+    /// Everything GitHub lists, fetched page by page and split into the Inbox, read and unread, and what seems Done (a
+    /// read thread with no `last_read_at`, see [`seems_not_done`]). Remembers when GitHub says it last changed, for
+    /// [`GitHub::listing_if_changed`].
     ///
     /// # Errors
     ///
@@ -202,7 +203,7 @@ impl GitHub {
     /// # Cancel Safety
     ///
     /// Cancel safe: dropping the future discards the pages fetched so far, and nothing changes on GitHub.
-    pub async fn inbox(&self) -> anyhow::Result<Inbox> {
+    pub async fn listing(&self) -> anyhow::Result<Listing> {
         let unconditional = "GitHub answered 304 Not Modified to an unconditional request";
         let first = self
             .inbox_page(Uri::from_static(INBOX_FIRST_PAGE), None)
@@ -218,26 +219,33 @@ impl GitHub {
 
         // Only now that every page has arrived, so that a fetch that failed half-way is retried in full.
         self.polling().last_modified = first.last_modified;
-        Ok(notifications
-            .into_iter()
-            .filter(seems_not_done)
-            .map(|api| self.notification_from_api(api))
-            .collect())
+        let (inbox, done): (Vec<ApiNotification>, Vec<ApiNotification>) =
+            notifications.into_iter().partition(seems_not_done);
+        Ok(Listing {
+            inbox: inbox
+                .into_iter()
+                .map(|api| self.notification_from_api(api))
+                .collect(),
+            done: done
+                .into_iter()
+                .map(|api| self.notification_from_api(api))
+                .collect(),
+        })
     }
 
-    /// The whole Inbox if it changed since the last one fetched; `None` when GitHub says it hasn't, an answer that
-    /// doesn't count against the rate limit. The same as [`GitHub::inbox`] until a whole Inbox has been fetched.
+    /// Everything GitHub lists, as [`GitHub::listing`], if it changed since the last fetch; `None` when GitHub says it hasn't, an answer that
+    /// doesn't count against the rate limit. The same as [`GitHub::listing`] until a whole Inbox has been fetched.
     ///
     /// # Errors
     ///
-    /// As for [`GitHub::inbox`].
+    /// As for [`GitHub::listing`].
     ///
     /// # Cancel Safety
     ///
-    /// Cancel safe, as [`GitHub::inbox`] is.
-    pub async fn inbox_if_changed(&self) -> anyhow::Result<Option<Inbox>> {
+    /// Cancel safe, as [`GitHub::listing`] is.
+    pub async fn listing_if_changed(&self) -> anyhow::Result<Option<Listing>> {
         let Some(last_modified) = self.polling().last_modified.clone() else {
-            return self.inbox().await.map(Some);
+            return self.listing().await.map(Some);
         };
         // GitHub answers a conditional request with only the threads updated since `If-Modified-Since`, on a single
         // page, rather than with the whole Inbox: its answer only tells whether to fetch the Inbox whole again.
@@ -248,7 +256,7 @@ impl GitHub {
         if !changed {
             return Ok(None);
         }
-        self.inbox().await.map(Some)
+        self.listing().await.map(Some)
     }
 
     /// How long GitHub wants clients to wait between polls of the Inbox: the last `X-Poll-Interval` it sent, or 60
@@ -800,14 +808,14 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        github.inbox().await.expect("GitHub answers 200");
+        github.listing().await.expect("GitHub answers 200");
         assert_eq!(github.poll_interval(), Duration::from_secs(90));
 
         Mock::given(method("GET"))
             .respond_with(first_page().insert_header("x-poll-interval", "0"))
             .mount(&server)
             .await;
-        github.inbox().await.expect("GitHub answers 200");
+        github.listing().await.expect("GitHub answers 200");
         assert_eq!(
             github.poll_interval(),
             Duration::from_secs(90),
@@ -836,8 +844,11 @@ mod tests {
             .await;
         let github = github_for(&server).await;
 
-        github.inbox().await.expect("GitHub answers 200");
-        let unchanged = github.inbox_if_changed().await.expect("GitHub answers 304");
+        github.listing().await.expect("GitHub answers 200");
+        let unchanged = github
+            .listing_if_changed()
+            .await
+            .expect("GitHub answers 304");
 
         assert!(unchanged.is_none());
         assert_eq!(
@@ -919,11 +930,12 @@ mod tests {
             .mount(&server)
             .await;
         let github = github_for(&server).await;
-        let threads = |inbox: &Inbox| inbox.iter().map(|n| n.thread.0).collect::<Vec<_>>();
+        let threads =
+            |listing: &Listing| listing.inbox.iter().map(|n| n.thread.0).collect::<Vec<_>>();
 
-        let before = github.inbox().await.expect("GitHub answers 200");
+        let before = github.listing().await.expect("GitHub answers 200");
         let after = github
-            .inbox_if_changed()
+            .listing_if_changed()
             .await
             .expect("GitHub answers 200")
             .expect("the Inbox changed");
@@ -970,9 +982,9 @@ mod tests {
             .await;
         let github = github_for(&server).await;
 
-        github.inbox().await.expect_err("the second page fails");
+        github.listing().await.expect_err("the second page fails");
         let inbox = github
-            .inbox_if_changed()
+            .listing_if_changed()
             .await
             .expect("every page is served");
 
@@ -1141,15 +1153,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let inbox = github_for(&server)
+        let listing = github_for(&server)
             .await
-            .inbox()
+            .listing()
             .await
             .expect("GitHub answers 200");
 
-        let mut threads: Vec<u64> = inbox.iter().map(|n| n.thread.0).collect();
+        let mut threads: Vec<u64> = listing.inbox.iter().map(|n| n.thread.0).collect();
         threads.sort_unstable();
-        assert_eq!(threads, [1, 2, 3], "read with no read time: Done");
+        assert_eq!(threads, [1, 2, 3]);
+        let done: Vec<u64> = listing.done.iter().map(|n| n.thread.0).collect();
+        assert_eq!(done, [4], "read with no read time: Done");
     }
 
     #[tokio::test]
@@ -1193,9 +1207,10 @@ mod tests {
 
         let inbox = github_for(&server)
             .await
-            .inbox()
+            .listing()
             .await
-            .expect("both pages are served");
+            .expect("both pages are served")
+            .inbox;
 
         let reasons: Vec<_> = inbox.iter().map(|n| n.reason.clone()).collect();
         assert_eq!(
@@ -1227,7 +1242,7 @@ mod tests {
 
         let error = github_for(&server)
             .await
-            .inbox()
+            .listing()
             .await
             .expect_err("GitHub answers 403");
 
@@ -1252,7 +1267,7 @@ mod tests {
 
         let error = github_for(&server)
             .await
-            .inbox()
+            .listing()
             .await
             .expect_err("GitHub answers 401");
 
@@ -1279,7 +1294,7 @@ mod tests {
         )
         .expect("valid address");
 
-        let error = github.inbox().await.expect_err("nothing answers");
+        let error = github.listing().await.expect_err("nothing answers");
 
         let message = format!("{error:#}");
         assert!(
@@ -1304,7 +1319,7 @@ mod tests {
 
         let error = github_for(&server)
             .await
-            .inbox()
+            .listing()
             .await
             .expect_err("GitHub answers 403");
 

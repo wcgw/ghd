@@ -8,19 +8,19 @@ use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::done::MarkedDone;
+use crate::done::{DoneMark, DoneMarks};
 use crate::github::Account;
-use crate::inbox::{Inbox, Notification, Reason, SubjectKind, ThreadId};
+use crate::inbox::{Listing, Notification, Reason, SubjectKind, ThreadId};
 use crate::state::{Known, States, SubjectState};
 use crate::xdg;
 
 /// The version of the cache file's format; a file of another version is ignored.
 const FORMAT_VERSION: u32 = 1;
 
-/// What ghd keeps between runs: the Inbox as it was, and where the user was in it.
+/// What ghd keeps between runs: the Inbox and the Done list as they were, and where the user was in them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    pub inbox: Inbox,
+    pub listing: Listing,
     pub saved_at: DateTime<Utc>,
     /// The name of the View that was on screen.
     pub view: String,
@@ -28,8 +28,8 @@ pub struct Snapshot {
     pub cursors: BTreeMap<String, ThreadId>,
     /// The Subjects' States known.
     pub states: States,
-    /// What ghd marked Done.
-    pub marked_done: MarkedDone,
+    /// The user's word on which threads are Done.
+    pub marks: DoneMarks,
 }
 
 /// Where one Account's [`Snapshot`] is kept.
@@ -110,19 +110,30 @@ struct File {
     view: String,
     cursors: BTreeMap<String, u64>,
     inbox: Vec<CachedNotification>,
+    /// Missing from files saved before ghd had a Done list.
+    #[serde(default)]
+    done: Vec<CachedNotification>,
     /// Missing from files saved before States were kept.
     #[serde(default)]
     states: Vec<CachedState>,
-    /// Missing from files saved before ghd kept what it marked Done.
+    /// Missing from files saved before ghd kept the user's word on Done.
     #[serde(default)]
-    marked_done: Vec<CachedDone>,
+    marked_done: Vec<CachedMark>,
 }
 
-/// A thread ghd marked Done, with the activity it had then.
+/// The user's word on a thread, with the activity it had then. Files saved before a thread could be brought back
+/// from the Done list have only Done marks, with their time as `done_at`.
 #[derive(Serialize, Deserialize)]
-struct CachedDone {
+struct CachedMark {
     thread: u64,
-    done_at: DateTime<Utc>,
+    #[serde(default = "done_by_default")]
+    done: bool,
+    #[serde(alias = "done_at")]
+    as_of: DateTime<Utc>,
+}
+
+fn done_by_default() -> bool {
+    true
 }
 
 /// A Subject's State, as written: by its name, which a State of a newer ghd might not have.
@@ -146,6 +157,36 @@ struct CachedNotification {
     updated_at: DateTime<Utc>,
 }
 
+impl From<&Notification> for CachedNotification {
+    fn from(n: &Notification) -> Self {
+        Self {
+            thread: n.thread.0,
+            subject_url: n.subject_url.clone(),
+            repository: n.repository.clone(),
+            subject_kind: n.subject_kind.api_name().to_owned(),
+            subject_title: n.subject_title.clone(),
+            reason: n.reason.api_name().to_owned(),
+            unread: n.unread,
+            updated_at: n.updated_at,
+        }
+    }
+}
+
+impl From<CachedNotification> for Notification {
+    fn from(n: CachedNotification) -> Self {
+        Self {
+            thread: ThreadId(n.thread),
+            subject_url: n.subject_url,
+            repository: n.repository,
+            subject_kind: SubjectKind::from_api(&n.subject_kind),
+            subject_title: n.subject_title,
+            reason: Reason::from_api(&n.reason),
+            unread: n.unread,
+            updated_at: n.updated_at,
+        }
+    }
+}
+
 impl File {
     fn from_snapshot(snapshot: &Snapshot) -> Self {
         Self {
@@ -158,18 +199,16 @@ impl File {
                 .map(|(view, thread)| (view.clone(), thread.0))
                 .collect(),
             inbox: snapshot
+                .listing
                 .inbox
                 .iter()
-                .map(|n| CachedNotification {
-                    thread: n.thread.0,
-                    subject_url: n.subject_url.clone(),
-                    repository: n.repository.clone(),
-                    subject_kind: n.subject_kind.api_name().to_owned(),
-                    subject_title: n.subject_title.clone(),
-                    reason: n.reason.api_name().to_owned(),
-                    unread: n.unread,
-                    updated_at: n.updated_at,
-                })
+                .map(CachedNotification::from)
+                .collect(),
+            done: snapshot
+                .listing
+                .done
+                .iter()
+                .map(CachedNotification::from)
                 .collect(),
             states: snapshot
                 .states
@@ -181,11 +220,12 @@ impl File {
                 })
                 .collect(),
             marked_done: snapshot
-                .marked_done
+                .marks
                 .iter()
-                .map(|(thread, done_at)| CachedDone {
+                .map(|(thread, mark)| CachedMark {
                     thread: thread.0,
-                    done_at,
+                    done: mark.done,
+                    as_of: mark.as_of,
                 })
                 .collect(),
         }
@@ -193,20 +233,10 @@ impl File {
 
     fn into_snapshot(self) -> Snapshot {
         Snapshot {
-            inbox: self
-                .inbox
-                .into_iter()
-                .map(|n| Notification {
-                    thread: ThreadId(n.thread),
-                    subject_url: n.subject_url,
-                    repository: n.repository,
-                    subject_kind: SubjectKind::from_api(&n.subject_kind),
-                    subject_title: n.subject_title,
-                    reason: Reason::from_api(&n.reason),
-                    unread: n.unread,
-                    updated_at: n.updated_at,
-                })
-                .collect(),
+            listing: Listing {
+                inbox: self.inbox.into_iter().map(Notification::from).collect(),
+                done: self.done.into_iter().map(Notification::from).collect(),
+            },
             saved_at: self.saved_at,
             view: self.view,
             cursors: self
@@ -214,10 +244,16 @@ impl File {
                 .into_iter()
                 .map(|(view, thread)| (view, ThreadId(thread)))
                 .collect(),
-            marked_done: self
+            marks: self
                 .marked_done
                 .into_iter()
-                .map(|done| (ThreadId(done.thread), done.done_at))
+                .map(|mark| {
+                    let done_mark = DoneMark {
+                        done: mark.done,
+                        as_of: mark.as_of,
+                    };
+                    (ThreadId(mark.thread), done_mark)
+                })
                 .collect(),
             // A State this ghd doesn't know is left out, to be looked up again.
             states: self
@@ -279,27 +315,44 @@ mod tests {
                     .expect("valid RFC 3339"),
             };
         Snapshot {
-            inbox: [
-                notification(1, SubjectKind::PullRequest, Reason::ReviewRequested, true),
-                notification(
-                    2,
-                    SubjectKind::Other("RepositoryAdvisory".to_owned()),
-                    Reason::Other("brand_new_reason".to_owned()),
-                    false,
-                ),
-            ]
-            .into_iter()
-            .collect(),
+            listing: Listing {
+                inbox: [
+                    notification(1, SubjectKind::PullRequest, Reason::ReviewRequested, true),
+                    notification(
+                        2,
+                        SubjectKind::Other("RepositoryAdvisory".to_owned()),
+                        Reason::Other("brand_new_reason".to_owned()),
+                        false,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                done: [notification(4, SubjectKind::Issue, Reason::Mention, false)]
+                    .into_iter()
+                    .collect(),
+            },
             saved_at: "2026-10-21T18:00:00Z".parse().expect("valid RFC 3339"),
             view: "Reviews".to_owned(),
             cursors: BTreeMap::from([
                 ("Inbox".to_owned(), ThreadId(2)),
                 ("Reviews".to_owned(), ThreadId(1)),
             ]),
-            marked_done: [(
-                ThreadId(3),
-                "2026-10-21T09:00:00Z".parse().expect("valid RFC 3339"),
-            )]
+            marks: [
+                (
+                    ThreadId(3),
+                    DoneMark {
+                        done: true,
+                        as_of: "2026-10-21T09:00:00Z".parse().expect("valid RFC 3339"),
+                    },
+                ),
+                (
+                    ThreadId(4),
+                    DoneMark {
+                        done: false,
+                        as_of: "2026-10-21T14:00:00Z".parse().expect("valid RFC 3339"),
+                    },
+                ),
+            ]
             .into_iter()
             .collect(),
             states: [
@@ -392,13 +445,42 @@ mod tests {
             .as_object_mut()
             .expect("an object")
             .remove("marked_done");
+        older.as_object_mut().expect("an object").remove("done");
         std::fs::write(&path, older.to_string()).expect("the directory is writable");
 
         let loaded = cache.load().await.expect("still readable");
 
-        assert_eq!(loaded.inbox, snapshot().inbox);
+        assert_eq!(loaded.listing.inbox, snapshot().listing.inbox);
+        assert!(loaded.listing.done.is_empty(), "no Done list then");
         assert_eq!(loaded.states, States::default());
-        assert_eq!(loaded.marked_done, MarkedDone::default());
+        assert_eq!(loaded.marks, DoneMarks::default());
+    }
+
+    #[tokio::test]
+    async fn done_marks_saved_before_bringing_back_read_as_done() {
+        let dir = ScratchDir::new("cache-old-marks");
+        let cache = Cache::in_dir(Some(&dir.0), &Account::default());
+        let path = cache.path.clone().expect("a cache directory");
+        std::fs::create_dir_all(path.parent().expect("in a directory"))
+            .expect("the directory is writable");
+        let mut older = serde_json::to_value(File::from_snapshot(&snapshot())).expect("encodable");
+        older["marked_done"] =
+            serde_json::json!([{ "thread": 3, "done_at": "2026-10-21T09:00:00Z" }]);
+        std::fs::write(&path, older.to_string()).expect("the directory is writable");
+
+        let loaded = cache.load().await.expect("still readable");
+
+        let marks: Vec<(ThreadId, DoneMark)> = loaded.marks.iter().collect();
+        assert_eq!(
+            marks,
+            [(
+                ThreadId(3),
+                DoneMark {
+                    done: true,
+                    as_of: "2026-10-21T09:00:00Z".parse().expect("valid RFC 3339"),
+                }
+            )]
+        );
     }
 
     #[tokio::test]

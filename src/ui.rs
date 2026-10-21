@@ -20,9 +20,9 @@ use tokio::time::Instant;
 use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
-use crate::done::MarkedDone;
+use crate::done::DoneMarks;
 use crate::github::GitHub;
-use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
+use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
 use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
 use crate::theme::Theme;
@@ -167,24 +167,24 @@ enum Fetch {
 
 /// The outcome of fetching the Inbox.
 struct Fetched {
-    /// When the fetch began: changes GitHub confirmed later may be missing from `inbox`.
+    /// When the fetch began: changes GitHub confirmed later may be missing from `listing`.
     began: Instant,
-    /// The Inbox; `None` if it hadn't changed.
-    inbox: anyhow::Result<Option<Inbox>>,
+    /// What GitHub lists; `None` if it hadn't changed.
+    listing: anyhow::Result<Option<Listing>>,
 }
 
 /// Fetches as much of the Inbox from `github` as `fetch` says.
 ///
 /// # Cancel Safety
 ///
-/// Cancel safe, as [`GitHub::inbox`] is.
+/// Cancel safe, as [`GitHub::listing`] is.
 async fn fetch_inbox(github: &GitHub, fetch: Fetch) -> Fetched {
     let began = Instant::now();
-    let inbox = match fetch {
-        Fetch::Whole => github.inbox().await.map(Some),
-        Fetch::IfChanged => github.inbox_if_changed().await,
+    let listing = match fetch {
+        Fetch::Whole => github.listing().await.map(Some),
+        Fetch::IfChanged => github.listing_if_changed().await,
     };
-    Fetched { began, inbox }
+    Fetched { began, listing }
 }
 
 /// What `run` has to do about a key press, beyond what [`App::press`] did on screen.
@@ -242,13 +242,16 @@ enum Command {
     /// Opens the Subjects in the browser, which also marks them read.
     Open,
     MarkRead,
+    /// Marks Done; in the Done list, brings back to ghd's Inbox.
     MarkDone,
+    /// Shows the Done list in every View in place of the Inbox, or the Inbox again.
+    ToggleDone,
     Help,
 }
 
 /// The commands in the order the help lists them. Adding a command means adding it here too: the help test checks
 /// every key the keymap knows is listed.
-const HELP_ORDER: [Command; 15] = [
+const HELP_ORDER: [Command; 16] = [
     Command::Down,
     Command::Up,
     Command::ToggleSelected,
@@ -259,6 +262,7 @@ const HELP_ORDER: [Command; 15] = [
     Command::Open,
     Command::MarkRead,
     Command::MarkDone,
+    Command::ToggleDone,
     Command::Search,
     Command::Clear,
     Command::Refresh,
@@ -304,7 +308,8 @@ impl Command {
             Self::ShowView(_) => ("1–9", "show a View by its place in the tabs"),
             Self::Open => ("o  Enter", "open in the browser, which marks read"),
             Self::MarkRead => ("I", "mark read"),
-            Self::MarkDone => ("e", "mark Done (GitHub can't undo it)"),
+            Self::MarkDone => ("e", "mark Done; in the Done list, back to the Inbox"),
+            Self::ToggleDone => ("D", "show the Done list, or the Inbox again"),
             Self::Search => ("/", "search the View on screen"),
             Self::Clear => ("Esc", "clear the selection, or else the search"),
             Self::Refresh => ("r", "fetch the Inbox now"),
@@ -331,6 +336,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('o') | KeyCode::Enter => Some(Command::Open),
         KeyCode::Char('I') => Some(Command::MarkRead),
         KeyCode::Char('e') => Some(Command::MarkDone),
+        KeyCode::Char('D') => Some(Command::ToggleDone),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
@@ -357,7 +363,8 @@ enum StatusMessage {
 /// What the app has of the Inbox so far.
 enum InboxState {
     Loading,
-    Loaded(Inbox),
+    /// The Inbox, and the Done list.
+    Loaded(Listing),
     Failed(anyhow::Error),
 }
 
@@ -393,8 +400,10 @@ struct App {
     kind_labels: KindLabels,
     /// The Subjects' States known so far.
     states: States,
-    /// What ghd marked Done, which GitHub keeps listing.
-    marked_done: MarkedDone,
+    /// The user's word on which threads are Done, which GitHub's API can't say.
+    marks: DoneMarks,
+    /// The Done list is on screen, in place of the Inbox, in every View.
+    showing_done: bool,
     /// An Inbox arrived since Subjects' States were last looked up: the ones it changed want looking up.
     states_wanted: bool,
 }
@@ -456,20 +465,21 @@ impl App {
             kind_labels,
             states: States::default(),
             states_wanted: false,
-            marked_done: MarkedDone::default(),
+            marks: DoneMarks::default(),
+            showing_done: false,
         }
     }
 
     /// Takes in the outcome of fetching the Inbox. A fetched Inbox replaces the one on screen, with the user's recent
     /// changes made again. A failed fetch leaves the Inbox on screen as it was, and says why.
     fn fetched(&mut self, fetched: Fetched) {
-        match fetched.inbox {
+        match fetched.listing {
             // Unchanged since the last fetch.
             Ok(None) => {}
-            Ok(Some(mut inbox)) => {
-                self.marked_done.hide_from(&mut inbox);
-                self.recent.reapply(&mut inbox, fetched.began);
-                self.replace_inbox(inbox);
+            Ok(Some(mut listing)) => {
+                self.marks.apply(&mut listing);
+                self.recent.reapply(&mut listing.inbox, fetched.began);
+                self.replace_listing(listing);
                 if matches!(
                     self.status,
                     Some(StatusMessage::FetchFailed(_) | StatusMessage::Cached(_))
@@ -490,13 +500,13 @@ impl App {
         }
     }
 
-    /// Shows `inbox` instead of the Inbox on screen. What it doesn't hold any more leaves the Selection and the
-    /// States, and what it changed wants its State looked up.
-    fn replace_inbox(&mut self, inbox: Inbox) {
-        self.selection.retain(|&thread| inbox.contains(thread));
-        self.states.retain_in(&inbox);
+    /// Shows `listing` instead of the Inbox and Done list on screen. What it doesn't hold any more leaves the
+    /// Selection and the States, and what it changed wants its State looked up.
+    fn replace_listing(&mut self, listing: Listing) {
+        self.selection.retain(|&thread| listing.contains(thread));
+        self.states.retain_in(&listing);
         self.states_wanted = true;
-        self.keeping_cursors(|app| app.inbox = InboxState::Loaded(inbox));
+        self.keeping_cursors(|app| app.inbox = InboxState::Loaded(listing));
     }
 
     /// Makes `input` the Search.
@@ -586,9 +596,13 @@ impl App {
         if !mem::take(&mut self.states_wanted) {
             return Vec::new();
         }
-        self.inbox()
-            .map(|inbox| self.states.stale(inbox))
-            .unwrap_or_default()
+        let InboxState::Loaded(listing) = &self.inbox else {
+            return Vec::new();
+        };
+        // The Done list's too, for when it's on screen.
+        let mut stale = self.states.stale(&listing.inbox);
+        stale.extend(self.states.stale(&listing.done));
+        stale
     }
 
     /// Takes in Subjects' States looked up; a failed lookup is reported until an Inbox is fetched again.
@@ -607,9 +621,9 @@ impl App {
     /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives, with the View that was on screen and
     /// each View's cursor as they were, where they still can be.
     fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
-        self.inbox = InboxState::Loaded(snapshot.inbox);
+        self.inbox = InboxState::Loaded(snapshot.listing);
         self.states = snapshot.states;
-        self.marked_done = snapshot.marked_done;
+        self.marks = snapshot.marks;
         if let Some(index) = self
             .views
             .iter()
@@ -632,27 +646,31 @@ impl App {
         )));
     }
 
-    /// What to keep for next time, as of `now`: the Inbox, the View on screen and each View's cursor; `None`
-    /// until there's an Inbox.
+    /// What to keep for next time, as of `now`: the Inbox and the Done list, the View on screen and each View's
+    /// cursor; `None` until there's an Inbox.
     fn into_snapshot(self, now: DateTime<Utc>) -> Option<Snapshot> {
         let cursors = self
             .views
             .iter()
             .filter_map(|shown_view| {
-                let notification =
-                    at_cursor_in(&self.inbox, shown_view, &self.search, &self.states)?;
+                let notification = at_cursor_in(
+                    on_screen(&self.inbox, self.showing_done),
+                    shown_view,
+                    &self.search,
+                    &self.states,
+                )?;
                 Some((shown_view.view.name.clone(), notification.thread))
             })
             .collect();
         let view = self.views[self.current].view.name.clone();
-        let InboxState::Loaded(inbox) = self.inbox else {
+        let InboxState::Loaded(listing) = self.inbox else {
             return None;
         };
         Some(Snapshot {
-            inbox,
+            listing,
             saved_at: now,
             states: self.states,
-            marked_done: self.marked_done,
+            marks: self.marks,
             view,
             cursors,
         })
@@ -664,7 +682,13 @@ impl App {
             .views
             .iter()
             .map(|shown_view| {
-                at_cursor_in(&self.inbox, shown_view, &self.search, &self.states).map(|n| n.thread)
+                at_cursor_in(
+                    on_screen(&self.inbox, self.showing_done),
+                    shown_view,
+                    &self.search,
+                    &self.states,
+                )
+                .map(|n| n.thread)
             })
             .collect();
         change(self);
@@ -675,8 +699,13 @@ impl App {
     fn move_cursors(&mut self, threads: Vec<Option<ThreadId>>) {
         for (shown_view, thread) in self.views.iter_mut().zip(threads) {
             let row = thread.and_then(|thread| {
-                shown(&self.inbox, &shown_view.view, &self.search, &self.states)
-                    .position(|n| n.thread == thread)
+                shown(
+                    on_screen(&self.inbox, self.showing_done),
+                    &shown_view.view,
+                    &self.search,
+                    &self.states,
+                )
+                .position(|n| n.thread == thread)
             });
             if let Some(row) = row {
                 shown_view.cursor.select(Some(row));
@@ -724,7 +753,7 @@ impl App {
             }
             Command::SelectAllShown => {
                 let shown: Vec<ThreadId> = shown(
-                    &self.inbox,
+                    on_screen(&self.inbox, self.showing_done),
                     &self.views[self.current].view,
                     &self.search,
                     &self.states,
@@ -762,6 +791,11 @@ impl App {
                 }
             }
             Command::Help => self.help_shown = true,
+            Command::ToggleDone => {
+                // The Selection is of the list that was on screen.
+                self.selection.clear();
+                self.keeping_cursors(|app| app.showing_done = !app.showing_done);
+            }
             Command::Open => return self.open(),
             Command::MarkRead => {
                 let targets = self.take_targets();
@@ -779,14 +813,14 @@ impl App {
         Vec::new()
     }
 
-    /// What an action acts on, taking it: the Selection, in the Inbox's order, which empties it; or else the
+    /// What an action acts on, taking it: the Selection, in the order of the list on screen, which empties it; or else the
     /// Notification at the cursor. Empty when there's nothing to act on.
     fn take_targets(&mut self) -> Vec<ThreadId> {
         if self.selection.is_empty() {
             return self.at_cursor().map(|n| n.thread).into_iter().collect();
         }
         let selection = mem::take(&mut self.selection);
-        self.inbox()
+        on_screen(&self.inbox, self.showing_done)
             .into_iter()
             .flat_map(Inbox::iter)
             .filter(|n| selection.contains(&n.thread))
@@ -801,8 +835,8 @@ impl App {
         let mut opened = Vec::new();
         for thread in targets {
             let Some(url) = self
-                .inbox()
-                .and_then(|inbox| inbox.get(thread))
+                .on_screen()
+                .and_then(|list| list.get(thread))
                 .map(|n| n.subject_url.clone())
             else {
                 continue;
@@ -821,7 +855,7 @@ impl App {
     /// Clears Unread on the Notifications of `threads`. Returns a change for each that was unread, holding it as
     /// it was before.
     fn mark_read(&mut self, threads: Vec<ThreadId>) -> Vec<Change> {
-        let Some(inbox) = self.inbox_mut() else {
+        let Some(Listing { inbox, .. }) = self.listing_mut() else {
             return Vec::new();
         };
         let changes: Vec<Change> = threads
@@ -837,21 +871,29 @@ impl App {
         self.made(changes)
     }
 
-    /// Takes what an action acts on out of the Inbox, and so out of every View. Returns a change for each; the
-    /// cursor moves to the Notification below.
+    /// Moves what an action acts on from the Inbox to the Done list, in every View. Returns a change for each; the
+    /// cursor moves to the Notification below. In the Done list, brings it back instead (see [`App::bring_back`]).
     fn mark_done(&mut self) -> Vec<Change> {
+        if self.showing_done {
+            self.bring_back();
+            return Vec::new();
+        }
         let targets = self.take_targets();
-        let Some(inbox) = self.inbox_mut() else {
+        let Some(listing) = self.listing_mut() else {
             return Vec::new();
         };
-        let changes: Vec<Change> = targets
+        let mut changes = Vec::new();
+        for notification in targets
             .into_iter()
-            .filter_map(|thread| inbox.remove(thread))
-            .map(Change::MarkDone)
-            .collect();
+            .filter_map(|thread| listing.inbox.remove(thread))
+        {
+            // Cloned: the Done list shows it, and the change keeps it as it was, should GitHub refuse.
+            listing.done.insert(notification.clone());
+            changes.push(Change::MarkDone(notification));
+        }
         for change in &changes {
             if let Change::MarkDone(n) = change {
-                self.marked_done.insert(n);
+                self.marks.mark_done(n);
             }
         }
         match changes.as_slice() {
@@ -870,6 +912,39 @@ impl App {
             }
         }
         self.made(changes)
+    }
+
+    /// Moves what an action acts on from the Done list back to ghd's Inbox, and keeps it there until GitHub lists it
+    /// unread or with newer activity. Only in ghd: GitHub's API can't move a thread back to the inbox, so GitHub
+    /// keeps it Done.
+    fn bring_back(&mut self) {
+        let targets = self.take_targets();
+        let Some(listing) = self.listing_mut() else {
+            return;
+        };
+        let brought: Vec<Notification> = targets
+            .into_iter()
+            .filter_map(|thread| listing.done.remove(thread))
+            .collect();
+        for notification in &brought {
+            self.marks.mark_not_done(notification);
+        }
+        self.status = match brought.as_slice() {
+            [] => return,
+            [notification] => Some(StatusMessage::Info(format!(
+                "Back in ghd's Inbox (GitHub keeps it Done): {}",
+                notification.subject_title
+            ))),
+            brought => Some(StatusMessage::Info(format!(
+                "{} back in ghd's Inbox (GitHub keeps them Done)",
+                brought.len()
+            ))),
+        };
+        if let Some(listing) = self.listing_mut() {
+            for notification in brought {
+                listing.inbox.insert(notification);
+            }
+        }
     }
 
     /// Notes `changes`, made on screen, as on their way to GitHub, and hands them back to be sent.
@@ -892,33 +967,43 @@ impl App {
             reply.change
         )));
         if let Change::MarkDone(n) = &reply.change {
-            self.marked_done.remove(n.thread);
+            self.marks.forget(n.thread);
         }
-        if let Some(inbox) = self.inbox_mut() {
-            reply.change.undo(inbox);
+        if let Some(listing) = self.listing_mut() {
+            if let Change::MarkDone(n) = &reply.change {
+                listing.done.remove(n.thread);
+            }
+            reply.change.undo(&mut listing.inbox);
         }
     }
 
     /// The Notification at the cursor of the View on screen; `None` until the Inbox arrives, or if the View shows none.
     fn at_cursor(&self) -> Option<&Notification> {
         at_cursor_in(
-            &self.inbox,
+            on_screen(&self.inbox, self.showing_done),
             &self.views[self.current],
             &self.search,
             &self.states,
         )
     }
 
+    /// The list on screen: the Inbox, or the Done list; `None` until they arrive.
+    fn on_screen(&self) -> Option<&Inbox> {
+        on_screen(&self.inbox, self.showing_done)
+    }
+
+    /// The Inbox; `None` until it arrives.
+    #[cfg(test)]
     fn inbox(&self) -> Option<&Inbox> {
         match &self.inbox {
-            InboxState::Loaded(inbox) => Some(inbox),
+            InboxState::Loaded(listing) => Some(&listing.inbox),
             InboxState::Loading | InboxState::Failed(_) => None,
         }
     }
 
-    fn inbox_mut(&mut self) -> Option<&mut Inbox> {
+    fn listing_mut(&mut self) -> Option<&mut Listing> {
         match &mut self.inbox {
-            InboxState::Loaded(inbox) => Some(inbox),
+            InboxState::Loaded(listing) => Some(listing),
             InboxState::Loading | InboxState::Failed(_) => None,
         }
     }
@@ -957,8 +1042,13 @@ impl App {
             ));
         }
         let current = &mut self.views[self.current];
-        let rows: Vec<&Notification> =
-            shown(&self.inbox, &current.view, &self.search, &self.states).collect();
+        let rows: Vec<&Notification> = shown(
+            on_screen(&self.inbox, self.showing_done),
+            &current.view,
+            &self.search,
+            &self.states,
+        )
+        .collect();
         let message = match &self.inbox {
             InboxState::Loading => Paragraph::new("Fetching notifications…").style(theme.message),
             InboxState::Failed(error) => {
@@ -966,20 +1056,35 @@ impl App {
                     .style(theme.error)
                     .wrap(Wrap { trim: false })
             }
-            InboxState::Loaded(inbox) if inbox.is_empty() => {
-                Paragraph::new("Nothing in your Inbox.").style(theme.message)
+            InboxState::Loaded(_)
+                if on_screen(&self.inbox, self.showing_done).is_none_or(Inbox::is_empty) =>
+            {
+                Paragraph::new(if self.showing_done {
+                    "Nothing in the Done list."
+                } else {
+                    "Nothing in your Inbox."
+                })
+                .style(theme.message)
             }
             InboxState::Loaded(_)
                 if rows.is_empty()
-                    && shown(&self.inbox, &current.view, &Search::default(), &self.states)
-                        .next()
-                        .is_some() =>
+                    && shown(
+                        on_screen(&self.inbox, self.showing_done),
+                        &current.view,
+                        &Search::default(),
+                        &self.states,
+                    )
+                    .next()
+                    .is_some() =>
             {
                 Paragraph::new("Nothing in this View matches the search.").style(theme.message)
             }
-            InboxState::Loaded(_) if rows.is_empty() => {
-                Paragraph::new("Nothing in your Inbox matches this View.").style(theme.message)
-            }
+            InboxState::Loaded(_) if rows.is_empty() => Paragraph::new(if self.showing_done {
+                "Nothing in the Done list matches this View."
+            } else {
+                "Nothing in your Inbox matches this View."
+            })
+            .style(theme.message),
             InboxState::Loaded(_) => {
                 let look = RowLook {
                     theme,
@@ -1031,19 +1136,34 @@ impl App {
     }
 
     /// The tabs: each View's name and, once the Inbox has arrived, how many unread Notifications it shows, the
-    /// Search included. The View on screen is highlighted.
+    /// Search included; in the Done list, which is all read, how many Notifications. The View on screen is
+    /// highlighted.
     fn tabs(&self) -> Line<'static> {
         let mut spans = vec![Span::raw(" ")];
+        if self.showing_done {
+            spans.extend([
+                Span::styled("Done", self.theme.tab_current),
+                Span::raw(": "),
+            ]);
+        }
         for (index, shown_view) in self.views.iter().enumerate() {
             if index > 0 {
                 spans.push(Span::raw(" │ "));
             }
             let label = match &self.inbox {
                 InboxState::Loaded(_) => {
-                    let unread = shown(&self.inbox, &shown_view.view, &self.search, &self.states)
-                        .filter(|n| n.unread)
-                        .count();
-                    format!("{} ({unread})", shown_view.view.name)
+                    let shown_here = shown(
+                        on_screen(&self.inbox, self.showing_done),
+                        &shown_view.view,
+                        &self.search,
+                        &self.states,
+                    );
+                    let count = if self.showing_done {
+                        shown_here.count()
+                    } else {
+                        shown_here.filter(|n| n.unread).count()
+                    };
+                    format!("{} ({count})", shown_view.view.name)
                 }
                 InboxState::Loading | InboxState::Failed(_) => shown_view.view.name.clone(),
             };
@@ -1078,7 +1198,6 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     lines.extend([
         Line::default(),
         Line::styled(SELECTION_HELP, theme.help_heading),
-        Line::default(),
         Line::styled("In the search prompt:", theme.help_heading),
     ]);
     lines.extend(SEARCH_PROMPT_HELP.iter().map(line));
@@ -1103,29 +1222,35 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     );
 }
 
+/// The list on screen: the Done list while `showing_done`, the Inbox otherwise; `None` until they've arrived.
+fn on_screen(inbox: &InboxState, showing_done: bool) -> Option<&Inbox> {
+    match inbox {
+        InboxState::Loaded(listing) if showing_done => Some(&listing.done),
+        InboxState::Loaded(listing) => Some(&listing.inbox),
+        InboxState::Loading | InboxState::Failed(_) => None,
+    }
+}
+
 /// The Notification at the cursor of `shown_view` narrowed by `search`; `None` until the Inbox has arrived, or if
 /// nothing is shown.
 fn at_cursor_in<'a>(
-    inbox: &'a InboxState,
+    list: Option<&'a Inbox>,
     shown_view: &'a ShownView,
     search: &'a Search,
     states: &'a States,
 ) -> Option<&'a Notification> {
-    shown(inbox, &shown_view.view, search, states).nth(shown_view.cursor.selected()?)
+    shown(list, &shown_view.view, search, states).nth(shown_view.cursor.selected()?)
 }
 
-/// The Notifications `view` shows narrowed by `search`, their Subjects' States as in `states`, newest first; none until the Inbox has arrived.
+/// The Notifications of `list` (the Inbox, or the Done list) that `view` shows, narrowed by `search`, their
+/// Subjects' States as in `states`, newest first; none until the Inbox has arrived.
 fn shown<'a>(
-    inbox: &'a InboxState,
+    list: Option<&'a Inbox>,
     view: &'a View,
     search: &'a Search,
     states: &'a States,
 ) -> impl Iterator<Item = &'a Notification> {
-    let inbox = match inbox {
-        InboxState::Loaded(inbox) => Some(inbox),
-        InboxState::Loading | InboxState::Failed(_) => None,
-    };
-    inbox.into_iter().flat_map(Inbox::iter).filter(|n| {
+    list.into_iter().flat_map(Inbox::iter).filter(|n| {
         let state = states.get(n);
         view.filter.matches(n, state) && search.matches(n, state)
     })
@@ -1353,7 +1478,10 @@ mod tests {
     fn fetched(notifications: Vec<Notification>) -> Fetched {
         Fetched {
             began: Instant::now(),
-            inbox: Ok(Some(notifications.into_iter().collect())),
+            listing: Ok(Some(Listing {
+                inbox: notifications.into_iter().collect(),
+                done: Inbox::default(),
+            })),
         }
     }
 
@@ -1361,7 +1489,7 @@ mod tests {
     fn fetch_failed() -> Fetched {
         Fetched {
             began: Instant::now(),
-            inbox: Err(anyhow!("timed out")),
+            listing: Err(anyhow!("timed out")),
         }
     }
 
@@ -1480,6 +1608,10 @@ mod tests {
         assert_eq!(press(KeyCode::Char('/'), none), Some(Command::Search));
         assert_eq!(press(KeyCode::Esc, none), Some(Command::Clear));
         assert_eq!(press(KeyCode::Char('?'), none), Some(Command::Help));
+        assert_eq!(
+            press(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            Some(Command::ToggleDone)
+        );
         assert_eq!(
             press(KeyCode::Char(' '), none),
             Some(Command::ToggleSelected)
@@ -1677,9 +1809,14 @@ mod tests {
 
         app.fetched(fetched(newer));
 
-        let inbox_view: Vec<&str> = shown(&app.inbox, &app.views[0].view, &app.search, &app.states)
-            .map(|n| n.subject_title.as_str())
-            .collect();
+        let inbox_view: Vec<&str> = shown(
+            on_screen(&app.inbox, app.showing_done),
+            &app.views[0].view,
+            &app.search,
+            &app.states,
+        )
+        .map(|n| n.subject_title.as_str())
+        .collect();
         assert_eq!(inbox_view, ["Brand new", "Add polling", "Old news"]);
         assert_eq!(cursor_title(&app), Some("Old news"));
     }
@@ -1791,6 +1928,153 @@ mod tests {
         assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
     }
 
+    /// `notifications` fetched, with GitHub's data making "Gone quiet" (thread 3, read, older than any) seem Done.
+    fn fetched_with_done(notifications: Vec<Notification>) -> Fetched {
+        let gone_quiet = Notification {
+            thread: ThreadId(3),
+            subject_title: "Gone quiet".to_owned(),
+            unread: false,
+            // From the Notifications given, so that the same ones give the same "Gone quiet".
+            updated_at: notifications[1].updated_at - TimeDelta::days(5),
+            ..notifications[1].clone()
+        };
+        Fetched {
+            began: Instant::now() + Duration::from_secs(1),
+            listing: Ok(Some(Listing {
+                inbox: notifications.into_iter().collect(),
+                done: [gone_quiet].into_iter().collect(),
+            })),
+        }
+    }
+
+    /// The titles in `app`'s Inbox, newest first.
+    fn inbox_titles(app: &App) -> Vec<&str> {
+        app.inbox()
+            .expect("fetched")
+            .iter()
+            .map(|n| n.subject_title.as_str())
+            .collect()
+    }
+
+    /// The titles of the rows on `lines`, of any Notification.
+    fn row_titles(lines: &[String]) -> Vec<&str> {
+        lines[1..4]
+            .iter()
+            .filter_map(|line| {
+                ["Brand new", "Add polling", "Old news", "Gone quiet"]
+                    .into_iter()
+                    .find(|title| line.contains(title))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn d_shows_the_done_list_in_every_view() {
+        let mut app = app();
+        app.fetched(fetched_with_done(notifications()));
+        app.execute(Command::MarkDone);
+
+        assert_eq!(row_titles(&screen(&mut app)), ["Old news"], "the Inbox");
+        assert!(app.press(key_named("D")).is_none());
+
+        let lines = screen(&mut app);
+        assert_eq!(
+            row_titles(&lines),
+            ["Add polling", "Gone quiet"],
+            "marked Done here, and seemingly Done"
+        );
+        assert!(
+            lines[0].contains(" Done: Inbox (2) │ Reviews (1) │ Read (1) "),
+            "{lines:#?}"
+        );
+        app.execute(Command::ShowView(2));
+        assert_eq!(
+            row_titles(&screen(&mut app)),
+            ["Gone quiet"],
+            "the Views apply"
+        );
+
+        app.press(key_named("D"));
+        app.execute(Command::ShowView(0));
+        assert_eq!(
+            row_titles(&screen(&mut app)),
+            ["Old news"],
+            "the Inbox again"
+        );
+    }
+
+    #[test]
+    fn e_in_the_done_list_brings_back_to_ghds_inbox_only() {
+        let mut app = app();
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        app.fetched(fetched_with_done(held.clone()));
+        app.press(key_named("D"));
+        app.press(key_named("A"));
+
+        let outcome = app.press(key_named("e"));
+
+        assert!(outcome.is_none(), "nothing for GitHub");
+        let lines = screen(&mut app);
+        assert!(lines[1].contains("Nothing in the Done list."), "{lines:#?}");
+        assert!(
+            lines[4].starts_with("Back in ghd's Inbox (GitHub keeps it Done): Gone quiet"),
+            "{lines:#?}"
+        );
+        app.press(key_named("D"));
+        assert_eq!(
+            inbox_titles(&app),
+            ["Add polling", "Old news", "Gone quiet"]
+        );
+
+        // GitHub's data still makes "Gone quiet" seem Done: brought back, it stays in the Inbox.
+        app.fetched(fetched_with_done(held));
+        assert_eq!(
+            inbox_titles(&app),
+            ["Add polling", "Old news", "Gone quiet"]
+        );
+    }
+
+    #[test]
+    fn switching_lists_drops_the_selection() {
+        let mut app = app();
+        app.press(key_named("Space"));
+
+        app.press(key_named("D"));
+
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn refused_done_leaves_the_done_list() {
+        let mut app = app();
+        let done = app
+            .execute(Command::MarkDone)
+            .pop()
+            .expect("a Notification at the cursor");
+
+        app.settle(Reply {
+            change: done,
+            accepted: refused(),
+        });
+        app.press(key_named("D"));
+
+        assert!(screen(&mut app)[1].contains("Nothing in the Done list."));
+    }
+
+    #[test]
+    fn done_list_states_are_looked_up_too() {
+        let mut app = app();
+        app.states_to_look_up();
+        app.fetched(fetched_with_done(notifications()));
+
+        let asked = app.states_to_look_up();
+
+        assert!(
+            asked.iter().any(|lookup| lookup.thread == ThreadId(3)),
+            "Gone quiet, in the Done list"
+        );
+    }
+
     #[test]
     fn refused_done_is_not_hidden_again() {
         let mut app = app();
@@ -1839,7 +2123,7 @@ mod tests {
 
         app.fetched(Fetched {
             began: Instant::now(),
-            inbox: Ok(None),
+            listing: Ok(None),
         });
 
         assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
@@ -2111,6 +2395,7 @@ mod tests {
                 .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
         };
         for label in [
+            "D",
             "Space",
             "A",
             "j",
@@ -2177,9 +2462,10 @@ mod tests {
             .map(|line| line.iter().map(|cell| cell.symbol()).collect())
             .collect();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains(&format!("{:14}  mark Done (GitHub can't undo it)", "e"))),
+            lines.iter().any(|line| line.contains(&format!(
+                "{:14}  mark Done; in the Done list, back to the Inbox",
+                "e"
+            ))),
             "{lines:#?}"
         );
         assert!(
@@ -2280,7 +2566,10 @@ mod tests {
     /// `now`.
     fn snapshot(now: DateTime<Utc>) -> Snapshot {
         Snapshot {
-            inbox: notifications().into_iter().collect(),
+            listing: Listing {
+                inbox: notifications().into_iter().collect(),
+                done: Inbox::default(),
+            },
             saved_at: now - TimeDelta::hours(2),
             view: "Read".to_owned(),
             cursors: BTreeMap::from([
@@ -2288,7 +2577,7 @@ mod tests {
                 ("Read".to_owned(), ThreadId(2)),
                 ("Gone".to_owned(), ThreadId(1)),
             ]),
-            marked_done: MarkedDone::default(),
+            marks: DoneMarks::default(),
             // "Add polling" was merged, as of before its latest activity.
             states: [(
                 ThreadId(1),
@@ -2369,7 +2658,7 @@ mod tests {
             ]),
             "Reviews shows nothing under the search"
         );
-        let threads: Vec<u64> = snapshot.inbox.iter().map(|n| n.thread.0).collect();
+        let threads: Vec<u64> = snapshot.listing.inbox.iter().map(|n| n.thread.0).collect();
         assert_eq!(threads, [1, 2]);
     }
 

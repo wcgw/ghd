@@ -32,6 +32,10 @@ A **Notification** with activity the user hasn't seen yet; reading it doesn't re
 A **Notification** the user has finished with; it leaves the **Inbox**.
 _Avoid_: archived, dismissed, read
 
+**Done list**:
+The **Notifications** ghd takes for **Done**, shown in every **View** in place of the **Inbox** when the user asks; ghd's view of **Done**, not GitHub's.
+_Avoid_: archive, done view
+
 **Filter**:
 A rule that a **Notification** either matches or doesn't; it has no name and is never shown on its own.
 _Avoid_: query, rule, search
@@ -59,6 +63,7 @@ _Avoid_: folder, bucket, tab, filter
 - A **Subject**'s **State** isn't part of its **Notification**: ghd looks it up apart, again whenever the **Notification** has new activity, and shows the last one it knows
 - A **Filter** or a **Search** can ask for a **State**; a **Notification** whose **State** isn't known matches none, only the negation of one
 - GitHub's API doesn't say which **Notifications** are **Done**: ghd takes for **Done** those it marked **Done** itself (until they get new activity or are **Unread** again) and read ones GitHub has no read time for (see `docs/adr/0002-inferring-done.md`)
+- Bringing a **Notification** back from the **Done list** puts it in ghd's **Inbox** only: GitHub's API can't move a thread back to its inbox, so GitHub keeps it **Done**
 - Opening a **Notification** clears **Unread**; marking it **Done** removes it from the **Inbox** and so from every **View**
 - A **View** has exactly one **Filter**
 - There is always one built-in **View**, named "Inbox", that shows the whole **Inbox**; it comes first and can't be removed or redefined, and configured **Views** follow in config order

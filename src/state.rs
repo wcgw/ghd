@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
+use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
 
 /// Where a Subject stands on GitHub. Only pull requests and issues have one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,9 +128,9 @@ impl States {
         }
     }
 
-    /// Forgets the States of Subjects whose Notifications `inbox` doesn't hold.
-    pub fn retain_in(&mut self, inbox: &Inbox) {
-        self.known.retain(|&thread, _| inbox.contains(thread));
+    /// Forgets the States of Subjects whose Notifications neither of `listing`'s lists holds.
+    pub fn retain_in(&mut self, listing: &Listing) {
+        self.known.retain(|&thread, _| listing.contains(thread));
     }
 
     /// What's known, in no particular order.
@@ -261,11 +261,12 @@ mod tests {
             ]),
         );
 
-        states.retain_in(
-            &[notification(2, SubjectKind::PullRequest, now)]
+        states.retain_in(&Listing {
+            inbox: Inbox::default(),
+            done: [notification(2, SubjectKind::PullRequest, now)]
                 .into_iter()
                 .collect(),
-        );
+        });
 
         assert_eq!(
             states

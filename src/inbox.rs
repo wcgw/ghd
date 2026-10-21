@@ -23,11 +23,6 @@ impl Inbox {
         self.notifications.iter().find(|n| n.thread == thread)
     }
 
-    /// Whether the Inbox holds a Notification for `thread`.
-    pub fn contains(&self, thread: ThreadId) -> bool {
-        self.get(thread).is_some()
-    }
-
     /// Whether the Inbox holds no Notification at all.
     pub fn is_empty(&self) -> bool {
         self.notifications.is_empty()
@@ -64,6 +59,43 @@ impl Inbox {
 
     fn find_mut(&mut self, thread: ThreadId) -> Option<&mut Notification> {
         self.notifications.iter_mut().find(|n| n.thread == thread)
+    }
+}
+
+/// Everything GitHub lists, split in two: the Inbox, and the Done list, of the Notifications that seem Done. GitHub's
+/// API lists both, and doesn't say which is which (see `docs/adr/0002-inferring-done.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub inbox: Inbox,
+    /// Kept in the same order as an Inbox: most recently updated first.
+    pub done: Inbox,
+}
+
+impl Listing {
+    /// The Notification for `thread`, in either list; `None` if neither holds one.
+    pub fn get(&self, thread: ThreadId) -> Option<&Notification> {
+        self.inbox.get(thread).or_else(|| self.done.get(thread))
+    }
+
+    /// Whether either list holds a Notification for `thread`.
+    pub fn contains(&self, thread: ThreadId) -> bool {
+        self.get(thread).is_some()
+    }
+
+    /// Moves the Notification for `thread` to the Done list (`done`), or to the Inbox; nothing if neither holds one.
+    pub fn put(&mut self, thread: ThreadId, done: bool) {
+        let Some(notification) = self
+            .inbox
+            .remove(thread)
+            .or_else(|| self.done.remove(thread))
+        else {
+            return;
+        };
+        if done {
+            self.done.insert(notification);
+        } else {
+            self.inbox.insert(notification);
+        }
     }
 }
 
