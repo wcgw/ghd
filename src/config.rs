@@ -1,8 +1,9 @@
-//! The configuration file: the Account to act as, and the Views.
+//! The configuration file: the Account to act as, the theme, and the Views.
 //!
 //! ```toml
 //! host = "github.example.com"   # optional, github.com by default
 //! user = "alexsnaps"            # optional, `gh`'s active account on the host by default
+//! theme = "terminal"            # optional, tokyonight-moon by default
 //!
 //! [[view]]
 //! name = "Reviews"
@@ -18,6 +19,7 @@ use serde::Deserialize;
 
 use crate::filter::Filter;
 use crate::github::Account;
+use crate::theme;
 
 /// The built-in View's name.
 const INBOX_VIEW: &str = "Inbox";
@@ -33,6 +35,8 @@ pub struct View {
 #[derive(Debug)]
 pub struct Config {
     account: Account,
+    /// The name of the theme to use.
+    theme: String,
     /// The built-in Inbox View, then the configured ones in the file's order; names are unique, ignoring case.
     views: Vec<View>,
 }
@@ -46,7 +50,7 @@ impl Config {
     /// Fails if the file exists but can't be read, or isn't a valid configuration. The error names the file, and
     /// what's wrong in it: the host or user, or the View and the part of its filter.
     pub async fn load() -> anyhow::Result<Self> {
-        let Some(path) = config_path() else {
+        let Some(path) = dir().map(|dir| dir.join("config.toml")) else {
             return Ok(Self::default());
         };
         match tokio::fs::read_to_string(&path).await {
@@ -62,6 +66,11 @@ impl Config {
         &self.account
     }
 
+    /// The name of the theme to use.
+    pub fn theme(&self) -> &str {
+        &self.theme
+    }
+
     /// The Views to show as tabs: the built-in Inbox View first, then the configured ones in the file's order.
     pub fn into_views(self) -> Vec<View> {
         self.views
@@ -72,6 +81,7 @@ impl Config {
         let file: File = toml::from_str(text)?;
         let mut config = Self {
             account: Account::new(file.host.as_deref(), file.user.as_deref())?,
+            theme: file.theme.unwrap_or_else(|| theme::DEFAULT.to_owned()),
             ..Self::default()
         };
         for entry in file.views {
@@ -104,11 +114,12 @@ impl Config {
     }
 }
 
-/// `gh`'s active account on github.com, and only the built-in Inbox View.
+/// `gh`'s active account on github.com, the default theme, and only the built-in Inbox View.
 impl Default for Config {
     fn default() -> Self {
         Self {
             account: Account::default(),
+            theme: theme::DEFAULT.to_owned(),
             views: vec![View {
                 name: INBOX_VIEW.to_owned(),
                 filter: Filter::default(),
@@ -123,6 +134,7 @@ impl Default for Config {
 struct File {
     host: Option<String>,
     user: Option<String>,
+    theme: Option<String>,
     #[serde(default, rename = "view")]
     views: Vec<ViewEntry>,
 }
@@ -135,15 +147,16 @@ struct ViewEntry {
     filter: String,
 }
 
-/// Where the configuration file is; `None` when neither `XDG_CONFIG_HOME` nor `HOME` is set.
-fn config_path() -> Option<PathBuf> {
+/// The directory of ghd's configuration file and themes: `$XDG_CONFIG_HOME/ghd`, or `~/.config/ghd` when
+/// `XDG_CONFIG_HOME` isn't set; `None` when neither it nor `HOME` is.
+pub fn dir() -> Option<PathBuf> {
     let set = |name| {
         env::var_os(name)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     };
     let config_home = set("XDG_CONFIG_HOME").or_else(|| Some(set("HOME")?.join(".config")))?;
-    Some(config_home.join("ghd").join("config.toml"))
+    Some(config_home.join("ghd"))
 }
 
 #[cfg(test)]
@@ -177,6 +190,18 @@ mod tests {
         assert_eq!(
             config.account,
             Account::new(Some("github.example.com"), Some("alexsnaps")).expect("valid account")
+        );
+    }
+
+    #[test]
+    fn theme_is_tokyonight_moon_unless_the_file_says() {
+        assert_eq!(Config::default().theme(), "tokyonight-moon");
+        assert_eq!(Config::parse("").expect("valid").theme(), "tokyonight-moon");
+        assert_eq!(
+            Config::parse("theme = \"terminal\"")
+                .expect("valid")
+                .theme(),
+            "terminal"
         );
     }
 

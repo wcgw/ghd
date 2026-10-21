@@ -1,5 +1,6 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
+use std::borrow::Cow;
 use std::mem;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures_util::future::OptionFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Style, Stylize as _};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -20,6 +21,7 @@ use crate::config::View;
 use crate::github::GitHub;
 use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
 use crate::search::{self, Search};
+use crate::theme::Theme;
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: u16 = 32;
@@ -27,8 +29,9 @@ const MAX_REPOSITORY_WIDTH: u16 = 32;
 /// Longest that quitting waits for changes still on their way to GitHub.
 const QUIT_GRACE: Duration = Duration::from_secs(10);
 
-/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order. Meanwhile it keeps the
-/// Inbox up to date from `github`, polling as often as GitHub allows, and sends it the changes the user makes.
+/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`. Meanwhile it
+/// keeps the Inbox up to date from `github`, polling as often as GitHub allows, and sends it the changes the user
+/// makes.
 ///
 /// # Errors
 ///
@@ -43,8 +46,9 @@ pub async fn run(
     terminal: &mut DefaultTerminal,
     github: &GitHub,
     views: Vec<View>,
+    theme: Theme,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(views);
+    let mut app = App::new(views, theme);
     let mut events = EventStream::new();
     // The fetch under way, if any; never more than one. Polled alongside terminal events, so the UI keeps drawing
     // and can be quit while pages arrive.
@@ -313,6 +317,7 @@ struct App {
     search_prompt: Option<SearchPrompt>,
     /// The help is shown over the View.
     help_shown: bool,
+    theme: Theme,
 }
 
 /// The prompt the user types a Search into.
@@ -339,12 +344,13 @@ enum Step {
 }
 
 impl App {
-    /// The app waiting for the Inbox, with `views` as tabs in that order and the first of them on screen.
+    /// The app waiting for the Inbox, with `views` as tabs in that order and the first of them on screen, in
+    /// `theme`.
     ///
     /// # Panics
     ///
     /// If `views` is empty.
-    fn new(views: Vec<View>) -> Self {
+    fn new(views: Vec<View>, theme: Theme) -> Self {
         assert!(
             !views.is_empty(),
             "the configuration always has the Inbox View"
@@ -366,6 +372,7 @@ impl App {
             search: Search::default(),
             search_prompt: None,
             help_shown: false,
+            theme,
         }
     }
 
@@ -635,37 +642,44 @@ impl App {
 
     /// Draws the app on `frame`, saying so when a fetch of the Inbox is under way (`fetching`).
     fn render(&mut self, frame: &mut Frame, fetching: bool) {
+        // The theme's text style, background included, under everything else.
+        frame.render_widget(Block::new().style(self.theme.text), frame.area());
         let [view_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
         self.render_view(frame, view_area, fetching);
         if self.help_shown {
-            render_help(frame);
+            render_help(frame, &self.theme);
         }
     }
 
     /// Draws the View on screen in `area`, its tabs and what's going on in its border.
     fn render_view(&mut self, frame: &mut Frame, area: Rect, fetching: bool) {
+        let theme = &self.theme;
         let mut block = Block::bordered()
+            .border_style(theme.border)
             .title(self.tabs())
-            .title_bottom(Line::from(" ? keys ").right_aligned());
+            .title_bottom(Line::styled(" ? keys ", theme.hint).right_aligned());
         if fetching {
-            block = block.title_top(Line::from(" fetching… ").right_aligned());
+            block = block.title_top(Line::styled(" fetching… ", theme.fetching).right_aligned());
         }
         if !self.search_input.is_empty() && !self.is_typing_search() {
-            block = block.title_bottom(format!(" /{} ", self.search_input));
+            block = block.title_bottom(Line::styled(
+                format!(" /{} ", self.search_input),
+                theme.search,
+            ));
         }
         let current = &mut self.views[self.current];
         let rows: Vec<&Notification> = shown(&self.inbox, &current.view, &self.search).collect();
         let message = match &self.inbox {
-            InboxState::Loading => Paragraph::new("Fetching notifications…"),
+            InboxState::Loading => Paragraph::new("Fetching notifications…").style(theme.message),
             InboxState::Failed(error) => {
                 Paragraph::new(format!("Couldn't fetch notifications: {error:#}"))
-                    .red()
+                    .style(theme.error)
                     .wrap(Wrap { trim: false })
             }
             InboxState::Loaded(inbox) if inbox.is_empty() => {
-                Paragraph::new("Nothing in your Inbox.")
+                Paragraph::new("Nothing in your Inbox.").style(theme.message)
             }
             InboxState::Loaded(_)
                 if rows.is_empty()
@@ -673,13 +687,13 @@ impl App {
                         .next()
                         .is_some() =>
             {
-                Paragraph::new("Nothing in this View matches the search.")
+                Paragraph::new("Nothing in this View matches the search.").style(theme.message)
             }
             InboxState::Loaded(_) if rows.is_empty() => {
-                Paragraph::new("Nothing in your Inbox matches this View.")
+                Paragraph::new("Nothing in your Inbox matches this View.").style(theme.message)
             }
             InboxState::Loaded(_) => {
-                let table = notifications_table(&rows, Utc::now()).block(block);
+                let table = notifications_table(&rows, Utc::now(), theme).block(block);
                 frame.render_stateful_widget(table, area, &mut current.selection);
                 return;
             }
@@ -692,18 +706,18 @@ impl App {
             let typed = format!("/{}", self.search_input);
             let width = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
-            let mut spans = vec![Span::raw(typed)];
+            let mut spans = vec![Span::styled(typed, self.theme.prompt)];
             // The completed words to go through, the one in the input highlighted.
             if let Some(completion) = &prompt.completion {
                 spans.push(Span::raw("  "));
                 for (index, input) in completion.inputs.iter().enumerate() {
                     let word = input.rsplit(char::is_whitespace).next().unwrap_or(input);
-                    let word = Span::raw(word.to_owned());
-                    spans.push(if index == completion.at {
-                        word.reversed()
+                    let style = if index == completion.at {
+                        self.theme.completion_current
                     } else {
-                        word.dim()
-                    });
+                        self.theme.completion
+                    };
+                    spans.push(Span::styled(word.to_owned(), style));
                     spans.push(Span::raw(" "));
                 }
             }
@@ -712,9 +726,9 @@ impl App {
         }
         let status = match &self.status {
             None => return,
-            Some(StatusMessage::Info(text)) => Line::from(text.as_str()),
+            Some(StatusMessage::Info(text)) => Line::styled(text.as_str(), self.theme.status),
             Some(StatusMessage::Error(text) | StatusMessage::FetchFailed(text)) => {
-                Line::from(text.as_str()).red()
+                Line::styled(text.as_str(), self.theme.error)
             }
         };
         frame.render_widget(status, area);
@@ -737,20 +751,20 @@ impl App {
                 }
                 InboxState::Loading | InboxState::Failed(_) => shown_view.view.name.clone(),
             };
-            let tab = Span::raw(label);
-            spans.push(if index == self.current {
-                tab.reversed()
+            let style = if index == self.current {
+                self.theme.tab_current
             } else {
-                tab
-            });
+                self.theme.tab
+            };
+            spans.push(Span::styled(label, style));
         }
         spans.push(Span::raw(" "));
         Line::from(spans)
     }
 }
 
-/// Draws the help over the middle of `frame`: every command's keys and what it does.
-fn render_help(frame: &mut Frame) {
+/// Draws the help over the middle of `frame` in `theme`: every command's keys and what it does.
+fn render_help(frame: &mut Frame, theme: &Theme) {
     let commands: Vec<KeyHelp> = HELP_ORDER.iter().map(|command| command.help()).collect();
     let keys_width = commands
         .iter()
@@ -760,12 +774,15 @@ fn render_help(frame: &mut Frame) {
         .unwrap_or(0);
     let line = |help: &KeyHelp| {
         Line::from(vec![
-            Span::raw(format!("{:keys_width$}  ", help.keys)).bold(),
+            Span::styled(format!("{:keys_width$}  ", help.keys), theme.help_keys),
             Span::raw(help.does),
         ])
     };
     let mut lines: Vec<Line> = commands.iter().map(line).collect();
-    lines.extend([Line::default(), Line::from("In the search prompt:").dim()]);
+    lines.extend([
+        Line::default(),
+        Line::styled("In the search prompt:", theme.help_heading),
+    ]);
     lines.extend(SEARCH_PROMPT_HELP.iter().map(line));
 
     // Two cells of border and two of padding around the text.
@@ -777,8 +794,10 @@ fn render_help(frame: &mut Frame) {
     );
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(
+        // Over the cleared area, the text style paints the theme's background again.
+        Paragraph::new(lines).style(theme.text).block(
             Block::bordered()
+                .border_style(theme.border)
                 .title(" Keys ")
                 .padding(Padding::horizontal(1)),
         ),
@@ -812,24 +831,31 @@ fn shown<'a>(
         .filter(|n| view.filter.matches(n) && search.matches(n))
 }
 
-/// One row per Notification in `notifications`: unread marker, Subject kind, repository, title, Reason, and age
-/// relative to `now`.
-fn notifications_table<'a>(notifications: &[&'a Notification], now: DateTime<Utc>) -> Table<'a> {
+/// One row per Notification in `notifications`, in `theme`: unread marker, Subject kind, repository, title, Reason,
+/// and age relative to `now`.
+fn notifications_table<'a>(
+    notifications: &[&'a Notification],
+    now: DateTime<Utc>,
+    theme: &Theme,
+) -> Table<'a> {
     let rows = notifications.iter().map(|n| {
-        let style = if n.unread {
-            Style::new().bold()
-        } else {
-            Style::new().dim()
-        };
+        // Whether it's read goes over the column's own style, so a theme can, say, grey out read rows.
+        let state = if n.unread { theme.unread } else { theme.read };
+        let cell = |text: Cow<'a, str>, column: Style| Cell::from(text).style(column.patch(state));
         Row::new([
-            Cell::from(if n.unread { "●" } else { " " }),
-            Cell::from(subject_kind_label(&n.subject_kind)),
-            Cell::from(n.repository.as_str()),
-            Cell::from(n.subject_title.as_str()),
-            Cell::from(n.reason.to_string()),
-            Cell::from(age(n.updated_at, now)),
+            cell(
+                Cow::Borrowed(if n.unread { "●" } else { " " }),
+                theme.unread_marker,
+            ),
+            cell(
+                Cow::Borrowed(subject_kind_label(&n.subject_kind)),
+                theme.kind(&n.subject_kind),
+            ),
+            cell(Cow::Borrowed(&n.repository), theme.repository),
+            cell(Cow::Borrowed(&n.subject_title), theme.title),
+            cell(Cow::Owned(n.reason.to_string()), theme.reason),
+            cell(Cow::Owned(age(n.updated_at, now)), theme.age),
         ])
-        .style(style)
     });
 
     let repository_width = notifications
@@ -854,7 +880,7 @@ fn notifications_table<'a>(notifications: &[&'a Notification], now: DateTime<Utc
         Constraint::Length(3),
     ];
 
-    Table::new(rows, widths).row_highlight_style(Style::new().reversed())
+    Table::new(rows, widths).row_highlight_style(theme.selection)
 }
 
 /// A label of at most three cells for the Subject column.
@@ -893,6 +919,8 @@ fn age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::filter::Filter;
@@ -967,27 +995,38 @@ mod tests {
     }
 
     fn inbox_view_only() -> App {
-        App::new(vec![View {
-            name: "Inbox".to_owned(),
-            filter: Filter::default(),
-        }])
+        App::new(
+            vec![View {
+                name: "Inbox".to_owned(),
+                filter: Filter::default(),
+            }],
+            Theme::default(),
+        )
     }
 
     /// The app with three Views: Inbox, "Reviews" (`reason:review-requested`) and "Read" (`is:read`), the Inbox
-    /// View on screen, and [`notifications`] fetched.
+    /// View on screen, and [`notifications`] fetched; no styles.
     fn app() -> App {
+        app_in(Theme::default())
+    }
+
+    /// [`app`], in `theme`.
+    fn app_in(theme: Theme) -> App {
         let view = |name: &str, filter: &str| View {
             name: name.to_owned(),
             filter: filter.parse().expect("valid filter"),
         };
-        let mut app = App::new(vec![
-            View {
-                name: "Inbox".to_owned(),
-                filter: Filter::default(),
-            },
-            view("Reviews", "reason:review-requested"),
-            view("Read", "is:read"),
-        ]);
+        let mut app = App::new(
+            vec![
+                View {
+                    name: "Inbox".to_owned(),
+                    filter: Filter::default(),
+                },
+                view("Reviews", "reason:review-requested"),
+                view("Read", "is:read"),
+            ],
+            theme,
+        );
         app.fetched(fetched(notifications()));
         app
     }
@@ -1657,6 +1696,92 @@ mod tests {
                 .any(|line| line.contains("Tab  Shift-Tab  complete a field's name")),
             "{lines:#?}"
         );
+    }
+
+    /// The cell on line `y` of `buffer` where `text` starts.
+    fn cell_at<'b>(buffer: &'b Buffer, y: u16, text: &str) -> &'b ratatui::buffer::Cell {
+        let width = buffer.area.width;
+        let line: Vec<&str> = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+        let wanted: Vec<String> = text.chars().map(String::from).collect();
+        let x = line
+            .windows(wanted.len())
+            .position(|window| {
+                window
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(cell, wanted)| cell == wanted)
+            })
+            .unwrap_or_else(|| panic!("{text:?} isn't on line {y}: {line:?}"));
+        &buffer[(u16::try_from(x).expect("fits the screen"), y)]
+    }
+
+    #[test]
+    fn rows_and_tabs_are_drawn_in_the_theme() {
+        let rgb = |shade| Color::Rgb(shade, shade, shade);
+        let theme = Theme {
+            text: Style::new().bg(rgb(1)),
+            repository: Style::new().fg(rgb(2)),
+            read: Style::new().fg(rgb(3)),
+            unread: Style::new().add_modifier(Modifier::BOLD),
+            selection: Style::new().bg(rgb(4)),
+            tab_current: Style::new().fg(rgb(5)),
+            kind_pull_request: Style::new().fg(rgb(6)),
+            ..Theme::default()
+        };
+        let mut app = app_in(theme);
+        let mut terminal =
+            Terminal::new(TestBackend::new(SCREEN_WIDTH, 5)).expect("test backend never fails");
+
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+
+        let buffer = terminal.backend().buffer();
+        let selected_unread = cell_at(buffer, 1, "wcgw/ghd");
+        assert_eq!(selected_unread.fg, rgb(2), "the column's color");
+        assert_eq!(selected_unread.bg, rgb(4), "the selection");
+        assert!(selected_unread.modifier.contains(Modifier::BOLD), "unread");
+        let read = cell_at(buffer, 2, "wcgw/other");
+        assert_eq!(read.fg, rgb(3), "read rows go over the column's color");
+        assert_eq!(read.bg, rgb(1), "the background");
+        assert_eq!(cell_at(buffer, 1, "PR").fg, rgb(6));
+        assert_eq!(cell_at(buffer, 0, "Inbox (1)").fg, rgb(5));
+        assert_eq!(
+            buffer[(0, 4)].bg,
+            rgb(1),
+            "the background reaches the status line"
+        );
+    }
+
+    #[test]
+    fn help_is_drawn_over_the_theme_background() {
+        let theme = Theme {
+            text: Style::new().bg(Color::Rgb(1, 1, 1)),
+            help_keys: Style::new().fg(Color::Rgb(2, 2, 2)),
+            ..Theme::default()
+        };
+        let mut app = app_in(theme);
+        app.press(key_named("?"));
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend never fails");
+
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+
+        let buffer = terminal.backend().buffer();
+        let (y, _) = (0..24)
+            .map(|y| {
+                (
+                    y,
+                    (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>(),
+                )
+            })
+            .find(|(_, line)| line.contains("mark Done"))
+            .expect("the help lists mark Done");
+        let key = cell_at(buffer, y, "e ");
+        assert_eq!(key.fg, Color::Rgb(2, 2, 2));
+        assert_eq!(cell_at(buffer, y, "mark Done").bg, Color::Rgb(1, 1, 1));
     }
 
     #[test]

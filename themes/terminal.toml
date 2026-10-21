@@ -1,0 +1,12 @@
+# The terminal's own colors, with emphasis only: how ghd looked before it had themes.
+
+[styles]
+tab_current = { reversed = true }
+selection = { reversed = true }
+unread = { bold = true }
+read = { dim = true }
+error = { fg = "red" }
+completion = { dim = true }
+completion_current = { reversed = true }
+help_keys = { bold = true }
+help_heading = { dim = true }
