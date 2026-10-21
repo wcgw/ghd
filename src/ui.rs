@@ -1,4 +1,4 @@
-//! The terminal UI: for now, the Inbox View alone.
+//! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
 use std::pin::pin;
 use std::time::Duration;
@@ -9,10 +9,11 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize as _};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::config::View;
 use crate::github::GitHub;
 use crate::inbox::{Inbox, Notification, SubjectKind};
 
@@ -22,16 +23,24 @@ const MAX_REPOSITORY_WIDTH: u16 = 32;
 /// Longest that quitting waits for changes still on their way to GitHub.
 const QUIT_GRACE: Duration = Duration::from_secs(10);
 
-/// Runs the UI on `terminal` until the user quits, fetching the Inbox from `github` meanwhile and sending it the
-/// changes the user makes.
+/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order. Meanwhile it fetches the
+/// Inbox from `github` and sends it the changes the user makes.
 ///
 /// # Errors
 ///
 /// Fails if the terminal can't be drawn on or read from, or if changes made just before quitting were refused or
 /// didn't reach GitHub in time. Failing to fetch the Inbox, or a refused change while the UI runs, isn't an error
 /// here: the screen shows it.
-pub async fn run(terminal: &mut DefaultTerminal, github: &GitHub) -> anyhow::Result<()> {
-    let mut app = App::default();
+///
+/// # Panics
+///
+/// If `views` is empty: the configuration always has the built-in Inbox View.
+pub async fn run(
+    terminal: &mut DefaultTerminal,
+    github: &GitHub,
+    views: Vec<View>,
+) -> anyhow::Result<()> {
+    let mut app = App::new(views);
     let mut events = EventStream::new();
     // Polled alongside terminal events, so the UI keeps drawing and can be quit while pages arrive.
     let mut fetch = pin!(github.inbox());
@@ -44,9 +53,7 @@ pub async fn run(terminal: &mut DefaultTerminal, github: &GitHub) -> anyhow::Res
             .context("drawing the terminal")?;
 
         tokio::select! {
-            inbox = &mut fetch, if matches!(app.inbox_view, InboxView::Loading) => {
-                app.inbox_view = InboxView::fetched(inbox);
-            }
+            inbox = &mut fetch, if matches!(app.inbox, InboxState::Loading) => app.fetched(inbox),
             Some(reply) = in_flight.next(), if !in_flight.is_empty() => app.settle(reply),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match command_for(key) {
@@ -104,6 +111,10 @@ enum Command {
     Quit,
     SelectNext,
     SelectPrevious,
+    NextView,
+    PreviousView,
+    /// Shows the View at this index in tab order, counting from 0; nothing happens past the last View.
+    ShowView(usize),
     /// Opens the selected Subject in the browser, which also marks it read.
     Open,
     MarkRead,
@@ -117,6 +128,9 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('q') => Some(Command::Quit),
         KeyCode::Char('j') | KeyCode::Down => Some(Command::SelectNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Command::SelectPrevious),
+        KeyCode::Tab => Some(Command::NextView),
+        KeyCode::BackTab => Some(Command::PreviousView),
+        KeyCode::Char(digit @ '1'..='9') => Some(Command::ShowView((digit as u8 - b'1').into())),
         KeyCode::Char('o') | KeyCode::Enter => Some(Command::Open),
         KeyCode::Char('I') => Some(Command::MarkRead),
         KeyCode::Char('e') => Some(Command::MarkDone),
@@ -168,34 +182,98 @@ enum StatusMessage {
     Error(String),
 }
 
+/// What the app has of the Inbox so far.
+enum InboxState {
+    Loading,
+    Loaded(Inbox),
+    Failed(anyhow::Error),
+}
+
+/// A View on screen, with the user's selection in it.
+struct ShownView {
+    view: View,
+    /// The selected row among the Notifications the View shows.
+    selection: TableState,
+}
+
 /// Everything on screen.
-#[derive(Default)]
 struct App {
-    inbox_view: InboxView,
+    inbox: InboxState,
+    /// The Views in tab order; never empty, the built-in Inbox View first.
+    views: Vec<ShownView>,
+    /// Index into `views` of the View on screen.
+    current: usize,
     /// What the latest action did, or why it failed; `None` until there's something to say.
     status: Option<StatusMessage>,
 }
 
 impl App {
+    /// The app waiting for the Inbox, with `views` as tabs in that order and the first of them on screen.
+    ///
+    /// # Panics
+    ///
+    /// If `views` is empty.
+    fn new(views: Vec<View>) -> Self {
+        assert!(
+            !views.is_empty(),
+            "the configuration always has the Inbox View"
+        );
+        let views = views
+            .into_iter()
+            .map(|view| ShownView {
+                view,
+                selection: TableState::new().with_selected(Some(0)),
+            })
+            .collect();
+        Self {
+            inbox: InboxState::Loading,
+            views,
+            current: 0,
+            status: None,
+        }
+    }
+
+    /// Takes in the outcome of fetching the Inbox.
+    fn fetched(&mut self, inbox: anyhow::Result<Inbox>) {
+        self.inbox = match inbox {
+            Ok(inbox) => InboxState::Loaded(inbox),
+            Err(error) => InboxState::Failed(error),
+        };
+    }
+
     /// Carries out `command` on screen. Returns the change to send to GitHub, if the command makes one.
     fn execute(&mut self, command: Command) -> Option<Change> {
+        // Moving the selection past either end is corrected when the table is next drawn.
         match command {
             // `run` quits before asking.
             Command::Quit => None,
             Command::SelectNext => {
-                self.inbox_view.select_next();
+                self.views[self.current].selection.select_next();
                 None
             }
             Command::SelectPrevious => {
-                self.inbox_view.select_previous();
+                self.views[self.current].selection.select_previous();
+                None
+            }
+            Command::NextView => {
+                self.current = (self.current + 1) % self.views.len();
+                None
+            }
+            Command::PreviousView => {
+                self.current = (self.current + self.views.len() - 1) % self.views.len();
+                None
+            }
+            Command::ShowView(index) => {
+                if index < self.views.len() {
+                    self.current = index;
+                }
                 None
             }
             Command::Open => match self
-                .inbox_view
                 .selected()
                 .map(|n| open::that_detached(&n.subject_url))?
             {
-                Ok(()) => self.inbox_view.mark_selected_read().map(Change::MarkRead),
+                Ok(()) => self.mark_selected_read().map(Change::MarkRead),
                 Err(error) => {
                     self.status = Some(StatusMessage::Error(format!(
                         "Couldn't open a browser: {error}"
@@ -203,9 +281,9 @@ impl App {
                     None
                 }
             },
-            Command::MarkRead => self.inbox_view.mark_selected_read().map(Change::MarkRead),
+            Command::MarkRead => self.mark_selected_read().map(Change::MarkRead),
             Command::MarkDone => {
-                let notification = self.inbox_view.take_selected()?;
+                let notification = self.take_selected()?;
                 self.status = Some(StatusMessage::Info(format!(
                     "Marked Done: {}",
                     notification.subject_title
@@ -224,126 +302,128 @@ impl App {
             "GitHub refused to {}, undone: {error:#}",
             reply.change
         )));
-        self.inbox_view.undo(reply.change);
-    }
-
-    fn render(&mut self, frame: &mut Frame) {
-        let [view_area, status_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-        self.inbox_view.render(frame, view_area);
-        let status = match &self.status {
-            None => return,
-            Some(StatusMessage::Info(text)) => Line::from(text.as_str()),
-            Some(StatusMessage::Error(text)) => Line::from(text.as_str()).red(),
-        };
-        frame.render_widget(status, status_area);
-    }
-}
-
-/// The built-in View showing the whole Inbox, and what it has to show so far.
-#[derive(Default)]
-enum InboxView {
-    #[default]
-    Loading,
-    Loaded {
-        inbox: Inbox,
-        selection: TableState,
-    },
-    Failed(anyhow::Error),
-}
-
-impl InboxView {
-    /// The View once fetching the Inbox has finished, the first Notification selected.
-    fn fetched(inbox: anyhow::Result<Inbox>) -> Self {
-        match inbox {
-            Ok(inbox) => {
-                let first = (!inbox.is_empty()).then_some(0);
-                Self::Loaded {
-                    inbox,
-                    selection: TableState::new().with_selected(first),
-                }
-            }
-            Err(error) => Self::Failed(error),
-        }
-    }
-
-    /// Moves the selection down one row; past the last row, the next draw puts it back.
-    fn select_next(&mut self) {
-        if let Self::Loaded { selection, .. } = self {
-            selection.select_next();
-        }
-    }
-
-    /// Moves the selection up one row; past the first row, the next draw puts it back.
-    fn select_previous(&mut self) {
-        if let Self::Loaded { selection, .. } = self {
-            selection.select_previous();
-        }
-    }
-
-    /// The selected Notification; `None` while there's no Inbox to select from, or it's empty.
-    fn selected(&self) -> Option<&Notification> {
-        let Self::Loaded { inbox, selection } = self else {
-            return None;
-        };
-        inbox.get(selection.selected()?)
-    }
-
-    /// Clears Unread on the selected Notification. Returns it as it was before; `None` if it was already read.
-    fn mark_selected_read(&mut self) -> Option<Notification> {
-        let Self::Loaded { inbox, selection } = self else {
-            return None;
-        };
-        // Cloned to keep it as it was, should the change need undoing.
-        let notification = inbox.get(selection.selected()?)?.clone();
-        inbox.mark_read(notification.thread).then_some(notification)
-    }
-
-    /// Takes the selected Notification out of the Inbox and returns it; the selection moves to the one below.
-    fn take_selected(&mut self) -> Option<Notification> {
-        let Self::Loaded { inbox, selection } = self else {
-            return None;
-        };
-        let thread = inbox.get(selection.selected()?)?.thread;
-        inbox.remove(thread)
-    }
-
-    /// Undoes `change` on screen, after GitHub refused it.
-    fn undo(&mut self, change: Change) {
-        let Self::Loaded { inbox, .. } = self else {
+        let Some(inbox) = self.inbox_mut() else {
             return;
         };
-        match change {
+        match reply.change {
             Change::MarkRead(n) => inbox.mark_unread(n.thread),
             Change::MarkDone(n) => inbox.insert(n),
         }
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let message = match self {
-            Self::Loading => Paragraph::new("Fetching notifications…"),
-            Self::Failed(error) => {
+    /// The selected Notification in the View on screen; `None` until the Inbox arrives, or if the View shows none.
+    fn selected(&self) -> Option<&Notification> {
+        let current = &self.views[self.current];
+        shown(&self.inbox, &current.view).nth(current.selection.selected()?)
+    }
+
+    /// Clears Unread on the selected Notification. Returns it as it was before; `None` if it was already read.
+    fn mark_selected_read(&mut self) -> Option<Notification> {
+        // Cloned to keep it as it was, should the change need undoing.
+        let notification = self.selected()?.clone();
+        self.inbox_mut()?
+            .mark_read(notification.thread)
+            .then_some(notification)
+    }
+
+    /// Takes the selected Notification out of the Inbox, and so out of every View, and returns it. The selection
+    /// moves to the one below.
+    fn take_selected(&mut self) -> Option<Notification> {
+        let thread = self.selected()?.thread;
+        self.inbox_mut()?.remove(thread)
+    }
+
+    fn inbox_mut(&mut self) -> Option<&mut Inbox> {
+        match &mut self.inbox {
+            InboxState::Loaded(inbox) => Some(inbox),
+            InboxState::Loading | InboxState::Failed(_) => None,
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let [view_area, status_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+        self.render_status(frame, status_area);
+
+        let block = Block::bordered().title(self.tabs());
+        let current = &mut self.views[self.current];
+        let rows: Vec<&Notification> = shown(&self.inbox, &current.view).collect();
+        let message = match &self.inbox {
+            InboxState::Loading => Paragraph::new("Fetching notifications…"),
+            InboxState::Failed(error) => {
                 Paragraph::new(format!("Couldn't fetch notifications: {error:#}"))
                     .red()
                     .wrap(Wrap { trim: false })
             }
-            Self::Loaded { inbox, .. } if inbox.is_empty() => {
+            InboxState::Loaded(inbox) if inbox.is_empty() => {
                 Paragraph::new("Nothing in your Inbox.")
             }
-            Self::Loaded { inbox, selection } => {
-                let block = Block::bordered().title(format!(" Inbox ({}) ", inbox.unread_count()));
-                let table = inbox_table(inbox, Utc::now()).block(block);
-                frame.render_stateful_widget(table, area, selection);
+            InboxState::Loaded(_) if rows.is_empty() => {
+                Paragraph::new("Nothing in your Inbox matches this View.")
+            }
+            InboxState::Loaded(_) => {
+                let table = notifications_table(&rows, Utc::now()).block(block);
+                frame.render_stateful_widget(table, view_area, &mut current.selection);
                 return;
             }
         };
-        frame.render_widget(message.block(Block::bordered().title(" Inbox ")), area);
+        frame.render_widget(message.block(block), view_area);
+    }
+
+    fn render_status(&self, frame: &mut Frame, area: Rect) {
+        let status = match &self.status {
+            None => return,
+            Some(StatusMessage::Info(text)) => Line::from(text.as_str()),
+            Some(StatusMessage::Error(text)) => Line::from(text.as_str()).red(),
+        };
+        frame.render_widget(status, area);
+    }
+
+    /// The tabs: each View's name and, once the Inbox has arrived, how many unread Notifications it shows. The View
+    /// on screen is highlighted.
+    fn tabs(&self) -> Line<'static> {
+        let mut spans = vec![Span::raw(" ")];
+        for (index, shown_view) in self.views.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" │ "));
+            }
+            let label = match &self.inbox {
+                InboxState::Loaded(_) => {
+                    let unread = shown(&self.inbox, &shown_view.view)
+                        .filter(|n| n.unread)
+                        .count();
+                    format!("{} ({unread})", shown_view.view.name)
+                }
+                InboxState::Loading | InboxState::Failed(_) => shown_view.view.name.clone(),
+            };
+            let tab = Span::raw(label);
+            spans.push(if index == self.current {
+                tab.reversed()
+            } else {
+                tab
+            });
+        }
+        spans.push(Span::raw(" "));
+        Line::from(spans)
     }
 }
 
-/// One row per Notification: unread marker, Subject kind, repository, title, Reason, and age relative to `now`.
-fn inbox_table(inbox: &Inbox, now: DateTime<Utc>) -> Table<'_> {
-    let rows = inbox.iter().map(|n| {
+/// The Notifications `view` shows, newest first; none until the Inbox has arrived.
+fn shown<'a>(inbox: &'a InboxState, view: &'a View) -> impl Iterator<Item = &'a Notification> {
+    let inbox = match inbox {
+        InboxState::Loaded(inbox) => Some(inbox),
+        InboxState::Loading | InboxState::Failed(_) => None,
+    };
+    inbox
+        .into_iter()
+        .flat_map(Inbox::iter)
+        .filter(|n| view.filter.matches(n))
+}
+
+/// One row per Notification in `notifications`: unread marker, Subject kind, repository, title, Reason, and age
+/// relative to `now`.
+fn notifications_table<'a>(notifications: &[&'a Notification], now: DateTime<Utc>) -> Table<'a> {
+    let rows = notifications.iter().map(|n| {
         let style = if n.unread {
             Style::new().bold()
         } else {
@@ -360,12 +440,12 @@ fn inbox_table(inbox: &Inbox, now: DateTime<Utc>) -> Table<'_> {
         .style(style)
     });
 
-    let repository_width = inbox
+    let repository_width = notifications
         .iter()
         .map(|n| n.repository.chars().count())
         .max()
         .unwrap_or(0);
-    let reason_width = inbox
+    let reason_width = notifications
         .iter()
         .map(|n| n.reason.to_string().len())
         .max()
@@ -423,6 +503,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::filter::Filter;
     use crate::inbox::{Reason, ThreadId};
 
     #[test]
@@ -451,8 +532,9 @@ mod tests {
     /// Width of the screen [`screen`] draws on.
     const SCREEN_WIDTH: u16 = 72;
 
-    /// The app showing a loaded Inbox: "Add polling" (thread 1, unread, PR, just now), then "Old news" (thread 2,
-    /// read, issue, two days ago). The first is selected.
+    /// The app with three Views: Inbox, "Reviews" (`reason:review-requested`) and "Read" (`is:read`), the Inbox
+    /// View on screen. The Inbox holds "Add polling" (thread 1, unread review request, just now), then "Old news"
+    /// (thread 2, read, two days ago).
     fn app() -> App {
         let inbox = [
             Notification {
@@ -478,10 +560,32 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        App {
-            inbox_view: InboxView::fetched(Ok(inbox)),
-            status: None,
-        }
+        let view = |name: &str, filter: &str| View {
+            name: name.to_owned(),
+            filter: filter.parse().expect("valid filter"),
+        };
+        let mut app = App::new(vec![
+            View {
+                name: "Inbox".to_owned(),
+                filter: Filter::default(),
+            },
+            view("Reviews", "reason:review-requested"),
+            view("Read", "is:read"),
+        ]);
+        app.fetched(Ok(inbox));
+        app
+    }
+
+    /// The titles of the rows `lines` shows, top to bottom.
+    fn titles(lines: &[String]) -> Vec<&str> {
+        lines[1..4]
+            .iter()
+            .filter_map(|line| {
+                ["Add polling", "Old news"]
+                    .into_iter()
+                    .find(|title| line.contains(title))
+            })
+            .collect()
     }
 
     /// The lines `app` draws on a 5-line screen.
@@ -501,7 +605,7 @@ mod tests {
     }
 
     fn selected_title(app: &App) -> Option<&str> {
-        app.inbox_view.selected().map(|n| n.subject_title.as_str())
+        app.selected().map(|n| n.subject_title.as_str())
     }
 
     fn refused() -> anyhow::Result<()> {
@@ -544,6 +648,14 @@ mod tests {
             Some(Command::Quit)
         );
         assert_eq!(press(KeyCode::Char('c'), none), None);
+        assert_eq!(press(KeyCode::Tab, none), Some(Command::NextView));
+        assert_eq!(
+            press(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Some(Command::PreviousView)
+        );
+        assert_eq!(press(KeyCode::Char('1'), none), Some(Command::ShowView(0)));
+        assert_eq!(press(KeyCode::Char('9'), none), Some(Command::ShowView(8)));
+        assert_eq!(press(KeyCode::Char('0'), none), None);
     }
 
     #[test]
@@ -631,8 +743,80 @@ mod tests {
     }
 
     #[test]
+    fn views_show_what_matches_and_count_its_unread() {
+        let mut app = app();
+
+        let lines = screen(&mut app);
+        assert!(
+            lines[0].contains(" Inbox (1) │ Reviews (1) │ Read (0) "),
+            "{lines:#?}"
+        );
+        assert_eq!(titles(&lines), ["Add polling", "Old news"]);
+
+        app.execute(Command::ShowView(2));
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+
+        app.execute(Command::NextView);
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Add polling", "Old news"],
+            "wraps to the Inbox View"
+        );
+        app.execute(Command::PreviousView);
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Old news"],
+            "wraps back to the last View"
+        );
+        app.execute(Command::ShowView(1));
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
+        app.execute(Command::ShowView(8));
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Add polling"],
+            "no ninth View: stays put"
+        );
+    }
+
+    #[test]
+    fn each_view_keeps_its_own_selection() {
+        let mut app = app();
+
+        app.execute(Command::SelectNext);
+        assert_eq!(selected_title(&app), Some("Old news"));
+        app.execute(Command::ShowView(1));
+        assert_eq!(selected_title(&app), Some("Add polling"));
+        app.execute(Command::ShowView(0));
+        assert_eq!(selected_title(&app), Some("Old news"));
+    }
+
+    #[test]
+    fn done_in_one_view_leaves_every_view() {
+        let mut app = app();
+        app.execute(Command::ShowView(1));
+
+        app.execute(Command::MarkDone)
+            .expect("a Notification is selected");
+
+        let lines = screen(&mut app);
+        assert!(
+            lines[0].contains(" Inbox (0) │ Reviews (0) │ Read (0) "),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[1].contains("Nothing in your Inbox matches this View."),
+            "{lines:#?}"
+        );
+        app.execute(Command::ShowView(0));
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+    }
+
+    #[test]
     fn nothing_to_act_on_while_loading() {
-        let mut app = App::default();
+        let mut app = App::new(vec![View {
+            name: "Inbox".to_owned(),
+            filter: Filter::default(),
+        }]);
 
         assert!(app.execute(Command::MarkDone).is_none());
         assert!(app.execute(Command::MarkRead).is_none());

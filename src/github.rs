@@ -418,7 +418,10 @@ mod tests {
                 Reason::ReviewRequested,
             ]
         );
-        let newest = inbox.get(0).expect("the Inbox holds three Notifications");
+        let newest = inbox
+            .iter()
+            .next()
+            .expect("the Inbox holds three Notifications");
         assert_eq!(newest.thread, ThreadId(3));
         assert_eq!(newest.subject_url, "https://github.com/wcgw/ghd/issues/3");
     }

@@ -14,6 +14,14 @@ list](https://docs.github.com/en/rest/activity/notifications#about-notification-
 configuration error. `reason:participating` is rejected: GitHub doesn't define which reasons it groups, and any set we
 picked would silently disagree with github.com.
 
+Negated qualifiers are exclusions: a Notification matching any of them is left out, so `-reason:a -reason:b` drops both
+(read as OR, it would let nearly everything through). `is:` counts as two qualifiers for the repeat rule, because it
+covers two unrelated things: the Subject's kind (`is:pr`, `is:issue`, …) and its read state (`is:read`, `is:unread`).
+So `is:pr is:unread` means unread pull requests, not "pull requests or anything unread". `is:` values ghd can't
+evaluate are rejected rather than matching nothing: `is:done` (the Inbox never holds Done notifications), `is:saved`
+(the API doesn't expose it) and the kinds whose API names ghd doesn't know yet (`gist`, `repository-invitation`,
+`repository-vulnerability-alert`, `repository-advisory`).
+
 ## Considered Options
 
 - **Structured TOML** (`reason = [...]`, `not_type = [...]`): parsing comes for free, but OR across fields and negation

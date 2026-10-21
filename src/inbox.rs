@@ -18,19 +18,9 @@ impl Inbox {
         self.notifications.iter()
     }
 
-    /// The Notification at `index` in [`Inbox::iter`]'s order; `None` past the end.
-    pub fn get(&self, index: usize) -> Option<&Notification> {
-        self.notifications.get(index)
-    }
-
     /// Whether the Inbox holds no Notification at all.
     pub fn is_empty(&self) -> bool {
         self.notifications.is_empty()
-    }
-
-    /// How many Notifications have activity the user hasn't seen yet.
-    pub fn unread_count(&self) -> usize {
-        self.notifications.iter().filter(|n| n.unread).count()
     }
 
     /// Clears Unread on the Notification for `thread`. Returns whether it was unread: `false` when it was already
@@ -202,6 +192,16 @@ reasons! {
     TeamMention = "team_mention",
 }
 
+impl Reason {
+    /// A known reason by the name it shows as (`review-requested`); `None` for any other name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match Self::from_api(&name.replace('-', "_")) {
+            Self::Other(_) => None,
+            known => (known.to_string() == name).then_some(known),
+        }
+    }
+}
+
 /// A known reason shows hyphenated, as in GitHub's inbox filters (`review-requested`); [`Reason::Other`] shows as the
 /// API sent it.
 impl fmt::Display for Reason {
@@ -243,6 +243,14 @@ mod tests {
         inbox.iter().map(|n| n.thread.0).collect()
     }
 
+    fn unread_threads(inbox: &Inbox) -> Vec<u64> {
+        inbox
+            .iter()
+            .filter(|n| n.unread)
+            .map(|n| n.thread.0)
+            .collect()
+    }
+
     #[test]
     fn inbox_orders_newest_first() {
         let inbox: Inbox = [
@@ -254,7 +262,6 @@ mod tests {
         .collect();
 
         assert_eq!(threads(&inbox), [2, 1, 3]);
-        assert_eq!(inbox.unread_count(), 2);
     }
 
     #[test]
@@ -267,11 +274,11 @@ mod tests {
         assert!(!inbox.mark_read(ThreadId(1)), "already read");
         assert!(!inbox.mark_read(ThreadId(2)), "already read");
         assert!(!inbox.mark_read(ThreadId(99)), "not in the Inbox");
-        assert_eq!(inbox.unread_count(), 0);
+        assert!(unread_threads(&inbox).is_empty());
 
         inbox.mark_unread(ThreadId(1));
         inbox.mark_unread(ThreadId(99));
-        assert_eq!(inbox.unread_count(), 1);
+        assert_eq!(unread_threads(&inbox), [1]);
     }
 
     #[test]
@@ -301,7 +308,7 @@ mod tests {
         inbox.insert(notification(1, 11, false));
 
         assert_eq!(threads(&inbox), [1, 2]);
-        assert_eq!(inbox.unread_count(), 1);
+        assert_eq!(unread_threads(&inbox), [2]);
     }
 
     #[test]
