@@ -11,7 +11,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 
@@ -180,6 +180,57 @@ enum Command {
     Open,
     MarkRead,
     MarkDone,
+    Help,
+}
+
+/// The commands in the order the help lists them. Adding a command means adding it here too: the help test checks
+/// every key the keymap knows is listed.
+const HELP_ORDER: [Command; 13] = [
+    Command::SelectNext,
+    Command::SelectPrevious,
+    Command::NextView,
+    Command::PreviousView,
+    Command::ShowView(0),
+    Command::Open,
+    Command::MarkRead,
+    Command::MarkDone,
+    Command::Search,
+    Command::ClearSearch,
+    Command::Refresh,
+    Command::Help,
+    Command::Quit,
+];
+
+/// What the help says about typing in the search prompt, where keys work differently.
+const SEARCH_PROMPT_HELP: &str =
+    "In the search prompt: Enter keeps it, Esc puts back the one before.";
+
+/// A command's line in the help.
+struct CommandHelp {
+    /// The keys for the command, separated by two spaces.
+    keys: &'static str,
+    does: &'static str,
+}
+
+impl Command {
+    fn help(self) -> CommandHelp {
+        let (keys, does) = match self {
+            Self::SelectNext => ("j  ↓", "select the next Notification"),
+            Self::SelectPrevious => ("k  ↑", "select the previous Notification"),
+            Self::NextView => ("Tab", "show the next View"),
+            Self::PreviousView => ("Shift-Tab", "show the previous View"),
+            Self::ShowView(_) => ("1–9", "show a View by its place in the tabs"),
+            Self::Open => ("o  Enter", "open in the browser, which marks it read"),
+            Self::MarkRead => ("I", "mark read"),
+            Self::MarkDone => ("e", "mark Done (GitHub can't undo it)"),
+            Self::Search => ("/", "search the View on screen"),
+            Self::ClearSearch => ("Esc", "clear the search"),
+            Self::Refresh => ("r", "fetch the Inbox now"),
+            Self::Help => ("?", "show these keys"),
+            Self::Quit => ("q  Ctrl-C", "quit"),
+        };
+        CommandHelp { keys, does }
+    }
 }
 
 /// The command a key press stands for. Marking read and Done use GitHub's own notification shortcuts.
@@ -198,6 +249,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('e') => Some(Command::MarkDone),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::ClearSearch),
+        KeyCode::Char('?') => Some(Command::Help),
         _ => None,
     }
 }
@@ -247,6 +299,8 @@ struct App {
     search: Search,
     /// The prompt in the status line, while the user types a Search.
     search_prompt: Option<SearchPrompt>,
+    /// The help is shown over the View.
+    help_shown: bool,
 }
 
 /// The prompt the user types a Search into.
@@ -282,6 +336,7 @@ impl App {
             search_input: String::new(),
             search: Search::default(),
             search_prompt: None,
+            help_shown: false,
         }
     }
 
@@ -376,9 +431,14 @@ impl App {
         }
     }
 
-    /// Takes in a key press: while the user types a Search, every key but Ctrl-C goes to the prompt; otherwise the
-    /// key's command is carried out on screen. Returns what's left for `run` to do.
+    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search,
+    /// every key but Ctrl-C goes to the prompt; otherwise the key's command is carried out on screen. Returns what's
+    /// left for `run` to do.
     fn press(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if self.help_shown && !is_interrupt(key) {
+            self.help_shown = false;
+            return None;
+        }
         if self.is_typing_search() && !is_interrupt(key) {
             self.type_search(key);
             return None;
@@ -426,6 +486,10 @@ impl App {
             }
             Command::ClearSearch => {
                 self.set_search(String::new());
+                None
+            }
+            Command::Help => {
+                self.help_shown = true;
                 None
             }
             Command::Open => match self
@@ -505,8 +569,17 @@ impl App {
         let [view_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
+        self.render_view(frame, view_area, fetching);
+        if self.help_shown {
+            render_help(frame);
+        }
+    }
 
-        let mut block = Block::bordered().title(self.tabs());
+    /// Draws the View on screen in `area`, its tabs and what's going on in its border.
+    fn render_view(&mut self, frame: &mut Frame, area: Rect, fetching: bool) {
+        let mut block = Block::bordered()
+            .title(self.tabs())
+            .title_bottom(Line::from(" ? keys ").right_aligned());
         if fetching {
             block = block.title_top(Line::from(" fetching… ").right_aligned());
         }
@@ -538,11 +611,11 @@ impl App {
             }
             InboxState::Loaded(_) => {
                 let table = notifications_table(&rows, Utc::now()).block(block);
-                frame.render_stateful_widget(table, view_area, &mut current.selection);
+                frame.render_stateful_widget(table, area, &mut current.selection);
                 return;
             }
         };
-        frame.render_widget(message.block(block), view_area);
+        frame.render_widget(message.block(block), area);
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
@@ -590,6 +663,43 @@ impl App {
         spans.push(Span::raw(" "));
         Line::from(spans)
     }
+}
+
+/// Draws the help over the middle of `frame`: every command's keys and what it does.
+fn render_help(frame: &mut Frame) {
+    let keys_width = HELP_ORDER
+        .iter()
+        .map(|command| command.help().keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = HELP_ORDER
+        .iter()
+        .map(|command| {
+            let help = command.help();
+            Line::from(vec![
+                Span::raw(format!("{:keys_width$}  ", help.keys)).bold(),
+                Span::raw(help.does),
+            ])
+        })
+        .collect();
+    lines.extend([Line::default(), Line::from(SEARCH_PROMPT_HELP).dim()]);
+
+    // Two cells of border and two of padding around the text.
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let height = lines.len() + 2;
+    let area = frame.area().centered(
+        Constraint::Length(u16::try_from(width).unwrap_or(u16::MAX)),
+        Constraint::Length(u16::try_from(height).unwrap_or(u16::MAX)),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Keys ")
+                .padding(Padding::horizontal(1)),
+        ),
+        area,
+    );
 }
 
 /// The Notification selected in `shown_view` narrowed by `search`; `None` until the Inbox has arrived, or if
@@ -873,6 +983,7 @@ mod tests {
         assert_eq!(press(KeyCode::Char('r'), none), Some(Command::Refresh));
         assert_eq!(press(KeyCode::Char('/'), none), Some(Command::Search));
         assert_eq!(press(KeyCode::Esc, none), Some(Command::ClearSearch));
+        assert_eq!(press(KeyCode::Char('?'), none), Some(Command::Help));
         assert_eq!(
             press(KeyCode::Char('u'), none),
             None,
@@ -1282,6 +1393,126 @@ mod tests {
         type_text(&mut app, "n");
 
         assert_eq!(selected_title(&app), Some("Old news"));
+    }
+
+    /// The key a help label names: a character, or `Tab`, `Shift-Tab`, `Enter`, `Esc`, `Ctrl-C`, `↓`, `↑`.
+    fn key_named(label: &str) -> KeyEvent {
+        let (code, modifiers) = match label {
+            "Tab" => (KeyCode::Tab, KeyModifiers::NONE),
+            "Shift-Tab" => (KeyCode::BackTab, KeyModifiers::SHIFT),
+            "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
+            "Esc" => (KeyCode::Esc, KeyModifiers::NONE),
+            "Ctrl-C" => (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            "↓" => (KeyCode::Down, KeyModifiers::NONE),
+            "↑" => (KeyCode::Up, KeyModifiers::NONE),
+            character => {
+                let mut characters = character.chars();
+                let (Some(character), None) = (characters.next(), characters.next()) else {
+                    panic!("no key is named {label:?}");
+                };
+                (KeyCode::Char(character), KeyModifiers::NONE)
+            }
+        };
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn help_names_the_keys_that_work() {
+        for command in HELP_ORDER {
+            let keys = command.help().keys;
+            if let Command::ShowView(_) = command {
+                assert_eq!(keys, "1–9");
+                assert_eq!(command_for(key_named("1")), Some(Command::ShowView(0)));
+                assert_eq!(command_for(key_named("9")), Some(Command::ShowView(8)));
+                continue;
+            }
+            for label in keys.split_whitespace() {
+                assert_eq!(command_for(key_named(label)), Some(command), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_lists_every_command() {
+        let listed = |command: Command| {
+            HELP_ORDER
+                .iter()
+                .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
+        };
+        for label in [
+            "j",
+            "k",
+            "↓",
+            "↑",
+            "Tab",
+            "Shift-Tab",
+            "1",
+            "o",
+            "Enter",
+            "I",
+            "e",
+            "/",
+            "Esc",
+            "r",
+            "?",
+            "q",
+            "Ctrl-C",
+        ] {
+            let command = command_for(key_named(label)).expect("a known key");
+            assert!(listed(command), "{command:?} isn't in the help");
+        }
+    }
+
+    #[test]
+    fn any_key_closes_the_help() {
+        let mut app = app();
+
+        assert!(app.press(key_named("?")).is_none());
+        let lines = screen(&mut app);
+        assert!(lines.iter().any(|line| line.contains("Keys")), "{lines:#?}");
+
+        assert!(
+            app.press(key_named("e")).is_none(),
+            "closes the help, doesn't mark Done"
+        );
+        assert!(!app.help_shown);
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+
+        app.press(key_named("?"));
+        assert!(matches!(
+            app.press(key_named("Ctrl-C")),
+            Some(Outcome::Quit)
+        ));
+    }
+
+    #[test]
+    fn help_fits_a_normal_terminal() {
+        let mut app = app();
+        app.press(key_named("?"));
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend never fails");
+
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("e          mark Done (GitHub can't undo it)")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(SEARCH_PROMPT_HELP)),
+            "{lines:#?}"
+        );
     }
 
     #[test]

@@ -16,8 +16,9 @@ use crate::github::GitHub;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Before taking over the terminal, so that a bad configuration or a missing token is reported as a plain error.
-    let views = Config::load().await?.into_views();
-    let github = GitHub::authenticate().await?;
+    let config = Config::load().await?;
+    let github = GitHub::authenticate(config.account()).await?;
+    let views = config.into_views();
 
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
     let outcome = ui::run(&mut terminal, &github, views).await;

@@ -1,6 +1,9 @@
-//! The configuration file, which defines the Views.
+//! The configuration file: the Account to act as, and the Views.
 //!
 //! ```toml
+//! host = "github.example.com"   # optional, github.com by default
+//! user = "alexsnaps"            # optional, `gh`'s active account on the host by default
+//!
 //! [[view]]
 //! name = "Reviews"
 //! filter = "reason:review-requested reason:team-mention -is:read"
@@ -14,6 +17,7 @@ use anyhow::{Context as _, bail};
 use serde::Deserialize;
 
 use crate::filter::Filter;
+use crate::github::Account;
 
 /// The built-in View's name.
 const INBOX_VIEW: &str = "Inbox";
@@ -28,6 +32,7 @@ pub struct View {
 /// What the configuration file asks for.
 #[derive(Debug)]
 pub struct Config {
+    account: Account,
     /// The built-in Inbox View, then the configured ones in the file's order; names are unique, ignoring case.
     views: Vec<View>,
 }
@@ -39,7 +44,7 @@ impl Config {
     /// # Errors
     ///
     /// Fails if the file exists but can't be read, or isn't a valid configuration. The error names the file, and
-    /// the View and the part of its filter that are wrong.
+    /// what's wrong in it: the host or user, or the View and the part of its filter.
     pub async fn load() -> anyhow::Result<Self> {
         let Some(path) = config_path() else {
             return Ok(Self::default());
@@ -52,6 +57,11 @@ impl Config {
         }
     }
 
+    /// The Account to act as.
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
     /// The Views to show as tabs: the built-in Inbox View first, then the configured ones in the file's order.
     pub fn into_views(self) -> Vec<View> {
         self.views
@@ -60,7 +70,10 @@ impl Config {
     /// The configuration that the TOML `text` describes.
     fn parse(text: &str) -> anyhow::Result<Self> {
         let file: File = toml::from_str(text)?;
-        let mut config = Self::default();
+        let mut config = Self {
+            account: Account::new(file.host.as_deref(), file.user.as_deref())?,
+            ..Self::default()
+        };
         for entry in file.views {
             if entry.name.trim().is_empty() {
                 bail!("a View needs a name");
@@ -91,10 +104,11 @@ impl Config {
     }
 }
 
-/// Only the built-in Inbox View.
+/// `gh`'s active account on github.com, and only the built-in Inbox View.
 impl Default for Config {
     fn default() -> Self {
         Self {
+            account: Account::default(),
             views: vec![View {
                 name: INBOX_VIEW.to_owned(),
                 filter: Filter::default(),
@@ -107,6 +121,8 @@ impl Default for Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    host: Option<String>,
+    user: Option<String>,
     #[serde(default, rename = "view")]
     views: Vec<ViewEntry>,
 }
@@ -146,6 +162,29 @@ mod tests {
             Ok(config) => panic!("{text:?} should be rejected, got {:?}", names(&config)),
             Err(error) => format!("{error:#}"),
         }
+    }
+
+    #[test]
+    fn account_is_github_com_unless_the_file_says() {
+        assert_eq!(Config::default().account, Account::default());
+        assert_eq!(
+            Config::parse("").expect("valid").account,
+            Account::default()
+        );
+
+        let config =
+            Config::parse("host = \"github.example.com\"\nuser = \"alexsnaps\"").expect("valid");
+        assert_eq!(
+            config.account,
+            Account::new(Some("github.example.com"), Some("alexsnaps")).expect("valid account")
+        );
+    }
+
+    #[test]
+    fn bad_host_or_user_is_rejected() {
+        assert!(rejection("host = \"https://github.example.com\"").contains("hostname"));
+        assert!(rejection("host = \"octocorp.ghe.com\"").contains("aren't supported yet"));
+        assert!(rejection("user = \"\"").contains("can't be empty"));
     }
 
     #[test]

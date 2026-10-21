@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
+use chrono::{DateTime, Local};
 use http::header::{HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED};
 use http::{StatusCode, Uri};
 use octocrab::models::activity::Notification as ApiNotification;
@@ -14,11 +15,11 @@ use octocrab::{FromResponse as _, GitHubError, Octocrab, Page};
 
 use crate::inbox::{Inbox, Notification, Reason, SubjectKind, ThreadId};
 
+/// github.com's hostname.
+const GITHUB_HOST: &str = "github.com";
+
 /// The REST API root for github.com.
 const GITHUB_API: &str = "https://api.github.com";
-
-/// The website root for github.com.
-const GITHUB_WEB: &str = "https://github.com";
 
 /// The Inbox's first page: read and unread Notifications, as many per page as the API allows.
 const INBOX_FIRST_PAGE: &str = "/notifications?all=true&per_page=50";
@@ -29,9 +30,93 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// GitHub's response header for the shortest time between polls of the Inbox, in seconds.
 const X_POLL_INTERVAL: HeaderName = HeaderName::from_static("x-poll-interval");
 
+/// The GitHub identity ghd acts as: a user on a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// `github.com`, or a GitHub Enterprise Server's hostname.
+    host: String,
+    /// The user's login; `None` for whichever account `gh` has active on `host`.
+    user: Option<String>,
+}
+
+impl Account {
+    /// The account of `user` on `host`; github.com when `host` is `None`, and `gh`'s active account there when
+    /// `user` is.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `host` isn't a bare hostname (`github.example.com`, no scheme or path), is a GHE.com one (not
+    /// supported yet), or if `user` is empty.
+    pub fn new(host: Option<&str>, user: Option<&str>) -> anyhow::Result<Self> {
+        let host = host.unwrap_or(GITHUB_HOST).to_ascii_lowercase();
+        if host.is_empty() || host.contains("://") || host.contains(['/', ' ']) {
+            bail!("`host` should be a hostname like `github.example.com`, not \"{host}\"");
+        }
+        if host == "ghe.com" || host.ends_with(".ghe.com") {
+            bail!("GHE.com hosts like \"{host}\" aren't supported yet");
+        }
+        if user.is_some_and(str::is_empty) {
+            bail!("`user` can't be empty; leave it out to use `gh`'s active account");
+        }
+        Ok(Self {
+            host,
+            user: user.map(str::to_owned),
+        })
+    }
+
+    fn is_github_com(&self) -> bool {
+        self.host == GITHUB_HOST
+    }
+
+    /// The REST API root, without a trailing `/`.
+    fn api_root(&self) -> String {
+        if self.is_github_com() {
+            GITHUB_API.to_owned()
+        } else {
+            format!("https://{}/api/v3", self.host)
+        }
+    }
+
+    /// The website root, without a trailing `/`.
+    fn web_root(&self) -> String {
+        format!("https://{}", self.host)
+    }
+
+    /// The environment variables that may hold a token for this host, in order of precedence: the ones `gh` reads
+    /// for it, so that a github.com token is never sent to another host.
+    fn token_variables(&self) -> [&'static str; 2] {
+        if self.is_github_com() {
+            ["GH_TOKEN", "GITHUB_TOKEN"]
+        } else {
+            ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+        }
+    }
+
+    /// The arguments to `gh` that print this account's token.
+    fn gh_auth_token_args(&self) -> Vec<&str> {
+        let mut args = vec!["auth", "token", "--hostname", &self.host];
+        if let Some(user) = &self.user {
+            args.extend(["--user", user]);
+        }
+        args
+    }
+}
+
+/// github.com, as `gh`'s active account there.
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            host: GITHUB_HOST.to_owned(),
+            user: None,
+        }
+    }
+}
+
 /// A GitHub API client acting as the user's Account.
 pub struct GitHub {
     client: Octocrab,
+    /// The host the Account is on, for advice in errors.
+    host: String,
     /// Where the website lives, without a trailing `/`; Subjects' pages are below it.
     web_root: String,
     /// What GitHub has said so far about polling the Inbox.
@@ -47,18 +132,19 @@ struct Polling {
 }
 
 impl GitHub {
-    /// A client for github.com using a token borrowed from the environment: `GH_TOKEN`, then `GITHUB_TOKEN`, then
-    /// `gh auth token` (the `gh` CLI's active account). Makes no request to GitHub.
+    /// A client acting as `account`, with a token borrowed from the environment: the variables `gh` reads for
+    /// the account's host (`GH_TOKEN`, then `GITHUB_TOKEN` for github.com; `GH_ENTERPRISE_TOKEN`, then
+    /// `GITHUB_ENTERPRISE_TOKEN` for others), then `gh auth token`. Makes no request to GitHub.
     ///
     /// # Errors
     ///
     /// Fails when none of those yields a token.
-    pub async fn authenticate() -> anyhow::Result<Self> {
-        Self::with_token(borrow_token().await?, GITHUB_API, GITHUB_WEB)
+    pub async fn authenticate(account: &Account) -> anyhow::Result<Self> {
+        Self::with_token(borrow_token(account).await?, account, &account.api_root())
     }
 
-    /// A client sending `token` to the REST API rooted at `api_root`, for the website at `web_root`.
-    fn with_token(token: SecretString, api_root: &str, web_root: &str) -> anyhow::Result<Self> {
+    /// A client for `account` sending `token` to the REST API rooted at `api_root`.
+    fn with_token(token: SecretString, account: &Account, api_root: &str) -> anyhow::Result<Self> {
         let client = Octocrab::builder()
             .personal_token(token)
             .base_uri(api_root)
@@ -67,7 +153,8 @@ impl GitHub {
             .context("building the GitHub client")?;
         Ok(Self {
             client,
-            web_root: web_root.trim_end_matches('/').to_owned(),
+            host: account.host.clone(),
+            web_root: account.web_root(),
             polling: Mutex::new(Polling {
                 last_modified: None,
                 interval: DEFAULT_POLL_INTERVAL,
@@ -161,7 +248,7 @@ impl GitHub {
             .client
             ._get_with_headers(uri, headers)
             .await
-            .context("fetching notifications")?;
+            .map_err(|error| self.explain(error))?;
         self.note_poll_interval(response.headers());
         if response.status() == StatusCode::NOT_MODIFIED {
             return Ok(None);
@@ -169,7 +256,7 @@ impl GitHub {
 
         let response = octocrab::map_github_error(response)
             .await
-            .map_err(explain_rejection)?;
+            .map_err(|error| self.explain(error))?;
         let last_modified = response.headers().get(LAST_MODIFIED).cloned();
         let page = Page::<ApiNotification>::from_response(response)
             .await
@@ -214,7 +301,7 @@ impl GitHub {
             .notifications()
             .mark_as_read(thread.0.into())
             .await
-            .map_err(explain_rejection)
+            .map_err(|error| self.explain(error))
     }
 
     /// Marks `thread` Done on GitHub, which takes it out of the Inbox. The API can't undo this.
@@ -232,7 +319,66 @@ impl GitHub {
             .notifications()
             .mark_as_done(thread.0.into())
             .await
-            .map_err(explain_rejection)
+            .map_err(|error| self.explain(error))
+    }
+
+    /// Puts `error` in the user's terms: what GitHub answered, or that it couldn't be reached, and what to do about
+    /// it where there's something to do.
+    fn explain(&self, error: octocrab::Error) -> anyhow::Error {
+        match error {
+            octocrab::Error::GitHub { source, .. } => {
+                let answer = format!(
+                    "GitHub answered {}: {}",
+                    source.status_code.as_u16(),
+                    source.message
+                );
+                match self.advice(&source) {
+                    Some(advice) => anyhow!("{answer}; {advice}"),
+                    None => anyhow!(answer),
+                }
+            }
+            error @ (octocrab::Error::Service { .. } | octocrab::Error::Hyper { .. }) => {
+                // The layers in between (octocrab's service, hyper's client) repeat themselves; the root cause
+                // says what happened, like a failed DNS lookup or a refused connection.
+                let mut cause: &dyn std::error::Error = &error;
+                while let Some(source) = cause.source() {
+                    cause = source;
+                }
+                anyhow!("couldn't reach {}: {cause}", self.host)
+            }
+            error => anyhow::Error::new(error),
+        }
+    }
+
+    /// What the user can do about GitHub's `error`, if anything.
+    fn advice(&self, error: &GitHubError) -> Option<String> {
+        let rate_limited = error
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("x-ratelimit-remaining"))
+            .is_some_and(|remaining| remaining == "0");
+        match error.status_code.as_u16() {
+            401 => Some(format!(
+                "the token may have expired or been revoked: run `gh auth login --hostname {}`, or set a new one",
+                self.host
+            )),
+            403 | 429 if rate_limited || error.status_code == StatusCode::TOO_MANY_REQUESTS => {
+                let until = error
+                    .rate_limit_reset
+                    .and_then(|reset| DateTime::from_timestamp(i64::try_from(reset).ok()?, 0))
+                    .map(|reset| format!(" until {}", reset.with_timezone(&Local).format("%H:%M")));
+                Some(format!(
+                    "the rate limit is used up{}",
+                    until.unwrap_or_default()
+                ))
+            }
+            403 => Some(
+                "fine-grained personal access tokens and GitHub App tokens can't read notifications: run \
+                 `gh auth login`, or use a classic token with the `notifications` scope"
+                    .to_owned(),
+            ),
+            _ => None,
+        }
     }
 
     /// Maps the API's representation of a Notification onto ghd's.
@@ -294,9 +440,9 @@ impl fmt::Debug for GitHub {
     }
 }
 
-/// Borrows a token: `GH_TOKEN`, then `GITHUB_TOKEN` (the variables `gh` itself honours), then `gh auth token`.
-async fn borrow_token() -> anyhow::Result<SecretString> {
-    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+/// Borrows a token for `account`; see [`GitHub::authenticate`].
+async fn borrow_token(account: &Account) -> anyhow::Result<SecretString> {
+    for name in account.token_variables() {
         match env::var(name) {
             Ok(token) if !token.is_empty() => return Ok(token.into()),
             Ok(_) | Err(VarError::NotPresent) => {}
@@ -304,17 +450,19 @@ async fn borrow_token() -> anyhow::Result<SecretString> {
         }
     }
 
+    let [variable, _] = account.token_variables();
+    let login = format!("gh auth login --hostname {}", account.host);
     let output = tokio::process::Command::new("gh")
-        .args(["auth", "token"])
+        .args(account.gh_auth_token_args())
         .output()
         .await
-        .context(
-            "no GitHub token: set GH_TOKEN, or install the `gh` CLI and run `gh auth login`",
-        )?;
+        .with_context(|| {
+            format!("no GitHub token: set {variable}, or install the `gh` CLI and run `{login}`")
+        })?;
     if !output.status.success() {
         bail!(
-            "no GitHub token: `gh auth token` failed ({}): {}; run `gh auth login`",
-            output.status,
+            "no GitHub token: `gh {}` failed: {}; run `{login}`",
+            account.gh_auth_token_args().join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -323,39 +471,9 @@ async fn borrow_token() -> anyhow::Result<SecretString> {
     Ok(token.trim().to_owned().into())
 }
 
-/// Adds a hint to an error that GitHub rejected the token for: notifications can only be read with a classic
-/// personal access token or an OAuth app token such as `gh`'s.
-fn explain_rejection(error: octocrab::Error) -> anyhow::Error {
-    let token_rejected =
-        matches!(&error, octocrab::Error::GitHub { source, .. } if is_token_rejection(source));
-    let error = anyhow::Error::new(error);
-    if token_rejected {
-        error.context(
-            "GitHub rejected the token: fine-grained personal access tokens can't read notifications; \
-             use `gh auth login`, or a classic token with the `notifications` scope",
-        )
-    } else {
-        error
-    }
-}
-
-/// Whether GitHub refused the request because of the token, rather than because the rate limit ran out (which
-/// GitHub also reports as 403).
-fn is_token_rejection(error: &GitHubError) -> bool {
-    let rate_limited = error
-        .headers
-        .as_ref()
-        .and_then(|headers| headers.get("x-ratelimit-remaining"))
-        .is_some_and(|remaining| remaining == "0");
-    match error.status_code.as_u16() {
-        401 => true,
-        403 => !rate_limited,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -387,14 +505,22 @@ mod tests {
     }
 
     async fn github_for(server: &MockServer) -> GitHub {
-        GitHub::with_token("test-token".to_owned().into(), &server.uri(), GITHUB_WEB)
-            .expect("mock server address is valid")
+        GitHub::with_token(
+            "test-token".to_owned().into(),
+            &Account::default(),
+            &server.uri(),
+        )
+        .expect("mock server address is valid")
     }
 
     #[tokio::test]
     async fn subject_page_follows_the_api_url() {
-        let github = GitHub::with_token("test-token".to_owned().into(), GITHUB_API, GITHUB_WEB)
-            .expect("github.com addresses are valid");
+        let github = GitHub::with_token(
+            "test-token".to_owned().into(),
+            &Account::default(),
+            GITHUB_API,
+        )
+        .expect("github.com addresses are valid");
         let cases = [
             (
                 Some("/repos/o/r/pulls/12"),
@@ -741,9 +867,62 @@ mod tests {
             .await
             .expect_err("GitHub answers 403");
 
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub answered 403: Resource not accessible by personal access token; fine-grained personal access \
+             tokens and GitHub App tokens can't read notifications: run `gh auth login`, or use a classic token \
+             with the `notifications` scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_credentials_suggest_logging_in_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "message": "Bad credentials",
+                "documentation_url": "https://docs.github.com/rest",
+            })))
+            .mount(&server)
+            .await;
+
+        let error = github_for(&server)
+            .await
+            .inbox()
+            .await
+            .expect_err("GitHub answers 401");
+
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub answered 401: Bad credentials; the token may have expired or been revoked: run \
+             `gh auth login --hostname github.com`, or set a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_host_is_named() {
+        // Nothing listens on the port once the listener is dropped. (A dropped wiremock server goes back to a pool
+        // and keeps answering.)
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let address = format!("http://127.0.0.1:{port}");
+        let github = GitHub::with_token(
+            "test-token".to_owned().into(),
+            &Account::default(),
+            &address,
+        )
+        .expect("valid address");
+
+        let error = github.inbox().await.expect_err("nothing answers");
+
         let message = format!("{error:#}");
-        assert!(message.contains("fine-grained"), "{message}");
-        assert!(message.contains("Resource not accessible"), "{message}");
+        assert!(
+            message.starts_with("couldn't reach github.com: "),
+            "{message}"
+        );
+        assert!(!message.contains("Service Error"), "{message}");
     }
 
     #[tokio::test]
@@ -765,8 +944,89 @@ mod tests {
             .await
             .expect_err("GitHub answers 403");
 
-        let message = format!("{error:#}");
-        assert!(!message.contains("fine-grained"), "{message}");
-        assert!(message.contains("rate limit"), "{message}");
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub answered 403: API rate limit exceeded; the rate limit is used up"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_says_when_it_resets() {
+        let reset = Utc::now() + TimeDelta::minutes(30);
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("x-ratelimit-reset", reset.timestamp().to_string())
+                    .set_body_json(
+                        json!({ "message": "You have exceeded a secondary rate limit" }),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let error = github_for(&server)
+            .await
+            .mark_done(ThreadId(1))
+            .await
+            .expect_err("GitHub answers 429");
+
+        let until = reset.with_timezone(&Local).format("%H:%M").to_string();
+        assert!(
+            format!("{error:#}").ends_with(&format!("the rate limit is used up until {until}")),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn github_com_account_uses_gh_defaults() {
+        let account = Account::new(None, None).expect("github.com is valid");
+
+        assert_eq!(account, Account::default());
+        assert_eq!(account.api_root(), "https://api.github.com");
+        assert_eq!(account.web_root(), "https://github.com");
+        assert_eq!(account.token_variables(), ["GH_TOKEN", "GITHUB_TOKEN"]);
+        assert_eq!(
+            account.gh_auth_token_args(),
+            ["auth", "token", "--hostname", "github.com"]
+        );
+    }
+
+    #[test]
+    fn enterprise_server_account_never_gets_a_github_com_token() {
+        let account =
+            Account::new(Some("GitHub.Example.com"), Some("alexsnaps")).expect("valid host");
+
+        assert_eq!(account.api_root(), "https://github.example.com/api/v3");
+        assert_eq!(account.web_root(), "https://github.example.com");
+        assert_eq!(
+            account.token_variables(),
+            ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+        );
+        assert_eq!(
+            account.gh_auth_token_args(),
+            [
+                "auth",
+                "token",
+                "--hostname",
+                "github.example.com",
+                "--user",
+                "alexsnaps"
+            ]
+        );
+    }
+
+    #[test]
+    fn account_rejects_what_isnt_a_hostname() {
+        for host in [
+            "",
+            "https://github.example.com",
+            "github.example.com/api",
+            "git hub.com",
+            "octocorp.ghe.com",
+        ] {
+            assert!(Account::new(Some(host), None).is_err(), "{host:?}");
+        }
+        assert!(Account::new(None, Some("")).is_err());
     }
 }
