@@ -17,6 +17,7 @@ use crate::cache::Cache;
 use crate::config::Config;
 use crate::github::GitHub;
 use crate::theme::Theme;
+use crate::ui::KindLabels;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -25,10 +26,15 @@ async fn main() -> anyhow::Result<()> {
     let theme = Theme::load(config.theme(), xdg::config_dir().as_deref()).await?;
     let github = GitHub::authenticate(config.account()).await?;
     let cache = Cache::for_account(config.account());
+    let kind_labels = if config.icons() {
+        KindLabels::Icons
+    } else {
+        KindLabels::Text
+    };
     let views = config.into_views();
 
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
-    let outcome = ui::run(&mut terminal, &github, views, theme, &cache).await;
+    let outcome = ui::run(&mut terminal, &github, views, theme, kind_labels, &cache).await;
     ratatui::restore();
     outcome
 }

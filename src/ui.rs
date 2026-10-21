@@ -31,7 +31,8 @@ const MAX_REPOSITORY_WIDTH: u16 = 32;
 /// Longest that quitting waits for changes still on their way to GitHub.
 const QUIT_GRACE: Duration = Duration::from_secs(10);
 
-/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`. Meanwhile it
+/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`, naming Subject
+/// kinds with `kind_labels`. Meanwhile it
 /// keeps the Inbox up to date from `github`, polling as often as GitHub allows, and sends it the changes the user
 /// makes. Until the first fetch arrives, it shows what `cache` kept from last time; on quitting, it keeps the Inbox
 /// there for next time.
@@ -50,9 +51,10 @@ pub async fn run(
     github: &GitHub,
     views: Vec<View>,
     theme: Theme,
+    kind_labels: KindLabels,
     cache: &Cache,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(views, theme);
+    let mut app = App::new(views, theme, kind_labels);
     if let Some(snapshot) = cache.load().await {
         app.restore(snapshot, Utc::now());
     }
@@ -351,6 +353,7 @@ struct App {
     /// The help is shown over the View.
     help_shown: bool,
     theme: Theme,
+    kind_labels: KindLabels,
 }
 
 /// The prompt the user types a Search into.
@@ -378,12 +381,12 @@ enum Step {
 
 impl App {
     /// The app waiting for the Inbox, with `views` as tabs in that order and the first of them on screen, in
-    /// `theme`.
+    /// `theme`, naming Subject kinds with `kind_labels`.
     ///
     /// # Panics
     ///
     /// If `views` is empty.
-    fn new(views: Vec<View>, theme: Theme) -> Self {
+    fn new(views: Vec<View>, theme: Theme, kind_labels: KindLabels) -> Self {
         assert!(
             !views.is_empty(),
             "the configuration always has the Inbox View"
@@ -407,6 +410,7 @@ impl App {
             selection: HashSet::new(),
             help_shown: false,
             theme,
+            kind_labels,
         }
     }
 
@@ -877,8 +881,14 @@ impl App {
                 Paragraph::new("Nothing in your Inbox matches this View.").style(theme.message)
             }
             InboxState::Loaded(_) => {
-                let table =
-                    notifications_table(&rows, &self.selection, Utc::now(), theme).block(block);
+                let table = notifications_table(
+                    &rows,
+                    &self.selection,
+                    Utc::now(),
+                    theme,
+                    self.kind_labels,
+                )
+                .block(block);
                 frame.render_stateful_widget(table, area, &mut current.cursor);
                 return;
             }
@@ -1021,12 +1031,14 @@ fn shown<'a>(
 }
 
 /// One row per Notification in `notifications`, in `theme`: selection marker, unread marker, Subject kind,
-/// repository, title, Reason, and age relative to `now`. Those whose thread is in `selection` are marked selected.
+/// repository, title, Reason, and age relative to `now`, the kinds named with `kind_labels`. Those whose thread is in
+/// `selection` are marked selected.
 fn notifications_table<'a>(
     notifications: &[&'a Notification],
     selection: &HashSet<ThreadId>,
     now: DateTime<Utc>,
     theme: &Theme,
+    kind_labels: KindLabels,
 ) -> Table<'a> {
     let rows = notifications.iter().map(|n| {
         let selected = selection.contains(&n.thread);
@@ -1047,7 +1059,7 @@ fn notifications_table<'a>(
                 theme.unread_marker,
             ),
             cell(
-                Cow::Borrowed(subject_kind_label(&n.subject_kind)),
+                Cow::Borrowed(kind_labels.label(&n.subject_kind)),
                 theme.kind(&n.subject_kind),
             ),
             cell(Cow::Borrowed(&n.repository), theme.repository),
@@ -1070,7 +1082,7 @@ fn notifications_table<'a>(
     let widths = [
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(kind_labels.width()),
         Constraint::Length(
             u16::try_from(repository_width)
                 .map_or(MAX_REPOSITORY_WIDTH, |w| w.min(MAX_REPOSITORY_WIDTH)),
@@ -1084,15 +1096,45 @@ fn notifications_table<'a>(
 }
 
 /// A label of at most three cells for the Subject column.
-fn subject_kind_label(kind: &SubjectKind) -> &'static str {
-    match kind {
-        SubjectKind::PullRequest => "PR",
-        SubjectKind::Issue => "ISS",
-        SubjectKind::Release => "REL",
-        SubjectKind::Discussion => "DIS",
-        SubjectKind::Commit => "CMT",
-        SubjectKind::CheckSuite => "CI",
-        SubjectKind::Other(_) => "?",
+/// How the Subject column names the kinds of Subject.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KindLabels {
+    /// `PR`, `ISS`, `REL`, …, which any font can draw.
+    #[default]
+    Text,
+    /// GitHub's Octicons, as Nerd Fonts (version 3) have them; a font without them draws boxes.
+    Icons,
+}
+
+impl KindLabels {
+    /// The label for `kind`, at most [`KindLabels::width`] cells wide.
+    fn label(self, kind: &SubjectKind) -> &'static str {
+        // The icons' names in Nerd Fonts: oct-git_pull_request, oct-issue_opened, oct-tag, oct-comment_discussion,
+        // oct-git_commit, oct-checklist and oct-question.
+        match (self, kind) {
+            (Self::Text, SubjectKind::PullRequest) => "PR",
+            (Self::Text, SubjectKind::Issue) => "ISS",
+            (Self::Text, SubjectKind::Release) => "REL",
+            (Self::Text, SubjectKind::Discussion) => "DIS",
+            (Self::Text, SubjectKind::Commit) => "CMT",
+            (Self::Text, SubjectKind::CheckSuite) => "CI",
+            (Self::Text, SubjectKind::Other(_)) => "?",
+            (Self::Icons, SubjectKind::PullRequest) => "\u{f407}",
+            (Self::Icons, SubjectKind::Issue) => "\u{f41b}",
+            (Self::Icons, SubjectKind::Release) => "\u{f412}",
+            (Self::Icons, SubjectKind::Discussion) => "\u{f442}",
+            (Self::Icons, SubjectKind::Commit) => "\u{f417}",
+            (Self::Icons, SubjectKind::CheckSuite) => "\u{f45e}",
+            (Self::Icons, SubjectKind::Other(_)) => "\u{f420}",
+        }
+    }
+
+    /// The width of the Subject column, in terminal cells.
+    fn width(self) -> u16 {
+        match self {
+            Self::Text => 3,
+            Self::Icons => 1,
+        }
     }
 }
 
@@ -1204,6 +1246,7 @@ mod tests {
                 filter: Filter::default(),
             }],
             Theme::default(),
+            KindLabels::Text,
         )
     }
 
@@ -1229,6 +1272,7 @@ mod tests {
                 view("Read", "is:read"),
             ],
             theme,
+            KindLabels::Text,
         );
         app.fetched(fetched(notifications()));
         app
@@ -2262,6 +2306,40 @@ mod tests {
             "not the others"
         );
         assert_eq!(cell_at(buffer, 3, " 1 selected ").fg, Color::Rgb(7, 7, 7));
+    }
+
+    #[test]
+    fn icons_take_the_place_of_text_labels() {
+        let mut app = app();
+        app.kind_labels = KindLabels::Icons;
+
+        let lines = screen(&mut app);
+
+        assert!(lines[1].contains("● \u{f407} wcgw/ghd"), "{lines:#?}");
+        assert!(lines[2].contains("  \u{f41b} wcgw/other"), "{lines:#?}");
+        assert!(!lines[1].contains("PR"), "{lines:#?}");
+    }
+
+    #[test]
+    fn every_kind_has_a_label_that_fits() {
+        let kinds = [
+            SubjectKind::PullRequest,
+            SubjectKind::Issue,
+            SubjectKind::Release,
+            SubjectKind::Discussion,
+            SubjectKind::Commit,
+            SubjectKind::CheckSuite,
+            SubjectKind::Other("RepositoryAdvisory".to_owned()),
+        ];
+        for labels in [KindLabels::Text, KindLabels::Icons] {
+            for kind in &kinds {
+                let width = labels.label(kind).chars().count();
+                assert!(
+                    width >= 1 && width <= labels.width().into(),
+                    "{labels:?} {kind:?}"
+                );
+            }
+        }
     }
 
     #[test]

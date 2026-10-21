@@ -4,6 +4,7 @@
 //! host = "github.example.com"   # optional, github.com by default
 //! user = "alexsnaps"            # optional, `gh`'s active account on the host by default
 //! theme = "terminal"            # optional, tokyonight-moon by default
+//! icons = true                  # optional, false by default: Nerd Font icons for kinds of Subject
 //!
 //! [[view]]
 //! name = "Reviews"
@@ -35,6 +36,8 @@ pub struct Config {
     account: Account,
     /// The name of the theme to use.
     theme: String,
+    /// Kinds of Subject show as Nerd Font icons rather than text.
+    icons: bool,
     /// The built-in Inbox View, then the configured ones in the file's order; names are unique, ignoring case.
     views: Vec<View>,
 }
@@ -69,6 +72,12 @@ impl Config {
         &self.theme
     }
 
+    /// Whether kinds of Subject show as Nerd Font icons rather than text. There's no telling from inside a
+    /// terminal which font it draws with, so it's the user's call.
+    pub fn icons(&self) -> bool {
+        self.icons
+    }
+
     /// The Views to show as tabs: the built-in Inbox View first, then the configured ones in the file's order.
     pub fn into_views(self) -> Vec<View> {
         self.views
@@ -80,6 +89,7 @@ impl Config {
         let mut config = Self {
             account: Account::new(file.host.as_deref(), file.user.as_deref())?,
             theme: file.theme.unwrap_or_else(|| theme::DEFAULT.to_owned()),
+            icons: file.icons.unwrap_or_default(),
             ..Self::default()
         };
         for entry in file.views {
@@ -112,12 +122,14 @@ impl Config {
     }
 }
 
-/// `gh`'s active account on github.com, the default theme, and only the built-in Inbox View.
+/// `gh`'s active account on github.com, the default theme, text for kinds of Subject, and only the built-in Inbox
+/// View.
 impl Default for Config {
     fn default() -> Self {
         Self {
             account: Account::default(),
             theme: theme::DEFAULT.to_owned(),
+            icons: false,
             views: vec![View {
                 name: INBOX_VIEW.to_owned(),
                 filter: Filter::default(),
@@ -133,6 +145,7 @@ struct File {
     host: Option<String>,
     user: Option<String>,
     theme: Option<String>,
+    icons: Option<bool>,
     #[serde(default, rename = "view")]
     views: Vec<ViewEntry>,
 }
@@ -189,6 +202,14 @@ mod tests {
                 .theme(),
             "terminal"
         );
+    }
+
+    #[test]
+    fn icons_are_off_unless_the_file_says() {
+        assert!(!Config::default().icons());
+        assert!(!Config::parse("").expect("valid").icons());
+        assert!(Config::parse("icons = true").expect("valid").icons());
+        assert!(rejection("icons = \"yes\"").contains("icons"));
     }
 
     #[test]
