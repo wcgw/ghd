@@ -5,6 +5,7 @@ mod config;
 mod filter;
 mod github;
 mod inbox;
+mod search;
 mod ui;
 
 use anyhow::Context as _;

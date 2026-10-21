@@ -1,5 +1,6 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
+use std::mem;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -7,7 +8,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::future::OptionFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
@@ -18,6 +19,7 @@ use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::github::GitHub;
 use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
+use crate::search::Search;
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: u16 = 32;
@@ -68,19 +70,15 @@ pub async fn run(
             }
             Some(reply) = in_flight.next(), if !in_flight.is_empty() => app.settle(reply),
             event = events.next() => match event {
-                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match command_for(key) {
-                    Some(Command::Quit) => break,
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match app.press(key) {
+                    Some(Outcome::Quit) => break,
                     // A refresh asked for while a fetch is under way gets that fetch.
-                    Some(Command::Refresh) => {
+                    Some(Outcome::Refresh) => {
                         if fetch.is_none() {
                             fetch = Some(Box::pin(fetch_inbox(github, Fetch::Whole)));
                         }
                     }
-                    Some(command) => {
-                        if let Some(change) = app.execute(command) {
-                            in_flight.push(send(github, change));
-                        }
-                    }
+                    Some(Outcome::Send(change)) => in_flight.push(send(github, change)),
                     None => {}
                 },
                 // Anything else, a resize included, just needs the redraw at the top of the loop.
@@ -153,6 +151,16 @@ async fn fetch_inbox(github: &GitHub, fetch: Fetch) -> Fetched {
     Fetched { began, inbox }
 }
 
+/// What `run` has to do about a key press, beyond what [`App::press`] did on screen.
+#[derive(Debug)]
+enum Outcome {
+    Quit,
+    /// Fetch the whole Inbox now, rather than at the next poll.
+    Refresh,
+    /// Send this change to GitHub; the screen shows it made already.
+    Send(Change),
+}
+
 /// What a key press can ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -165,6 +173,9 @@ enum Command {
     PreviousView,
     /// Shows the View at this index in tab order, counting from 0; nothing happens past the last View.
     ShowView(usize),
+    /// Opens the prompt to type a Search into.
+    Search,
+    ClearSearch,
     /// Opens the selected Subject in the browser, which also marks it read.
     Open,
     MarkRead,
@@ -174,7 +185,7 @@ enum Command {
 /// The command a key press stands for. Marking read and Done use GitHub's own notification shortcuts.
 fn command_for(key: KeyEvent) -> Option<Command> {
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::Quit),
+        _ if is_interrupt(key) => Some(Command::Quit),
         KeyCode::Char('q') => Some(Command::Quit),
         KeyCode::Char('r') => Some(Command::Refresh),
         KeyCode::Char('j') | KeyCode::Down => Some(Command::SelectNext),
@@ -185,8 +196,15 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('o') | KeyCode::Enter => Some(Command::Open),
         KeyCode::Char('I') => Some(Command::MarkRead),
         KeyCode::Char('e') => Some(Command::MarkDone),
+        KeyCode::Char('/') => Some(Command::Search),
+        KeyCode::Esc => Some(Command::ClearSearch),
         _ => None,
     }
+}
+
+/// Whether `key` is Ctrl-C, which quits even while the user types a Search.
+fn is_interrupt(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// A one-line message at the bottom of the screen.
@@ -223,6 +241,18 @@ struct App {
     status: Option<StatusMessage>,
     /// Changes the user made that a fetched Inbox may not show yet.
     recent: RecentChanges,
+    /// The Search as the user typed it; empty when there's none.
+    search_input: String,
+    /// The Search `search_input` stands for. It narrows whichever View is on screen.
+    search: Search,
+    /// The prompt in the status line, while the user types a Search.
+    search_prompt: Option<SearchPrompt>,
+}
+
+/// The prompt the user types a Search into.
+struct SearchPrompt {
+    /// The Search input when the prompt opened, put back if the user cancels.
+    input_before: String,
 }
 
 impl App {
@@ -249,6 +279,9 @@ impl App {
             current: 0,
             status: None,
             recent: RecentChanges::default(),
+            search_input: String::new(),
+            search: Search::default(),
+            search_prompt: None,
         }
     }
 
@@ -278,18 +311,64 @@ impl App {
         }
     }
 
-    /// Shows `inbox` instead of the Inbox on screen. Each View's selection stays on the same Notification, if the
-    /// View still shows it.
+    /// Shows `inbox` instead of the Inbox on screen.
     fn replace_inbox(&mut self, inbox: Inbox) {
+        self.keeping_selections(|app| app.inbox = InboxState::Loaded(inbox));
+    }
+
+    /// Makes `input` the Search.
+    fn set_search(&mut self, input: String) {
+        self.keeping_selections(|app| {
+            app.search = Search::parse(&input);
+            app.search_input = input;
+        });
+    }
+
+    /// Whether the user is typing a Search, so keys go to the prompt.
+    fn is_typing_search(&self) -> bool {
+        self.search_prompt.is_some()
+    }
+
+    /// Edits the Search in the prompt with `key`, the View on screen narrowing as it changes. A character adds to
+    /// it and Backspace takes the last one off; Enter closes the prompt, keeping the Search, and Esc closes it,
+    /// putting back the Search there was before.
+    fn type_search(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let mut input = mem::take(&mut self.search_input);
+                input.push(character);
+                self.set_search(input);
+            }
+            KeyCode::Backspace => {
+                let mut input = mem::take(&mut self.search_input);
+                input.pop();
+                self.set_search(input);
+            }
+            KeyCode::Enter => self.search_prompt = None,
+            KeyCode::Esc => {
+                if let Some(prompt) = self.search_prompt.take() {
+                    self.set_search(prompt.input_before);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Runs `change`, keeping each View's selection on the same Notification if the View still shows it.
+    fn keeping_selections(&mut self, change: impl FnOnce(&mut Self)) {
         let selected: Vec<Option<ThreadId>> = self
             .views
             .iter()
-            .map(|shown_view| selected_in(&self.inbox, shown_view).map(|n| n.thread))
+            .map(|shown_view| selected_in(&self.inbox, shown_view, &self.search).map(|n| n.thread))
             .collect();
-        self.inbox = InboxState::Loaded(inbox);
+        change(self);
         for (shown_view, thread) in self.views.iter_mut().zip(selected) {
             let row = thread.and_then(|thread| {
-                shown(&self.inbox, &shown_view.view).position(|n| n.thread == thread)
+                shown(&self.inbox, &shown_view.view, &self.search).position(|n| n.thread == thread)
             });
             if let Some(row) = row {
                 shown_view.selection.select(Some(row));
@@ -297,11 +376,25 @@ impl App {
         }
     }
 
+    /// Takes in a key press: while the user types a Search, every key but Ctrl-C goes to the prompt; otherwise the
+    /// key's command is carried out on screen. Returns what's left for `run` to do.
+    fn press(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if self.is_typing_search() && !is_interrupt(key) {
+            self.type_search(key);
+            return None;
+        }
+        match command_for(key)? {
+            Command::Quit => Some(Outcome::Quit),
+            Command::Refresh => Some(Outcome::Refresh),
+            command => self.execute(command).map(Outcome::Send),
+        }
+    }
+
     /// Carries out `command` on screen. Returns the change to send to GitHub, if the command makes one.
     fn execute(&mut self, command: Command) -> Option<Change> {
         // Moving the selection past either end is corrected when the table is next drawn.
         let change = match command {
-            // `run` quits and fetches.
+            // Nothing to do on screen: `press` hands these to `run`.
             Command::Quit | Command::Refresh => None,
             Command::SelectNext => {
                 self.views[self.current].selection.select_next();
@@ -323,6 +416,16 @@ impl App {
                 if index < self.views.len() {
                     self.current = index;
                 }
+                None
+            }
+            Command::Search => {
+                self.search_prompt = Some(SearchPrompt {
+                    input_before: self.search_input.clone(),
+                });
+                None
+            }
+            Command::ClearSearch => {
+                self.set_search(String::new());
                 None
             }
             Command::Open => match self
@@ -371,7 +474,7 @@ impl App {
 
     /// The selected Notification in the View on screen; `None` until the Inbox arrives, or if the View shows none.
     fn selected(&self) -> Option<&Notification> {
-        selected_in(&self.inbox, &self.views[self.current])
+        selected_in(&self.inbox, &self.views[self.current], &self.search)
     }
 
     /// Clears Unread on the selected Notification. Returns it as it was before; `None` if it was already read.
@@ -407,8 +510,11 @@ impl App {
         if fetching {
             block = block.title_top(Line::from(" fetching… ").right_aligned());
         }
+        if !self.search_input.is_empty() && !self.is_typing_search() {
+            block = block.title_bottom(format!(" /{} ", self.search_input));
+        }
         let current = &mut self.views[self.current];
-        let rows: Vec<&Notification> = shown(&self.inbox, &current.view).collect();
+        let rows: Vec<&Notification> = shown(&self.inbox, &current.view, &self.search).collect();
         let message = match &self.inbox {
             InboxState::Loading => Paragraph::new("Fetching notifications…"),
             InboxState::Failed(error) => {
@@ -418,6 +524,14 @@ impl App {
             }
             InboxState::Loaded(inbox) if inbox.is_empty() => {
                 Paragraph::new("Nothing in your Inbox.")
+            }
+            InboxState::Loaded(_)
+                if rows.is_empty()
+                    && shown(&self.inbox, &current.view, &Search::default())
+                        .next()
+                        .is_some() =>
+            {
+                Paragraph::new("Nothing in this View matches the search.")
             }
             InboxState::Loaded(_) if rows.is_empty() => {
                 Paragraph::new("Nothing in your Inbox matches this View.")
@@ -432,6 +546,13 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
+        if self.is_typing_search() {
+            let prompt = format!("/{}", self.search_input);
+            let width = u16::try_from(prompt.chars().count()).unwrap_or(u16::MAX);
+            frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
+            frame.render_widget(Line::from(prompt), area);
+            return;
+        }
         let status = match &self.status {
             None => return,
             Some(StatusMessage::Info(text)) => Line::from(text.as_str()),
@@ -442,8 +563,8 @@ impl App {
         frame.render_widget(status, area);
     }
 
-    /// The tabs: each View's name and, once the Inbox has arrived, how many unread Notifications it shows. The View
-    /// on screen is highlighted.
+    /// The tabs: each View's name and, once the Inbox has arrived, how many unread Notifications it shows, the
+    /// Search included. The View on screen is highlighted.
     fn tabs(&self) -> Line<'static> {
         let mut spans = vec![Span::raw(" ")];
         for (index, shown_view) in self.views.iter().enumerate() {
@@ -452,7 +573,7 @@ impl App {
             }
             let label = match &self.inbox {
                 InboxState::Loaded(_) => {
-                    let unread = shown(&self.inbox, &shown_view.view)
+                    let unread = shown(&self.inbox, &shown_view.view, &self.search)
                         .filter(|n| n.unread)
                         .count();
                     format!("{} ({unread})", shown_view.view.name)
@@ -471,13 +592,22 @@ impl App {
     }
 }
 
-/// The Notification selected in `shown_view`; `None` until the Inbox has arrived, or if the View shows none.
-fn selected_in<'a>(inbox: &'a InboxState, shown_view: &'a ShownView) -> Option<&'a Notification> {
-    shown(inbox, &shown_view.view).nth(shown_view.selection.selected()?)
+/// The Notification selected in `shown_view` narrowed by `search`; `None` until the Inbox has arrived, or if
+/// nothing is shown.
+fn selected_in<'a>(
+    inbox: &'a InboxState,
+    shown_view: &'a ShownView,
+    search: &'a Search,
+) -> Option<&'a Notification> {
+    shown(inbox, &shown_view.view, search).nth(shown_view.selection.selected()?)
 }
 
-/// The Notifications `view` shows, newest first; none until the Inbox has arrived.
-fn shown<'a>(inbox: &'a InboxState, view: &'a View) -> impl Iterator<Item = &'a Notification> {
+/// The Notifications `view` shows narrowed by `search`, newest first; none until the Inbox has arrived.
+fn shown<'a>(
+    inbox: &'a InboxState,
+    view: &'a View,
+    search: &'a Search,
+) -> impl Iterator<Item = &'a Notification> {
     let inbox = match inbox {
         InboxState::Loaded(inbox) => Some(inbox),
         InboxState::Loading | InboxState::Failed(_) => None,
@@ -485,7 +615,7 @@ fn shown<'a>(inbox: &'a InboxState, view: &'a View) -> impl Iterator<Item = &'a 
     inbox
         .into_iter()
         .flat_map(Inbox::iter)
-        .filter(|n| view.filter.matches(n))
+        .filter(|n| view.filter.matches(n) && search.matches(n))
 }
 
 /// One row per Notification in `notifications`: unread marker, Subject kind, repository, title, Reason, and age
@@ -741,6 +871,13 @@ mod tests {
         assert_eq!(press(KeyCode::Up, none), Some(Command::SelectPrevious));
         assert_eq!(press(KeyCode::Char('q'), none), Some(Command::Quit));
         assert_eq!(press(KeyCode::Char('r'), none), Some(Command::Refresh));
+        assert_eq!(press(KeyCode::Char('/'), none), Some(Command::Search));
+        assert_eq!(press(KeyCode::Esc, none), Some(Command::ClearSearch));
+        assert_eq!(
+            press(KeyCode::Char('u'), none),
+            None,
+            "GitHub can't mark unread"
+        );
         assert_eq!(
             press(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(Command::Quit)
@@ -923,7 +1060,7 @@ mod tests {
 
         app.fetched(fetched(newer));
 
-        let inbox_view: Vec<&str> = shown(&app.inbox, &app.views[0].view)
+        let inbox_view: Vec<&str> = shown(&app.inbox, &app.views[0].view, &app.search)
             .map(|n| n.subject_title.as_str())
             .collect();
         assert_eq!(inbox_view, ["Brand new", "Add polling", "Old news"]);
@@ -1025,6 +1162,126 @@ mod tests {
         assert!(!screen(&mut app)[0].contains("fetching"));
         let lines = screen_while(&mut app, true);
         assert!(lines[0].ends_with(" fetching… ┐"), "{lines:#?}");
+    }
+
+    /// Types `text` into the Search prompt.
+    fn type_text(app: &mut App, text: &str) {
+        for character in text.chars() {
+            app.type_search(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+    }
+
+    fn type_key(app: &mut App, code: KeyCode) {
+        app.type_search(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn search_narrows_as_it_is_typed() {
+        let mut app = app();
+
+        app.execute(Command::Search);
+        assert!(app.is_typing_search());
+        type_text(&mut app, "old");
+
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Old news"]);
+        assert!(lines[4].starts_with("/old "), "{lines:#?}");
+        assert!(!lines[3].contains("/old"), "not shown twice while typing");
+
+        for _ in 0..3 {
+            type_key(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+    }
+
+    #[test]
+    fn keys_go_to_the_prompt_while_typing() {
+        let mut app = app();
+        let press = |app: &mut App, code, modifiers| app.press(KeyEvent::new(code, modifiers));
+        let none = KeyModifiers::NONE;
+
+        assert!(press(&mut app, KeyCode::Char('/'), none).is_none());
+        for character in ['q', 'e', 'r', '/'] {
+            assert!(
+                press(&mut app, KeyCode::Char(character), none).is_none(),
+                "{character}"
+            );
+        }
+        assert!(press(&mut app, KeyCode::Esc, none).is_none());
+
+        assert!(!app.is_typing_search());
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Add polling", "Old news"],
+            "nothing marked Done"
+        );
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('e'), none),
+            Some(Outcome::Send(Change::MarkDone(_)))
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_typing() {
+        let mut app = app();
+        app.execute(Command::Search);
+
+        let outcome = app.press(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(matches!(outcome, Some(Outcome::Quit)));
+    }
+
+    #[test]
+    fn enter_keeps_the_search_and_it_follows_across_views() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "old");
+        type_key(&mut app, KeyCode::Enter);
+
+        assert!(!app.is_typing_search());
+        let lines = screen(&mut app);
+        assert!(lines[3].contains(" /old "), "{lines:#?}");
+        assert!(
+            lines[0].contains(" Inbox (0) │ Reviews (0) │ Read (0) "),
+            "counts follow the search"
+        );
+
+        app.execute(Command::ShowView(2));
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+        app.execute(Command::ShowView(1));
+        assert!(screen(&mut app)[1].contains("Nothing in this View matches the search."));
+
+        app.execute(Command::ClearSearch);
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
+        assert!(!screen(&mut app)[3].contains('/'));
+    }
+
+    #[test]
+    fn esc_in_the_prompt_puts_back_the_previous_search() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "old");
+        type_key(&mut app, KeyCode::Enter);
+
+        app.execute(Command::Search);
+        type_text(&mut app, " nothing-like-this");
+        assert_eq!(titles(&screen(&mut app)), Vec::<&str>::new());
+        type_key(&mut app, KeyCode::Esc);
+
+        assert!(!app.is_typing_search());
+        assert_eq!(app.search_input, "old");
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+    }
+
+    #[test]
+    fn selection_stays_put_while_the_search_still_shows_it() {
+        let mut app = app();
+        app.execute(Command::SelectNext);
+
+        app.execute(Command::Search);
+        type_text(&mut app, "n");
+
+        assert_eq!(selected_title(&app), Some("Old news"));
     }
 
     #[test]
