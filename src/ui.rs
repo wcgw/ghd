@@ -1,21 +1,23 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
-use std::pin::pin;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures_util::future::OptionFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use tokio::time::Instant;
 
+use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::github::GitHub;
-use crate::inbox::{Inbox, Notification, SubjectKind};
+use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: u16 = 32;
@@ -23,14 +25,14 @@ const MAX_REPOSITORY_WIDTH: u16 = 32;
 /// Longest that quitting waits for changes still on their way to GitHub.
 const QUIT_GRACE: Duration = Duration::from_secs(10);
 
-/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order. Meanwhile it fetches the
-/// Inbox from `github` and sends it the changes the user makes.
+/// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order. Meanwhile it keeps the
+/// Inbox up to date from `github`, polling as often as GitHub allows, and sends it the changes the user makes.
 ///
 /// # Errors
 ///
 /// Fails if the terminal can't be drawn on or read from, or if changes made just before quitting were refused or
 /// didn't reach GitHub in time. Failing to fetch the Inbox, or a refused change while the UI runs, isn't an error
-/// here: the screen shows it.
+/// here: the screen shows it, and the next poll tries again.
 ///
 /// # Panics
 ///
@@ -42,22 +44,38 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut app = App::new(views);
     let mut events = EventStream::new();
-    // Polled alongside terminal events, so the UI keeps drawing and can be quit while pages arrive.
-    let mut fetch = pin!(github.inbox());
+    // The fetch under way, if any; never more than one. Polled alongside terminal events, so the UI keeps drawing
+    // and can be quit while pages arrive.
+    let mut fetch = Some(Box::pin(fetch_inbox(github, Fetch::Whole)));
+    // When to poll the Inbox next, once no fetch is under way.
+    let mut next_poll = Instant::now();
     // Changes already on screen, on their way to GitHub.
     let mut in_flight = FuturesUnordered::new();
 
     loop {
         terminal
-            .draw(|frame| app.render(frame))
+            .draw(|frame| app.render(frame, fetch.is_some()))
             .context("drawing the terminal")?;
 
         tokio::select! {
-            inbox = &mut fetch, if matches!(app.inbox, InboxState::Loading) => app.fetched(inbox),
+            Some(fetched) = OptionFuture::from(fetch.as_mut()), if fetch.is_some() => {
+                fetch = None;
+                app.fetched(fetched);
+                next_poll = Instant::now() + github.poll_interval();
+            }
+            () = tokio::time::sleep_until(next_poll), if fetch.is_none() => {
+                fetch = Some(Box::pin(fetch_inbox(github, Fetch::IfChanged)));
+            }
             Some(reply) = in_flight.next(), if !in_flight.is_empty() => app.settle(reply),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match command_for(key) {
                     Some(Command::Quit) => break,
+                    // A refresh asked for while a fetch is under way gets that fetch.
+                    Some(Command::Refresh) => {
+                        if fetch.is_none() {
+                            fetch = Some(Box::pin(fetch_inbox(github, Fetch::Whole)));
+                        }
+                    }
                     Some(command) => {
                         if let Some(change) = app.execute(command) {
                             in_flight.push(send(github, change));
@@ -82,7 +100,7 @@ pub async fn run(
         "Sending {unconfirmed} change(s) to GitHub…"
     )));
     terminal
-        .draw(|frame| app.render(frame))
+        .draw(|frame| app.render(frame, false))
         .context("drawing the terminal")?;
     let replies = tokio::time::timeout(QUIT_GRACE, in_flight.collect::<Vec<_>>())
         .await
@@ -105,10 +123,42 @@ pub async fn run(
     Ok(())
 }
 
+/// How much of the Inbox to fetch.
+#[derive(Debug, Clone, Copy)]
+enum Fetch {
+    Whole,
+    /// The whole Inbox if it changed since the last fetch, nothing otherwise.
+    IfChanged,
+}
+
+/// The outcome of fetching the Inbox.
+struct Fetched {
+    /// When the fetch began: changes GitHub confirmed later may be missing from `inbox`.
+    began: Instant,
+    /// The Inbox; `None` if it hadn't changed.
+    inbox: anyhow::Result<Option<Inbox>>,
+}
+
+/// Fetches as much of the Inbox from `github` as `fetch` says.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::inbox`] is.
+async fn fetch_inbox(github: &GitHub, fetch: Fetch) -> Fetched {
+    let began = Instant::now();
+    let inbox = match fetch {
+        Fetch::Whole => github.inbox().await.map(Some),
+        Fetch::IfChanged => github.inbox_if_changed().await,
+    };
+    Fetched { began, inbox }
+}
+
 /// What a key press can ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Quit,
+    /// Fetches the whole Inbox now, rather than at the next poll.
+    Refresh,
     SelectNext,
     SelectPrevious,
     NextView,
@@ -126,6 +176,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::Quit),
         KeyCode::Char('q') => Some(Command::Quit),
+        KeyCode::Char('r') => Some(Command::Refresh),
         KeyCode::Char('j') | KeyCode::Down => Some(Command::SelectNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Command::SelectPrevious),
         KeyCode::Tab => Some(Command::NextView),
@@ -138,48 +189,13 @@ fn command_for(key: KeyEvent) -> Option<Command> {
     }
 }
 
-/// A change to a Notification that is already on screen and on its way to GitHub. It holds the Notification as it
-/// was before the change, so the change can be undone if GitHub refuses it.
-#[derive(Debug)]
-enum Change {
-    MarkRead(Notification),
-    MarkDone(Notification),
-}
-
-/// What the change does, e.g. `mark Done "Fix the build"`.
-impl std::fmt::Display for Change {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MarkRead(n) => write!(f, "mark read \"{}\"", n.subject_title),
-            Self::MarkDone(n) => write!(f, "mark Done \"{}\"", n.subject_title),
-        }
-    }
-}
-
-/// GitHub's answer to a [`Change`].
-struct Reply {
-    change: Change,
-    accepted: anyhow::Result<()>,
-}
-
-/// Sends `change` to GitHub.
-///
-/// # Cancel Safety
-///
-/// Not cancel safe: dropped while waiting for GitHub, the change may or may not have been made.
-async fn send(github: &GitHub, change: Change) -> Reply {
-    let accepted = match &change {
-        Change::MarkRead(n) => github.mark_read(n.thread).await,
-        Change::MarkDone(n) => github.mark_done(n.thread).await,
-    };
-    Reply { change, accepted }
-}
-
 /// A one-line message at the bottom of the screen.
 #[derive(Debug)]
 enum StatusMessage {
     Info(String),
     Error(String),
+    /// Why the latest fetch failed; it goes away when one succeeds.
+    FetchFailed(String),
 }
 
 /// What the app has of the Inbox so far.
@@ -205,6 +221,8 @@ struct App {
     current: usize,
     /// What the latest action did, or why it failed; `None` until there's something to say.
     status: Option<StatusMessage>,
+    /// Changes the user made that a fetched Inbox may not show yet.
+    recent: RecentChanges,
 }
 
 impl App {
@@ -230,23 +248,61 @@ impl App {
             views,
             current: 0,
             status: None,
+            recent: RecentChanges::default(),
         }
     }
 
-    /// Takes in the outcome of fetching the Inbox.
-    fn fetched(&mut self, inbox: anyhow::Result<Inbox>) {
-        self.inbox = match inbox {
-            Ok(inbox) => InboxState::Loaded(inbox),
-            Err(error) => InboxState::Failed(error),
-        };
+    /// Takes in the outcome of fetching the Inbox. A fetched Inbox replaces the one on screen, with the user's recent
+    /// changes made again. A failed fetch leaves the Inbox on screen as it was, and says why.
+    fn fetched(&mut self, fetched: Fetched) {
+        match fetched.inbox {
+            // Unchanged since the last fetch.
+            Ok(None) => {}
+            Ok(Some(mut inbox)) => {
+                self.recent.reapply(&mut inbox, fetched.began);
+                self.replace_inbox(inbox);
+                if matches!(self.status, Some(StatusMessage::FetchFailed(_))) {
+                    self.status = None;
+                }
+            }
+            Err(error) => match self.inbox {
+                InboxState::Loaded(_) => {
+                    self.status = Some(StatusMessage::FetchFailed(format!(
+                        "Couldn't refresh the Inbox, it may be out of date: {error:#}"
+                    )));
+                }
+                InboxState::Loading | InboxState::Failed(_) => {
+                    self.inbox = InboxState::Failed(error)
+                }
+            },
+        }
+    }
+
+    /// Shows `inbox` instead of the Inbox on screen. Each View's selection stays on the same Notification, if the
+    /// View still shows it.
+    fn replace_inbox(&mut self, inbox: Inbox) {
+        let selected: Vec<Option<ThreadId>> = self
+            .views
+            .iter()
+            .map(|shown_view| selected_in(&self.inbox, shown_view).map(|n| n.thread))
+            .collect();
+        self.inbox = InboxState::Loaded(inbox);
+        for (shown_view, thread) in self.views.iter_mut().zip(selected) {
+            let row = thread.and_then(|thread| {
+                shown(&self.inbox, &shown_view.view).position(|n| n.thread == thread)
+            });
+            if let Some(row) = row {
+                shown_view.selection.select(Some(row));
+            }
+        }
     }
 
     /// Carries out `command` on screen. Returns the change to send to GitHub, if the command makes one.
     fn execute(&mut self, command: Command) -> Option<Change> {
         // Moving the selection past either end is corrected when the table is next drawn.
-        match command {
-            // `run` quits before asking.
-            Command::Quit => None,
+        let change = match command {
+            // `run` quits and fetches.
+            Command::Quit | Command::Refresh => None,
             Command::SelectNext => {
                 self.views[self.current].selection.select_next();
                 None
@@ -290,31 +346,32 @@ impl App {
                 )));
                 Some(Change::MarkDone(notification))
             }
+        };
+        if let Some(change) = &change {
+            self.recent.made(change);
         }
+        change
     }
 
     /// Takes in GitHub's answer to an earlier change: a refused change is undone on screen and reported.
     fn settle(&mut self, reply: Reply) {
         let Err(error) = reply.accepted else {
+            self.recent.confirmed(&reply.change, Instant::now());
             return;
         };
+        self.recent.refused(&reply.change);
         self.status = Some(StatusMessage::Error(format!(
             "GitHub refused to {}, undone: {error:#}",
             reply.change
         )));
-        let Some(inbox) = self.inbox_mut() else {
-            return;
-        };
-        match reply.change {
-            Change::MarkRead(n) => inbox.mark_unread(n.thread),
-            Change::MarkDone(n) => inbox.insert(n),
+        if let Some(inbox) = self.inbox_mut() {
+            reply.change.undo(inbox);
         }
     }
 
     /// The selected Notification in the View on screen; `None` until the Inbox arrives, or if the View shows none.
     fn selected(&self) -> Option<&Notification> {
-        let current = &self.views[self.current];
-        shown(&self.inbox, &current.view).nth(current.selection.selected()?)
+        selected_in(&self.inbox, &self.views[self.current])
     }
 
     /// Clears Unread on the selected Notification. Returns it as it was before; `None` if it was already read.
@@ -340,12 +397,16 @@ impl App {
         }
     }
 
-    fn render(&mut self, frame: &mut Frame) {
+    /// Draws the app on `frame`, saying so when a fetch of the Inbox is under way (`fetching`).
+    fn render(&mut self, frame: &mut Frame, fetching: bool) {
         let [view_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
 
-        let block = Block::bordered().title(self.tabs());
+        let mut block = Block::bordered().title(self.tabs());
+        if fetching {
+            block = block.title_top(Line::from(" fetching… ").right_aligned());
+        }
         let current = &mut self.views[self.current];
         let rows: Vec<&Notification> = shown(&self.inbox, &current.view).collect();
         let message = match &self.inbox {
@@ -374,7 +435,9 @@ impl App {
         let status = match &self.status {
             None => return,
             Some(StatusMessage::Info(text)) => Line::from(text.as_str()),
-            Some(StatusMessage::Error(text)) => Line::from(text.as_str()).red(),
+            Some(StatusMessage::Error(text) | StatusMessage::FetchFailed(text)) => {
+                Line::from(text.as_str()).red()
+            }
         };
         frame.render_widget(status, area);
     }
@@ -406,6 +469,11 @@ impl App {
         spans.push(Span::raw(" "));
         Line::from(spans)
     }
+}
+
+/// The Notification selected in `shown_view`; `None` until the Inbox has arrived, or if the View shows none.
+fn selected_in<'a>(inbox: &'a InboxState, shown_view: &'a ShownView) -> Option<&'a Notification> {
+    shown(inbox, &shown_view.view).nth(shown_view.selection.selected()?)
 }
 
 /// The Notifications `view` shows, newest first; none until the Inbox has arrived.
@@ -532,11 +600,9 @@ mod tests {
     /// Width of the screen [`screen`] draws on.
     const SCREEN_WIDTH: u16 = 72;
 
-    /// The app with three Views: Inbox, "Reviews" (`reason:review-requested`) and "Read" (`is:read`), the Inbox
-    /// View on screen. The Inbox holds "Add polling" (thread 1, unread review request, just now), then "Old news"
-    /// (thread 2, read, two days ago).
-    fn app() -> App {
-        let inbox = [
+    /// "Add polling" (thread 1, unread review request, just now), then "Old news" (thread 2, read, two days ago).
+    fn notifications() -> Vec<Notification> {
+        vec![
             Notification {
                 thread: ThreadId(1),
                 subject_url: "https://github.com/wcgw/ghd/pull/1".to_owned(),
@@ -558,8 +624,34 @@ mod tests {
                 updated_at: Utc::now() - TimeDelta::days(2),
             },
         ]
-        .into_iter()
-        .collect();
+    }
+
+    /// A fetch that has just brought `notifications`.
+    fn fetched(notifications: Vec<Notification>) -> Fetched {
+        Fetched {
+            began: Instant::now(),
+            inbox: Ok(Some(notifications.into_iter().collect())),
+        }
+    }
+
+    /// A fetch that has just failed.
+    fn fetch_failed() -> Fetched {
+        Fetched {
+            began: Instant::now(),
+            inbox: Err(anyhow!("timed out")),
+        }
+    }
+
+    fn inbox_view_only() -> App {
+        App::new(vec![View {
+            name: "Inbox".to_owned(),
+            filter: Filter::default(),
+        }])
+    }
+
+    /// The app with three Views: Inbox, "Reviews" (`reason:review-requested`) and "Read" (`is:read`), the Inbox
+    /// View on screen, and [`notifications`] fetched.
+    fn app() -> App {
         let view = |name: &str, filter: &str| View {
             name: name.to_owned(),
             filter: filter.parse().expect("valid filter"),
@@ -572,7 +664,7 @@ mod tests {
             view("Reviews", "reason:review-requested"),
             view("Read", "is:read"),
         ]);
-        app.fetched(Ok(inbox));
+        app.fetched(fetched(notifications()));
         app
     }
 
@@ -581,19 +673,24 @@ mod tests {
         lines[1..4]
             .iter()
             .filter_map(|line| {
-                ["Add polling", "Old news"]
+                ["Brand new", "Add polling", "Old news"]
                     .into_iter()
                     .find(|title| line.contains(title))
             })
             .collect()
     }
 
-    /// The lines `app` draws on a 5-line screen.
+    /// The lines `app` draws on a 5-line screen, with no fetch under way.
     fn screen(app: &mut App) -> Vec<String> {
+        screen_while(app, false)
+    }
+
+    /// The lines `app` draws on a 5-line screen, saying a fetch is under way if `fetching`.
+    fn screen_while(app: &mut App, fetching: bool) -> Vec<String> {
         let mut terminal =
             Terminal::new(TestBackend::new(SCREEN_WIDTH, 5)).expect("test backend never fails");
         terminal
-            .draw(|frame| app.render(frame))
+            .draw(|frame| app.render(frame, fetching))
             .expect("test backend never fails");
         terminal
             .backend()
@@ -643,6 +740,7 @@ mod tests {
         assert_eq!(press(KeyCode::Char('j'), none), Some(Command::SelectNext));
         assert_eq!(press(KeyCode::Up, none), Some(Command::SelectPrevious));
         assert_eq!(press(KeyCode::Char('q'), none), Some(Command::Quit));
+        assert_eq!(press(KeyCode::Char('r'), none), Some(Command::Refresh));
         assert_eq!(
             press(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(Command::Quit)
@@ -812,11 +910,126 @@ mod tests {
     }
 
     #[test]
+    fn poll_keeps_each_selection_on_its_notification() {
+        let mut app = app();
+        app.execute(Command::SelectNext);
+        let mut newer = notifications();
+        newer.push(Notification {
+            thread: ThreadId(3),
+            subject_title: "Brand new".to_owned(),
+            updated_at: Utc::now() + TimeDelta::minutes(1),
+            ..newer[0].clone()
+        });
+
+        app.fetched(fetched(newer));
+
+        let inbox_view: Vec<&str> = shown(&app.inbox, &app.views[0].view)
+            .map(|n| n.subject_title.as_str())
+            .collect();
+        assert_eq!(inbox_view, ["Brand new", "Add polling", "Old news"]);
+        assert_eq!(selected_title(&app), Some("Old news"));
+    }
+
+    #[test]
+    fn poll_does_not_bring_back_a_change_on_its_way_to_github() {
+        let mut app = app();
+        let done = app
+            .execute(Command::MarkDone)
+            .expect("a Notification is selected");
+
+        app.fetched(fetched(notifications()));
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Old news"],
+            "GitHub hadn't applied it yet"
+        );
+
+        app.settle(Reply {
+            change: done,
+            accepted: Ok(()),
+        });
+        app.fetched(fetched(notifications().split_off(1)));
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+    }
+
+    #[test]
+    fn confirmed_change_gives_way_to_newer_activity() {
+        let mut app = app();
+        let read = app
+            .execute(Command::MarkRead)
+            .expect("the selection is unread");
+        app.settle(Reply {
+            change: read,
+            accepted: Ok(()),
+        });
+
+        // New activity on "Add polling", in a fetch that began after GitHub confirmed it read.
+        app.fetched(Fetched {
+            began: Instant::now() + Duration::from_secs(1),
+            ..fetched(notifications())
+        });
+
+        assert!(screen(&mut app)[0].contains("Inbox (1)"), "unread again");
+    }
+
+    #[test]
+    fn unchanged_inbox_changes_nothing() {
+        let mut app = app();
+        app.execute(Command::SelectNext);
+
+        app.fetched(Fetched {
+            began: Instant::now(),
+            inbox: Ok(None),
+        });
+
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+        assert_eq!(selected_title(&app), Some("Old news"));
+    }
+
+    #[test]
+    fn failed_poll_keeps_the_inbox_until_one_succeeds() {
+        let mut app = app();
+
+        app.fetched(fetch_failed());
+
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Add polling", "Old news"]);
+        assert!(
+            lines[4].starts_with("Couldn't refresh the Inbox, it may be out of date: timed out"),
+            "{lines:#?}"
+        );
+
+        app.fetched(fetched(notifications()));
+        assert_eq!(screen(&mut app)[4].trim(), "", "the failure is over");
+    }
+
+    #[test]
+    fn failed_first_fetch_is_retried_by_the_next_poll() {
+        let mut app = inbox_view_only();
+
+        app.fetched(fetch_failed());
+        let lines = screen(&mut app);
+        assert!(
+            lines[1].contains("Couldn't fetch notifications: timed out"),
+            "{lines:#?}"
+        );
+
+        app.fetched(fetched(notifications()));
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+    }
+
+    #[test]
+    fn fetch_under_way_shows_in_the_corner() {
+        let mut app = app();
+
+        assert!(!screen(&mut app)[0].contains("fetching"));
+        let lines = screen_while(&mut app, true);
+        assert!(lines[0].ends_with(" fetching… ┐"), "{lines:#?}");
+    }
+
+    #[test]
     fn nothing_to_act_on_while_loading() {
-        let mut app = App::new(vec![View {
-            name: "Inbox".to_owned(),
-            filter: Filter::default(),
-        }]);
+        let mut app = inbox_view_only();
 
         assert!(app.execute(Command::MarkDone).is_none());
         assert!(app.execute(Command::MarkRead).is_none());

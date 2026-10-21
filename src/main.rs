@@ -1,5 +1,6 @@
 //! ghd: a terminal UI to GitHub, starting with notifications.
 
+mod change;
 mod config;
 mod filter;
 mod github;
