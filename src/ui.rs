@@ -227,6 +227,10 @@ enum Command {
     Refresh,
     Down,
     Up,
+    /// Moves the cursor down by half the rows the list shows.
+    HalfPageDown,
+    /// Moves the cursor up by half the rows the list shows.
+    HalfPageUp,
     /// Selects the Notification at the cursor, or unselects it, then moves the cursor down.
     ToggleSelected,
     /// Selects every Notification the View on screen shows, or unselects them if they're all selected.
@@ -249,25 +253,114 @@ enum Command {
     Help,
 }
 
-/// The commands in the order the help lists them. Adding a command means adding it here too: the help test checks
-/// every key the keymap knows is listed.
-const HELP_ORDER: [Command; 16] = [
-    Command::Down,
-    Command::Up,
-    Command::ToggleSelected,
-    Command::SelectAllShown,
-    Command::NextView,
-    Command::PreviousView,
-    Command::ShowView(0),
-    Command::Open,
-    Command::MarkRead,
-    Command::MarkDone,
-    Command::ToggleDone,
-    Command::Search,
-    Command::Clear,
-    Command::Refresh,
-    Command::Help,
-    Command::Quit,
+/// The help's lines for commands, in order, each with the commands its keys stand for. Adding a command means adding
+/// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
+const COMMAND_HELP: [(&[Command], KeyHelp); 15] = [
+    (
+        &[Command::Down, Command::Up],
+        KeyHelp {
+            keys: "j  k  ↓  ↑",
+            does: "move to the next or previous Notification",
+        },
+    ),
+    (
+        &[Command::HalfPageDown, Command::HalfPageUp],
+        KeyHelp {
+            keys: "Ctrl-D  Ctrl-U",
+            does: "move half a page down or up",
+        },
+    ),
+    (
+        &[Command::ToggleSelected],
+        KeyHelp {
+            keys: "Space",
+            does: "select or unselect, and move down",
+        },
+    ),
+    (
+        &[Command::SelectAllShown],
+        KeyHelp {
+            keys: "A",
+            does: "select all shown, or unselect them",
+        },
+    ),
+    (
+        &[Command::NextView, Command::PreviousView],
+        KeyHelp {
+            keys: "Tab  Shift-Tab",
+            does: "show the next or previous View",
+        },
+    ),
+    (
+        &[Command::ShowView(0)],
+        KeyHelp {
+            keys: "1–9",
+            does: "show a View by its place in the tabs",
+        },
+    ),
+    (
+        &[Command::Open],
+        KeyHelp {
+            keys: "o  Enter",
+            does: "open in the browser, which marks read",
+        },
+    ),
+    (
+        &[Command::MarkRead],
+        KeyHelp {
+            keys: "I",
+            does: "mark read",
+        },
+    ),
+    (
+        &[Command::MarkDone],
+        KeyHelp {
+            keys: "e",
+            does: "mark Done; in the Done list, back to the Inbox",
+        },
+    ),
+    (
+        &[Command::ToggleDone],
+        KeyHelp {
+            keys: "D",
+            does: "show the Done list, or the Inbox again",
+        },
+    ),
+    (
+        &[Command::Search],
+        KeyHelp {
+            keys: "/",
+            does: "search the View on screen",
+        },
+    ),
+    (
+        &[Command::Clear],
+        KeyHelp {
+            keys: "Esc",
+            does: "clear the selection, or else the search",
+        },
+    ),
+    (
+        &[Command::Refresh],
+        KeyHelp {
+            keys: "r",
+            does: "fetch the Inbox now",
+        },
+    ),
+    (
+        &[Command::Help],
+        KeyHelp {
+            keys: "?",
+            does: "show these keys",
+        },
+    ),
+    (
+        &[Command::Quit],
+        KeyHelp {
+            keys: "q  Ctrl-C",
+            does: "quit",
+        },
+    ),
 ];
 
 /// What the help says about acting on the Selection, after the commands.
@@ -296,34 +389,16 @@ struct KeyHelp {
     does: &'static str,
 }
 
-impl Command {
-    fn help(self) -> KeyHelp {
-        let (keys, does) = match self {
-            Self::Down => ("j  ↓", "move to the next Notification"),
-            Self::Up => ("k  ↑", "move to the previous Notification"),
-            Self::ToggleSelected => ("Space", "select or unselect, and move down"),
-            Self::SelectAllShown => ("A", "select all shown, or unselect them"),
-            Self::NextView => ("Tab", "show the next View"),
-            Self::PreviousView => ("Shift-Tab", "show the previous View"),
-            Self::ShowView(_) => ("1–9", "show a View by its place in the tabs"),
-            Self::Open => ("o  Enter", "open in the browser, which marks read"),
-            Self::MarkRead => ("I", "mark read"),
-            Self::MarkDone => ("e", "mark Done; in the Done list, back to the Inbox"),
-            Self::ToggleDone => ("D", "show the Done list, or the Inbox again"),
-            Self::Search => ("/", "search the View on screen"),
-            Self::Clear => ("Esc", "clear the selection, or else the search"),
-            Self::Refresh => ("r", "fetch the Inbox now"),
-            Self::Help => ("?", "show these keys"),
-            Self::Quit => ("q  Ctrl-C", "quit"),
-        };
-        KeyHelp { keys, does }
-    }
-}
-
 /// The command a key press stands for. Marking read and Done use GitHub's own notification shortcuts.
 fn command_for(key: KeyEvent) -> Option<Command> {
     match key.code {
         _ if is_interrupt(key) => Some(Command::Quit),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Command::HalfPageDown)
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Command::HalfPageUp)
+        }
         KeyCode::Char('q') => Some(Command::Quit),
         KeyCode::Char('r') => Some(Command::Refresh),
         KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
@@ -396,6 +471,8 @@ struct App {
     selection: HashSet<ThreadId>,
     /// The help is shown over the View.
     help_shown: bool,
+    /// How many rows the list had room for at the last draw.
+    rows_on_screen: u16,
     theme: Theme,
     kind_labels: KindLabels,
     /// The Subjects' States known so far.
@@ -461,6 +538,7 @@ impl App {
             search_prompt: None,
             selection: HashSet::new(),
             help_shown: false,
+            rows_on_screen: 0,
             theme,
             kind_labels,
             states: States::default(),
@@ -743,6 +821,14 @@ impl App {
             Command::Quit | Command::Refresh => {}
             Command::Down => self.views[self.current].cursor.select_next(),
             Command::Up => self.views[self.current].cursor.select_previous(),
+            Command::HalfPageDown => {
+                let half_page = (self.rows_on_screen / 2).max(1);
+                self.views[self.current].cursor.scroll_down_by(half_page);
+            }
+            Command::HalfPageUp => {
+                let half_page = (self.rows_on_screen / 2).max(1);
+                self.views[self.current].cursor.scroll_up_by(half_page);
+            }
             Command::ToggleSelected => {
                 if let Some(thread) = self.at_cursor().map(|n| n.thread) {
                     if !self.selection.remove(&thread) {
@@ -1023,6 +1109,8 @@ impl App {
 
     /// Draws the View on screen in `area`, its tabs and what's going on in its border.
     fn render_view(&mut self, frame: &mut Frame, area: Rect, fetching: bool) {
+        // Inside the border.
+        self.rows_on_screen = area.height.saturating_sub(2);
         let theme = &self.theme;
         let mut block = Block::bordered()
             .border_style(theme.border)
@@ -1181,9 +1269,9 @@ impl App {
 
 /// Draws the help over the middle of `frame` in `theme`: every command's keys and what it does.
 fn render_help(frame: &mut Frame, theme: &Theme) {
-    let commands: Vec<KeyHelp> = HELP_ORDER.iter().map(|command| command.help()).collect();
-    let keys_width = commands
+    let keys_width = COMMAND_HELP
         .iter()
+        .map(|(_, help)| help)
         .chain(&SEARCH_PROMPT_HELP)
         .map(|help| help.keys.chars().count())
         .max()
@@ -1194,7 +1282,7 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
             Span::raw(help.does),
         ])
     };
-    let mut lines: Vec<Line> = commands.iter().map(line).collect();
+    let mut lines: Vec<Line> = COMMAND_HELP.iter().map(|(_, help)| line(help)).collect();
     lines.extend([
         Line::default(),
         Line::styled(SELECTION_HELP, theme.help_heading),
@@ -1609,6 +1697,15 @@ mod tests {
         assert_eq!(press(KeyCode::Esc, none), Some(Command::Clear));
         assert_eq!(press(KeyCode::Char('?'), none), Some(Command::Help));
         assert_eq!(
+            press(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some(Command::HalfPageDown)
+        );
+        assert_eq!(
+            press(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Some(Command::HalfPageUp)
+        );
+        assert_eq!(press(KeyCode::Char('d'), none), None);
+        assert_eq!(
             press(KeyCode::Char('D'), KeyModifiers::SHIFT),
             Some(Command::ToggleDone)
         );
@@ -1761,6 +1858,61 @@ mod tests {
             ["Add polling"],
             "no ninth View: stays put"
         );
+    }
+
+    /// The app with an Inbox of `count` Notifications, "Notification 0" newest, drawn on a screen with room for
+    /// `rows` of them.
+    fn app_with_many(count: u64, rows: u16) -> App {
+        let mut app = inbox_view_only();
+        let template = notifications().remove(0);
+        app.fetched(fetched(
+            (0..count)
+                .map(|i| Notification {
+                    thread: ThreadId(100 + i),
+                    subject_title: format!("Notification {i}"),
+                    updated_at: template.updated_at
+                        - TimeDelta::minutes(i64::try_from(i).expect("small")),
+                    ..template.clone()
+                })
+                .collect(),
+        ));
+        // Two lines of border and one of status around the rows.
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, rows + 3))
+            .expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+        app
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_move_half_a_page() {
+        let mut app = app_with_many(30, 10);
+
+        app.press(key_named("Ctrl-D"));
+        assert_eq!(cursor_title(&app), Some("Notification 5"));
+        app.press(key_named("Ctrl-D"));
+        assert_eq!(cursor_title(&app), Some("Notification 10"));
+        app.press(key_named("Ctrl-U"));
+        assert_eq!(cursor_title(&app), Some("Notification 5"));
+        app.press(key_named("Ctrl-U"));
+        app.press(key_named("Ctrl-U"));
+        assert_eq!(
+            cursor_title(&app),
+            Some("Notification 0"),
+            "no further than the top"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_stops_at_the_last_row() {
+        let mut app = app_with_many(7, 10);
+
+        app.press(key_named("Ctrl-D"));
+        app.press(key_named("Ctrl-D"));
+        screen(&mut app);
+
+        assert_eq!(cursor_title(&app), Some("Notification 6"));
     }
 
     #[test]
@@ -2349,7 +2501,8 @@ mod tests {
         assert_eq!(cursor_title(&app), Some("Old news"));
     }
 
-    /// The key a help label names: a character, or `Space`, `Tab`, `Shift-Tab`, `Enter`, `Esc`, `Ctrl-C`, `↓`, `↑`.
+    /// The key a help label names: a character, `Ctrl-` and a letter, `Space`, `Tab`, `Shift-Tab`, `Enter`, `Esc`, `↓` or
+    /// `↑`.
     fn key_named(label: &str) -> KeyEvent {
         let (code, modifiers) = match label {
             "Space" => (KeyCode::Char(' '), KeyModifiers::NONE),
@@ -2357,9 +2510,16 @@ mod tests {
             "Shift-Tab" => (KeyCode::BackTab, KeyModifiers::SHIFT),
             "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
             "Esc" => (KeyCode::Esc, KeyModifiers::NONE),
-            "Ctrl-C" => (KeyCode::Char('c'), KeyModifiers::CONTROL),
             "↓" => (KeyCode::Down, KeyModifiers::NONE),
             "↑" => (KeyCode::Up, KeyModifiers::NONE),
+            control if control.starts_with("Ctrl-") => {
+                let letter = control["Ctrl-".len()..].to_lowercase();
+                let mut characters = letter.chars();
+                let (Some(letter), None) = (characters.next(), characters.next()) else {
+                    panic!("no key is named {label:?}");
+                };
+                (KeyCode::Char(letter), KeyModifiers::CONTROL)
+            }
             character => {
                 let mut characters = character.chars();
                 let (Some(character), None) = (characters.next(), characters.next()) else {
@@ -2373,16 +2533,19 @@ mod tests {
 
     #[test]
     fn help_names_the_keys_that_work() {
-        for command in HELP_ORDER {
-            let keys = command.help().keys;
-            if let Command::ShowView(_) = command {
-                assert_eq!(keys, "1–9");
+        for (commands, help) in COMMAND_HELP {
+            if let [Command::ShowView(_)] = commands {
+                assert_eq!(help.keys, "1–9");
                 assert_eq!(command_for(key_named("1")), Some(Command::ShowView(0)));
                 assert_eq!(command_for(key_named("9")), Some(Command::ShowView(8)));
                 continue;
             }
-            for label in keys.split_whitespace() {
-                assert_eq!(command_for(key_named(label)), Some(command), "{label}");
+            for label in help.keys.split_whitespace() {
+                let command = command_for(key_named(label)).expect("a known key");
+                assert!(
+                    commands.contains(&command),
+                    "{label} is {command:?}, not on its line"
+                );
             }
         }
     }
@@ -2390,9 +2553,11 @@ mod tests {
     #[test]
     fn help_lists_every_command() {
         let listed = |command: Command| {
-            HELP_ORDER
-                .iter()
-                .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
+            COMMAND_HELP.iter().any(|(commands, _)| {
+                commands
+                    .iter()
+                    .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
+            })
         };
         for label in [
             "D",
@@ -2415,6 +2580,8 @@ mod tests {
             "?",
             "q",
             "Ctrl-C",
+            "Ctrl-D",
+            "Ctrl-U",
         ] {
             let command = command_for(key_named(label)).expect("a known key");
             assert!(listed(command), "{command:?} isn't in the help");
