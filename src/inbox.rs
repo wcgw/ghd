@@ -18,6 +18,11 @@ impl Inbox {
         self.notifications.iter()
     }
 
+    /// The Notification at `index` in [`Inbox::iter`]'s order; `None` past the end.
+    pub fn get(&self, index: usize) -> Option<&Notification> {
+        self.notifications.get(index)
+    }
+
     /// Whether the Inbox holds no Notification at all.
     pub fn is_empty(&self) -> bool {
         self.notifications.is_empty()
@@ -26,6 +31,39 @@ impl Inbox {
     /// How many Notifications have activity the user hasn't seen yet.
     pub fn unread_count(&self) -> usize {
         self.notifications.iter().filter(|n| n.unread).count()
+    }
+
+    /// Clears Unread on the Notification for `thread`. Returns whether it was unread: `false` when it was already
+    /// read or the Inbox doesn't hold it.
+    pub fn mark_read(&mut self, thread: ThreadId) -> bool {
+        self.find_mut(thread)
+            .is_some_and(|n| std::mem::replace(&mut n.unread, false))
+    }
+
+    /// Sets Unread on the Notification for `thread`, if the Inbox still holds it.
+    pub fn mark_unread(&mut self, thread: ThreadId) {
+        if let Some(n) = self.find_mut(thread) {
+            n.unread = true;
+        }
+    }
+
+    /// Takes the Notification for `thread` out of the Inbox; `None` if it doesn't hold one.
+    pub fn remove(&mut self, thread: ThreadId) -> Option<Notification> {
+        let index = self.notifications.iter().position(|n| n.thread == thread)?;
+        Some(self.notifications.remove(index))
+    }
+
+    /// Puts `notification` in its place by `updated_at`, replacing any Notification for the same thread.
+    pub fn insert(&mut self, notification: Notification) {
+        self.remove(notification.thread);
+        let index = self
+            .notifications
+            .partition_point(|n| n.updated_at >= notification.updated_at);
+        self.notifications.insert(index, notification);
+    }
+
+    fn find_mut(&mut self, thread: ThreadId) -> Option<&mut Notification> {
+        self.notifications.iter_mut().find(|n| n.thread == thread)
     }
 }
 
@@ -38,9 +76,17 @@ impl FromIterator<Notification> for Inbox {
     }
 }
 
+/// GitHub's identifier for a Notification's thread, which stays the same as new activity arrives on its Subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadId(pub u64);
+
 /// An entry in the user's GitHub notifications inbox, about a single Subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
+    /// The thread this Notification is; what marking it read or Done acts on.
+    pub thread: ThreadId,
+    /// The Subject's page on GitHub's website.
+    pub subject_url: String,
     /// The repository the Subject belongs to, as `owner/name`.
     pub repository: String,
     /// What kind of GitHub item the Subject is.
@@ -177,37 +223,85 @@ impl fmt::Display for Reason {
 mod tests {
     use super::*;
 
-    fn notification(updated_at: &str, unread: bool) -> Notification {
+    /// A Notification on thread `thread`, updated on 21 October 2026 at `hour`:00 UTC.
+    fn notification(thread: u64, hour: u32, unread: bool) -> Notification {
         Notification {
+            thread: ThreadId(thread),
+            subject_url: format!("https://github.com/wcgw/ghd/issues/{thread}"),
             repository: "wcgw/ghd".to_owned(),
             subject_kind: SubjectKind::Issue,
-            subject_title: updated_at.to_owned(),
+            subject_title: format!("Issue {thread}"),
             reason: Reason::Mention,
             unread,
-            updated_at: updated_at.parse().expect("test timestamps are RFC 3339"),
+            updated_at: format!("2026-10-21T{hour:02}:00:00Z")
+                .parse()
+                .expect("valid RFC 3339"),
         }
+    }
+
+    fn threads(inbox: &Inbox) -> Vec<u64> {
+        inbox.iter().map(|n| n.thread.0).collect()
     }
 
     #[test]
     fn inbox_orders_newest_first() {
         let inbox: Inbox = [
-            notification("2026-10-20T00:00:00Z", true),
-            notification("2026-10-21T00:00:00Z", false),
-            notification("2026-10-19T00:00:00Z", true),
+            notification(1, 10, true),
+            notification(2, 11, false),
+            notification(3, 9, true),
         ]
         .into_iter()
         .collect();
 
-        let titles: Vec<_> = inbox.iter().map(|n| n.subject_title.as_str()).collect();
-        assert_eq!(
-            titles,
-            [
-                "2026-10-21T00:00:00Z",
-                "2026-10-20T00:00:00Z",
-                "2026-10-19T00:00:00Z"
-            ]
-        );
+        assert_eq!(threads(&inbox), [2, 1, 3]);
         assert_eq!(inbox.unread_count(), 2);
+    }
+
+    #[test]
+    fn mark_read_reports_whether_anything_changed() {
+        let mut inbox: Inbox = [notification(1, 10, true), notification(2, 11, false)]
+            .into_iter()
+            .collect();
+
+        assert!(inbox.mark_read(ThreadId(1)));
+        assert!(!inbox.mark_read(ThreadId(1)), "already read");
+        assert!(!inbox.mark_read(ThreadId(2)), "already read");
+        assert!(!inbox.mark_read(ThreadId(99)), "not in the Inbox");
+        assert_eq!(inbox.unread_count(), 0);
+
+        inbox.mark_unread(ThreadId(1));
+        inbox.mark_unread(ThreadId(99));
+        assert_eq!(inbox.unread_count(), 1);
+    }
+
+    #[test]
+    fn removed_notification_goes_back_in_its_place() {
+        let mut inbox: Inbox = [
+            notification(1, 9, true),
+            notification(2, 10, true),
+            notification(3, 11, true),
+        ]
+        .into_iter()
+        .collect();
+
+        let removed = inbox.remove(ThreadId(2)).expect("thread 2 is in the Inbox");
+        assert_eq!(threads(&inbox), [3, 1]);
+        assert_eq!(inbox.remove(ThreadId(2)), None);
+
+        inbox.insert(removed);
+        assert_eq!(threads(&inbox), [3, 2, 1]);
+    }
+
+    #[test]
+    fn insert_replaces_the_same_thread() {
+        let mut inbox: Inbox = [notification(1, 9, true), notification(2, 10, true)]
+            .into_iter()
+            .collect();
+
+        inbox.insert(notification(1, 11, false));
+
+        assert_eq!(threads(&inbox), [1, 2]);
+        assert_eq!(inbox.unread_count(), 1);
     }
 
     #[test]
