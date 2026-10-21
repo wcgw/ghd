@@ -22,8 +22,8 @@ pub struct Snapshot {
     pub saved_at: DateTime<Utc>,
     /// The name of the View that was on screen.
     pub view: String,
-    /// The Notification selected in each View, by the View's name; a View with nothing selected isn't there.
-    pub selected: BTreeMap<String, ThreadId>,
+    /// The Notification at each View's cursor, by the View's name; a View showing nothing isn't there.
+    pub cursors: BTreeMap<String, ThreadId>,
 }
 
 /// Where one Account's [`Snapshot`] is kept.
@@ -102,7 +102,7 @@ struct File {
     version: u32,
     saved_at: DateTime<Utc>,
     view: String,
-    selected: BTreeMap<String, u64>,
+    cursors: BTreeMap<String, u64>,
     inbox: Vec<CachedNotification>,
 }
 
@@ -125,8 +125,8 @@ impl File {
             version: FORMAT_VERSION,
             saved_at: snapshot.saved_at,
             view: snapshot.view.clone(),
-            selected: snapshot
-                .selected
+            cursors: snapshot
+                .cursors
                 .iter()
                 .map(|(view, thread)| (view.clone(), thread.0))
                 .collect(),
@@ -165,8 +165,8 @@ impl File {
                 .collect(),
             saved_at: self.saved_at,
             view: self.view,
-            selected: self
-                .selected
+            cursors: self
+                .cursors
                 .into_iter()
                 .map(|(view, thread)| (view, ThreadId(thread)))
                 .collect(),
@@ -225,7 +225,7 @@ mod tests {
             .collect(),
             saved_at: "2026-10-21T18:00:00Z".parse().expect("valid RFC 3339"),
             view: "Reviews".to_owned(),
-            selected: BTreeMap::from([
+            cursors: BTreeMap::from([
                 ("Inbox".to_owned(), ThreadId(2)),
                 ("Reviews".to_owned(), ThreadId(1)),
             ]),

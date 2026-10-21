@@ -1,6 +1,7 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::mem;
 use std::time::Duration;
 
@@ -88,7 +89,9 @@ pub async fn run(
                             fetch = Some(Box::pin(fetch_inbox(github, Fetch::Whole)));
                         }
                     }
-                    Some(Outcome::Send(change)) => in_flight.push(send(github, change)),
+                    Some(Outcome::Send(changes)) => {
+                        in_flight.extend(changes.into_iter().map(|change| send(github, change)));
+                    }
                     None => {}
                 },
                 // Anything else, a resize included, just needs the redraw at the top of the loop.
@@ -173,8 +176,8 @@ enum Outcome {
     Quit,
     /// Fetch the whole Inbox now, rather than at the next poll.
     Refresh,
-    /// Send this change to GitHub; the screen shows it made already.
-    Send(Change),
+    /// Send these changes to GitHub; the screen shows them made already. Never empty.
+    Send(Vec<Change>),
 }
 
 /// What a key press can ask for.
@@ -183,16 +186,21 @@ enum Command {
     Quit,
     /// Fetches the whole Inbox now, rather than at the next poll.
     Refresh,
-    SelectNext,
-    SelectPrevious,
+    Down,
+    Up,
+    /// Selects the Notification at the cursor, or unselects it, then moves the cursor down.
+    ToggleSelected,
+    /// Selects every Notification the View on screen shows, or unselects them if they're all selected.
+    SelectAllShown,
     NextView,
     PreviousView,
     /// Shows the View at this index in tab order, counting from 0; nothing happens past the last View.
     ShowView(usize),
     /// Opens the prompt to type a Search into.
     Search,
-    ClearSearch,
-    /// Opens the selected Subject in the browser, which also marks it read.
+    /// Clears the Selection, or the Search if nothing is selected.
+    Clear,
+    /// Opens the Subjects in the browser, which also marks them read.
     Open,
     MarkRead,
     MarkDone,
@@ -201,9 +209,11 @@ enum Command {
 
 /// The commands in the order the help lists them. Adding a command means adding it here too: the help test checks
 /// every key the keymap knows is listed.
-const HELP_ORDER: [Command; 13] = [
-    Command::SelectNext,
-    Command::SelectPrevious,
+const HELP_ORDER: [Command; 15] = [
+    Command::Down,
+    Command::Up,
+    Command::ToggleSelected,
+    Command::SelectAllShown,
     Command::NextView,
     Command::PreviousView,
     Command::ShowView(0),
@@ -211,11 +221,14 @@ const HELP_ORDER: [Command; 13] = [
     Command::MarkRead,
     Command::MarkDone,
     Command::Search,
-    Command::ClearSearch,
+    Command::Clear,
     Command::Refresh,
     Command::Help,
     Command::Quit,
 ];
+
+/// What the help says about acting on the Selection, after the commands.
+const SELECTION_HELP: &str = "With a selection, o, I and e act on all of it.";
 
 /// The keys that work differently in the search prompt, as the help lists them after the commands.
 const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
@@ -243,16 +256,18 @@ struct KeyHelp {
 impl Command {
     fn help(self) -> KeyHelp {
         let (keys, does) = match self {
-            Self::SelectNext => ("j  ↓", "select the next Notification"),
-            Self::SelectPrevious => ("k  ↑", "select the previous Notification"),
+            Self::Down => ("j  ↓", "move to the next Notification"),
+            Self::Up => ("k  ↑", "move to the previous Notification"),
+            Self::ToggleSelected => ("Space", "select or unselect, and move down"),
+            Self::SelectAllShown => ("A", "select all shown, or unselect them"),
             Self::NextView => ("Tab", "show the next View"),
             Self::PreviousView => ("Shift-Tab", "show the previous View"),
             Self::ShowView(_) => ("1–9", "show a View by its place in the tabs"),
-            Self::Open => ("o  Enter", "open in the browser, which marks it read"),
+            Self::Open => ("o  Enter", "open in the browser, which marks read"),
             Self::MarkRead => ("I", "mark read"),
             Self::MarkDone => ("e", "mark Done (GitHub can't undo it)"),
             Self::Search => ("/", "search the View on screen"),
-            Self::ClearSearch => ("Esc", "clear the search"),
+            Self::Clear => ("Esc", "clear the selection, or else the search"),
             Self::Refresh => ("r", "fetch the Inbox now"),
             Self::Help => ("?", "show these keys"),
             Self::Quit => ("q  Ctrl-C", "quit"),
@@ -267,8 +282,10 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         _ if is_interrupt(key) => Some(Command::Quit),
         KeyCode::Char('q') => Some(Command::Quit),
         KeyCode::Char('r') => Some(Command::Refresh),
-        KeyCode::Char('j') | KeyCode::Down => Some(Command::SelectNext),
-        KeyCode::Char('k') | KeyCode::Up => Some(Command::SelectPrevious),
+        KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
+        KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
+        KeyCode::Char(' ') => Some(Command::ToggleSelected),
+        KeyCode::Char('A') => Some(Command::SelectAllShown),
         KeyCode::Tab => Some(Command::NextView),
         KeyCode::BackTab => Some(Command::PreviousView),
         KeyCode::Char(digit @ '1'..='9') => Some(Command::ShowView((digit as u8 - b'1').into())),
@@ -276,7 +293,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('I') => Some(Command::MarkRead),
         KeyCode::Char('e') => Some(Command::MarkDone),
         KeyCode::Char('/') => Some(Command::Search),
-        KeyCode::Esc => Some(Command::ClearSearch),
+        KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
         _ => None,
     }
@@ -305,11 +322,11 @@ enum InboxState {
     Failed(anyhow::Error),
 }
 
-/// A View on screen, with the user's selection in it.
+/// A View on screen, with its cursor.
 struct ShownView {
     view: View,
-    /// The selected row among the Notifications the View shows.
-    selection: TableState,
+    /// The cursor's row among the Notifications the View shows.
+    cursor: TableState,
 }
 
 /// Everything on screen.
@@ -329,6 +346,8 @@ struct App {
     search: Search,
     /// The prompt in the status line, while the user types a Search.
     search_prompt: Option<SearchPrompt>,
+    /// The Selection, by thread: only ever threads the Inbox holds, whichever View shows them.
+    selection: HashSet<ThreadId>,
     /// The help is shown over the View.
     help_shown: bool,
     theme: Theme,
@@ -373,7 +392,7 @@ impl App {
             .into_iter()
             .map(|view| ShownView {
                 view,
-                selection: TableState::new().with_selected(Some(0)),
+                cursor: TableState::new().with_selected(Some(0)),
             })
             .collect();
         Self {
@@ -385,6 +404,7 @@ impl App {
             search_input: String::new(),
             search: Search::default(),
             search_prompt: None,
+            selection: HashSet::new(),
             help_shown: false,
             theme,
         }
@@ -419,14 +439,15 @@ impl App {
         }
     }
 
-    /// Shows `inbox` instead of the Inbox on screen.
+    /// Shows `inbox` instead of the Inbox on screen. What it doesn't hold any more leaves the Selection.
     fn replace_inbox(&mut self, inbox: Inbox) {
-        self.keeping_selections(|app| app.inbox = InboxState::Loaded(inbox));
+        self.selection.retain(|&thread| inbox.contains(thread));
+        self.keeping_cursors(|app| app.inbox = InboxState::Loaded(inbox));
     }
 
     /// Makes `input` the Search.
     fn set_search(&mut self, input: String) {
-        self.keeping_selections(|app| {
+        self.keeping_cursors(|app| {
             app.search = Search::parse(&input);
             app.search_input = input;
         });
@@ -506,7 +527,7 @@ impl App {
     }
 
     /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives, with the View that was on screen and
-    /// each View's selection as they were, where they still can be.
+    /// each View's cursor as they were, where they still can be.
     fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
         self.inbox = InboxState::Loaded(snapshot.inbox);
         if let Some(index) = self
@@ -516,12 +537,12 @@ impl App {
         {
             self.current = index;
         }
-        let selected = self
+        let cursors = self
             .views
             .iter()
-            .map(|shown_view| snapshot.selected.get(&shown_view.view.name).copied())
+            .map(|shown_view| snapshot.cursors.get(&shown_view.view.name).copied())
             .collect();
-        self.select_threads(selected);
+        self.move_cursors(cursors);
         let when = match age(snapshot.saved_at, now).as_str() {
             "now" => "just now".to_owned(),
             age => format!("{age} ago"),
@@ -531,14 +552,14 @@ impl App {
         )));
     }
 
-    /// What to keep for next time, as of `now`: the Inbox, the View on screen and each View's selection; `None`
+    /// What to keep for next time, as of `now`: the Inbox, the View on screen and each View's cursor; `None`
     /// until there's an Inbox.
     fn into_snapshot(self, now: DateTime<Utc>) -> Option<Snapshot> {
-        let selected = self
+        let cursors = self
             .views
             .iter()
             .filter_map(|shown_view| {
-                let notification = selected_in(&self.inbox, shown_view, &self.search)?;
+                let notification = at_cursor_in(&self.inbox, shown_view, &self.search)?;
                 Some((shown_view.view.name.clone(), notification.thread))
             })
             .collect();
@@ -550,29 +571,29 @@ impl App {
             inbox,
             saved_at: now,
             view,
-            selected,
+            cursors,
         })
     }
 
-    /// Runs `change`, keeping each View's selection on the same Notification if the View still shows it.
-    fn keeping_selections(&mut self, change: impl FnOnce(&mut Self)) {
-        let selected = self
+    /// Runs `change`, keeping each View's cursor on the same Notification if the View still shows it.
+    fn keeping_cursors(&mut self, change: impl FnOnce(&mut Self)) {
+        let cursors = self
             .views
             .iter()
-            .map(|shown_view| selected_in(&self.inbox, shown_view, &self.search).map(|n| n.thread))
+            .map(|shown_view| at_cursor_in(&self.inbox, shown_view, &self.search).map(|n| n.thread))
             .collect();
         change(self);
-        self.select_threads(selected);
+        self.move_cursors(cursors);
     }
 
     /// Selects in each View the Notification of the thread at the View's index in `threads`, if the View shows it.
-    fn select_threads(&mut self, threads: Vec<Option<ThreadId>>) {
+    fn move_cursors(&mut self, threads: Vec<Option<ThreadId>>) {
         for (shown_view, thread) in self.views.iter_mut().zip(threads) {
             let row = thread.and_then(|thread| {
                 shown(&self.inbox, &shown_view.view, &self.search).position(|n| n.thread == thread)
             });
             if let Some(row) = row {
-                shown_view.selection.select(Some(row));
+                shown_view.cursor.select(Some(row));
             }
         }
     }
@@ -592,79 +613,176 @@ impl App {
         match command_for(key)? {
             Command::Quit => Some(Outcome::Quit),
             Command::Refresh => Some(Outcome::Refresh),
-            command => self.execute(command).map(Outcome::Send),
+            command => {
+                let changes = self.execute(command);
+                (!changes.is_empty()).then_some(Outcome::Send(changes))
+            }
         }
     }
 
-    /// Carries out `command` on screen. Returns the change to send to GitHub, if the command makes one.
-    fn execute(&mut self, command: Command) -> Option<Change> {
-        // Moving the selection past either end is corrected when the table is next drawn.
-        let change = match command {
+    /// Carries out `command` on screen. Returns the changes to send to GitHub, if the command makes any.
+    fn execute(&mut self, command: Command) -> Vec<Change> {
+        // Moving the cursor past either end is corrected when the table is next drawn.
+        match command {
             // Nothing to do on screen: `press` hands these to `run`.
-            Command::Quit | Command::Refresh => None,
-            Command::SelectNext => {
-                self.views[self.current].selection.select_next();
-                None
+            Command::Quit | Command::Refresh => {}
+            Command::Down => self.views[self.current].cursor.select_next(),
+            Command::Up => self.views[self.current].cursor.select_previous(),
+            Command::ToggleSelected => {
+                if let Some(thread) = self.at_cursor().map(|n| n.thread) {
+                    if !self.selection.remove(&thread) {
+                        self.selection.insert(thread);
+                    }
+                    self.views[self.current].cursor.select_next();
+                }
             }
-            Command::SelectPrevious => {
-                self.views[self.current].selection.select_previous();
-                None
+            Command::SelectAllShown => {
+                let shown: Vec<ThreadId> =
+                    shown(&self.inbox, &self.views[self.current].view, &self.search)
+                        .map(|n| n.thread)
+                        .collect();
+                if !shown.is_empty() && shown.iter().all(|thread| self.selection.contains(thread)) {
+                    for thread in &shown {
+                        self.selection.remove(thread);
+                    }
+                } else {
+                    self.selection.extend(shown);
+                }
             }
-            Command::NextView => {
-                self.current = (self.current + 1) % self.views.len();
-                None
-            }
+            Command::NextView => self.current = (self.current + 1) % self.views.len(),
             Command::PreviousView => {
                 self.current = (self.current + self.views.len() - 1) % self.views.len();
-                None
             }
             Command::ShowView(index) => {
                 if index < self.views.len() {
                     self.current = index;
                 }
-                None
             }
             Command::Search => {
                 self.search_prompt = Some(SearchPrompt {
                     input_before: self.search_input.clone(),
                     completion: None,
                 });
-                None
             }
-            Command::ClearSearch => {
-                self.set_search(String::new());
-                None
-            }
-            Command::Help => {
-                self.help_shown = true;
-                None
-            }
-            Command::Open => match self
-                .selected()
-                .map(|n| open::that_detached(&n.subject_url))?
-            {
-                Ok(()) => self.mark_selected_read().map(Change::MarkRead),
-                Err(error) => {
-                    self.status = Some(StatusMessage::Error(format!(
-                        "Couldn't open a browser: {error}"
-                    )));
-                    None
+            Command::Clear => {
+                if self.selection.is_empty() {
+                    self.set_search(String::new());
+                } else {
+                    self.selection.clear();
                 }
-            },
-            Command::MarkRead => self.mark_selected_read().map(Change::MarkRead),
-            Command::MarkDone => {
-                let notification = self.take_selected()?;
+            }
+            Command::Help => self.help_shown = true,
+            Command::Open => return self.open(),
+            Command::MarkRead => {
+                let targets = self.take_targets();
+                let changes = self.mark_read(targets);
+                if changes.len() > 1 {
+                    self.status = Some(StatusMessage::Info(format!(
+                        "Marked {} read",
+                        changes.len()
+                    )));
+                }
+                return changes;
+            }
+            Command::MarkDone => return self.mark_done(),
+        }
+        Vec::new()
+    }
+
+    /// What an action acts on, taking it: the Selection, in the Inbox's order, which empties it; or else the
+    /// Notification at the cursor. Empty when there's nothing to act on.
+    fn take_targets(&mut self) -> Vec<ThreadId> {
+        if self.selection.is_empty() {
+            return self.at_cursor().map(|n| n.thread).into_iter().collect();
+        }
+        let selection = mem::take(&mut self.selection);
+        self.inbox()
+            .into_iter()
+            .flat_map(Inbox::iter)
+            .filter(|n| selection.contains(&n.thread))
+            .map(|n| n.thread)
+            .collect()
+    }
+
+    /// Opens what an action acts on in the browser, and marks read what was opened. Stops at the first Subject the
+    /// browser can't be started for, and says so.
+    fn open(&mut self) -> Vec<Change> {
+        let targets = self.take_targets();
+        let mut opened = Vec::new();
+        for thread in targets {
+            let Some(url) = self
+                .inbox()
+                .and_then(|inbox| inbox.get(thread))
+                .map(|n| n.subject_url.clone())
+            else {
+                continue;
+            };
+            if let Err(error) = open::that_detached(&url) {
+                self.status = Some(StatusMessage::Error(format!(
+                    "Couldn't open a browser: {error}"
+                )));
+                break;
+            }
+            opened.push(thread);
+        }
+        self.mark_read(opened)
+    }
+
+    /// Clears Unread on the Notifications of `threads`. Returns a change for each that was unread, holding it as
+    /// it was before.
+    fn mark_read(&mut self, threads: Vec<ThreadId>) -> Vec<Change> {
+        let Some(inbox) = self.inbox_mut() else {
+            return Vec::new();
+        };
+        let changes: Vec<Change> = threads
+            .into_iter()
+            .filter_map(|thread| {
+                // Cloned to keep it as it was, should the change need undoing.
+                let notification = inbox.get(thread)?.clone();
+                inbox
+                    .mark_read(thread)
+                    .then_some(Change::MarkRead(notification))
+            })
+            .collect();
+        self.made(changes)
+    }
+
+    /// Takes what an action acts on out of the Inbox, and so out of every View. Returns a change for each; the
+    /// cursor moves to the Notification below.
+    fn mark_done(&mut self) -> Vec<Change> {
+        let targets = self.take_targets();
+        let Some(inbox) = self.inbox_mut() else {
+            return Vec::new();
+        };
+        let changes: Vec<Change> = targets
+            .into_iter()
+            .filter_map(|thread| inbox.remove(thread))
+            .map(Change::MarkDone)
+            .collect();
+        match changes.as_slice() {
+            [] => {}
+            [Change::MarkDone(notification)] => {
                 self.status = Some(StatusMessage::Info(format!(
                     "Marked Done: {}",
                     notification.subject_title
                 )));
-                Some(Change::MarkDone(notification))
             }
-        };
-        if let Some(change) = &change {
+            changes => {
+                self.status = Some(StatusMessage::Info(format!(
+                    "Marked {} Done",
+                    changes.len()
+                )))
+            }
+        }
+        self.made(changes)
+    }
+
+    /// Notes `changes`, made on screen, as on their way to GitHub, and hands them back to be sent.
+    fn made(&mut self, changes: Vec<Change>) -> Vec<Change> {
+        for change in &changes {
             self.recent.made(change);
         }
-        change
+        changes
     }
 
     /// Takes in GitHub's answer to an earlier change: a refused change is undone on screen and reported.
@@ -683,25 +801,16 @@ impl App {
         }
     }
 
-    /// The selected Notification in the View on screen; `None` until the Inbox arrives, or if the View shows none.
-    fn selected(&self) -> Option<&Notification> {
-        selected_in(&self.inbox, &self.views[self.current], &self.search)
+    /// The Notification at the cursor of the View on screen; `None` until the Inbox arrives, or if the View shows none.
+    fn at_cursor(&self) -> Option<&Notification> {
+        at_cursor_in(&self.inbox, &self.views[self.current], &self.search)
     }
 
-    /// Clears Unread on the selected Notification. Returns it as it was before; `None` if it was already read.
-    fn mark_selected_read(&mut self) -> Option<Notification> {
-        // Cloned to keep it as it was, should the change need undoing.
-        let notification = self.selected()?.clone();
-        self.inbox_mut()?
-            .mark_read(notification.thread)
-            .then_some(notification)
-    }
-
-    /// Takes the selected Notification out of the Inbox, and so out of every View, and returns it. The selection
-    /// moves to the one below.
-    fn take_selected(&mut self) -> Option<Notification> {
-        let thread = self.selected()?.thread;
-        self.inbox_mut()?.remove(thread)
+    fn inbox(&self) -> Option<&Inbox> {
+        match &self.inbox {
+            InboxState::Loaded(inbox) => Some(inbox),
+            InboxState::Loading | InboxState::Failed(_) => None,
+        }
     }
 
     fn inbox_mut(&mut self) -> Option<&mut Inbox> {
@@ -734,6 +843,10 @@ impl App {
         if fetching {
             block = block.title_top(Line::styled(" fetching… ", theme.fetching).right_aligned());
         }
+        if !self.selection.is_empty() {
+            let count = format!(" {} selected ", self.selection.len());
+            block = block.title_bottom(Line::styled(count, theme.selected));
+        }
         if !self.search_input.is_empty() && !self.is_typing_search() {
             block = block.title_bottom(Line::styled(
                 format!(" /{} ", self.search_input),
@@ -764,8 +877,9 @@ impl App {
                 Paragraph::new("Nothing in your Inbox matches this View.").style(theme.message)
             }
             InboxState::Loaded(_) => {
-                let table = notifications_table(&rows, Utc::now(), theme).block(block);
-                frame.render_stateful_widget(table, area, &mut current.selection);
+                let table =
+                    notifications_table(&rows, &self.selection, Utc::now(), theme).block(block);
+                frame.render_stateful_widget(table, area, &mut current.cursor);
                 return;
             }
         };
@@ -854,6 +968,8 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     let mut lines: Vec<Line> = commands.iter().map(line).collect();
     lines.extend([
         Line::default(),
+        Line::styled(SELECTION_HELP, theme.help_heading),
+        Line::default(),
         Line::styled("In the search prompt:", theme.help_heading),
     ]);
     lines.extend(SEARCH_PROMPT_HELP.iter().map(line));
@@ -878,14 +994,14 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     );
 }
 
-/// The Notification selected in `shown_view` narrowed by `search`; `None` until the Inbox has arrived, or if
+/// The Notification at the cursor of `shown_view` narrowed by `search`; `None` until the Inbox has arrived, or if
 /// nothing is shown.
-fn selected_in<'a>(
+fn at_cursor_in<'a>(
     inbox: &'a InboxState,
     shown_view: &'a ShownView,
     search: &'a Search,
 ) -> Option<&'a Notification> {
-    shown(inbox, &shown_view.view, search).nth(shown_view.selection.selected()?)
+    shown(inbox, &shown_view.view, search).nth(shown_view.cursor.selected()?)
 }
 
 /// The Notifications `view` shows narrowed by `search`, newest first; none until the Inbox has arrived.
@@ -904,18 +1020,28 @@ fn shown<'a>(
         .filter(|n| view.filter.matches(n) && search.matches(n))
 }
 
-/// One row per Notification in `notifications`, in `theme`: unread marker, Subject kind, repository, title, Reason,
-/// and age relative to `now`.
+/// One row per Notification in `notifications`, in `theme`: selection marker, unread marker, Subject kind,
+/// repository, title, Reason, and age relative to `now`. Those whose thread is in `selection` are marked selected.
 fn notifications_table<'a>(
     notifications: &[&'a Notification],
+    selection: &HashSet<ThreadId>,
     now: DateTime<Utc>,
     theme: &Theme,
 ) -> Table<'a> {
     let rows = notifications.iter().map(|n| {
-        // Whether it's read goes over the column's own style, so a theme can, say, grey out read rows.
-        let state = if n.unread { theme.unread } else { theme.read };
+        let selected = selection.contains(&n.thread);
+        // Whether it's read goes over the column's own style, so a theme can, say, grey out read rows; whether it's
+        // selected goes over that.
+        let mut state = if n.unread { theme.unread } else { theme.read };
+        if selected {
+            state = state.patch(theme.selected);
+        }
         let cell = |text: Cow<'a, str>, column: Style| Cell::from(text).style(column.patch(state));
         Row::new([
+            cell(
+                Cow::Borrowed(if selected { "▌" } else { " " }),
+                Style::new(),
+            ),
             cell(
                 Cow::Borrowed(if n.unread { "●" } else { " " }),
                 theme.unread_marker,
@@ -943,6 +1069,7 @@ fn notifications_table<'a>(
         .unwrap_or(0);
     let widths = [
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(
             u16::try_from(repository_width)
@@ -953,7 +1080,7 @@ fn notifications_table<'a>(
         Constraint::Length(3),
     ];
 
-    Table::new(rows, widths).row_highlight_style(theme.selection)
+    Table::new(rows, widths).row_highlight_style(theme.cursor)
 }
 
 /// A label of at most three cells for the Subject column.
@@ -1140,8 +1267,8 @@ mod tests {
             .collect()
     }
 
-    fn selected_title(app: &App) -> Option<&str> {
-        app.selected().map(|n| n.subject_title.as_str())
+    fn cursor_title(app: &App) -> Option<&str> {
+        app.at_cursor().map(|n| n.subject_title.as_str())
     }
 
     fn refused() -> anyhow::Result<()> {
@@ -1176,13 +1303,21 @@ mod tests {
         assert_eq!(press(KeyCode::Char('i'), none), None);
         assert_eq!(press(KeyCode::Char('o'), none), Some(Command::Open));
         assert_eq!(press(KeyCode::Enter, none), Some(Command::Open));
-        assert_eq!(press(KeyCode::Char('j'), none), Some(Command::SelectNext));
-        assert_eq!(press(KeyCode::Up, none), Some(Command::SelectPrevious));
+        assert_eq!(press(KeyCode::Char('j'), none), Some(Command::Down));
+        assert_eq!(press(KeyCode::Up, none), Some(Command::Up));
         assert_eq!(press(KeyCode::Char('q'), none), Some(Command::Quit));
         assert_eq!(press(KeyCode::Char('r'), none), Some(Command::Refresh));
         assert_eq!(press(KeyCode::Char('/'), none), Some(Command::Search));
-        assert_eq!(press(KeyCode::Esc, none), Some(Command::ClearSearch));
+        assert_eq!(press(KeyCode::Esc, none), Some(Command::Clear));
         assert_eq!(press(KeyCode::Char('?'), none), Some(Command::Help));
+        assert_eq!(
+            press(KeyCode::Char(' '), none),
+            Some(Command::ToggleSelected)
+        );
+        assert_eq!(
+            press(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            Some(Command::SelectAllShown)
+        );
         assert_eq!(
             press(KeyCode::Char('u'), none),
             None,
@@ -1209,13 +1344,14 @@ mod tests {
 
         let change = app
             .execute(Command::MarkDone)
-            .expect("a Notification is selected");
+            .pop()
+            .expect("the cursor is on a Notification");
 
         assert!(matches!(&change, Change::MarkDone(n) if n.thread == ThreadId(1)));
         assert_eq!(
-            selected_title(&app),
+            cursor_title(&app),
             Some("Old news"),
-            "selection moves to the next one"
+            "the cursor moves to the next one"
         );
         let lines = screen(&mut app);
         assert!(
@@ -1245,7 +1381,8 @@ mod tests {
         let mut app = app();
         let change = app
             .execute(Command::MarkDone)
-            .expect("a Notification is selected");
+            .pop()
+            .expect("the cursor is on a Notification");
 
         app.settle(Reply {
             change,
@@ -1269,10 +1406,11 @@ mod tests {
 
         let change = app
             .execute(Command::MarkRead)
-            .expect("the selection is unread");
+            .pop()
+            .expect("the cursor's Notification is unread");
         assert!(matches!(&change, Change::MarkRead(n) if n.thread == ThreadId(1)));
         assert!(screen(&mut app)[0].contains("Inbox (0)"));
-        assert!(app.execute(Command::MarkRead).is_none(), "already read");
+        assert!(app.execute(Command::MarkRead).is_empty(), "already read");
 
         app.settle(Reply {
             change,
@@ -1324,15 +1462,15 @@ mod tests {
     }
 
     #[test]
-    fn each_view_keeps_its_own_selection() {
+    fn each_view_keeps_its_own_cursor() {
         let mut app = app();
 
-        app.execute(Command::SelectNext);
-        assert_eq!(selected_title(&app), Some("Old news"));
+        app.execute(Command::Down);
+        assert_eq!(cursor_title(&app), Some("Old news"));
         app.execute(Command::ShowView(1));
-        assert_eq!(selected_title(&app), Some("Add polling"));
+        assert_eq!(cursor_title(&app), Some("Add polling"));
         app.execute(Command::ShowView(0));
-        assert_eq!(selected_title(&app), Some("Old news"));
+        assert_eq!(cursor_title(&app), Some("Old news"));
     }
 
     #[test]
@@ -1340,8 +1478,7 @@ mod tests {
         let mut app = app();
         app.execute(Command::ShowView(1));
 
-        app.execute(Command::MarkDone)
-            .expect("a Notification is selected");
+        assert_eq!(app.execute(Command::MarkDone).len(), 1);
 
         let lines = screen(&mut app);
         assert!(
@@ -1357,9 +1494,9 @@ mod tests {
     }
 
     #[test]
-    fn poll_keeps_each_selection_on_its_notification() {
+    fn poll_keeps_each_cursor_on_its_notification() {
         let mut app = app();
-        app.execute(Command::SelectNext);
+        app.execute(Command::Down);
         let mut newer = notifications();
         newer.push(Notification {
             thread: ThreadId(3),
@@ -1374,7 +1511,7 @@ mod tests {
             .map(|n| n.subject_title.as_str())
             .collect();
         assert_eq!(inbox_view, ["Brand new", "Add polling", "Old news"]);
-        assert_eq!(selected_title(&app), Some("Old news"));
+        assert_eq!(cursor_title(&app), Some("Old news"));
     }
 
     #[test]
@@ -1382,7 +1519,8 @@ mod tests {
         let mut app = app();
         let done = app
             .execute(Command::MarkDone)
-            .expect("a Notification is selected");
+            .pop()
+            .expect("the cursor is on a Notification");
 
         app.fetched(fetched(notifications()));
         assert_eq!(
@@ -1404,7 +1542,8 @@ mod tests {
         let mut app = app();
         let read = app
             .execute(Command::MarkRead)
-            .expect("the selection is unread");
+            .pop()
+            .expect("the cursor's Notification is unread");
         app.settle(Reply {
             change: read,
             accepted: Ok(()),
@@ -1422,7 +1561,7 @@ mod tests {
     #[test]
     fn unchanged_inbox_changes_nothing() {
         let mut app = app();
-        app.execute(Command::SelectNext);
+        app.execute(Command::Down);
 
         app.fetched(Fetched {
             began: Instant::now(),
@@ -1430,7 +1569,7 @@ mod tests {
         });
 
         assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
-        assert_eq!(selected_title(&app), Some("Old news"));
+        assert_eq!(cursor_title(&app), Some("Old news"));
     }
 
     #[test]
@@ -1527,7 +1666,7 @@ mod tests {
         );
         assert!(matches!(
             press(&mut app, KeyCode::Char('e'), none),
-            Some(Outcome::Send(Change::MarkDone(_)))
+            Some(Outcome::Send(changes)) if matches!(changes.as_slice(), [Change::MarkDone(_)])
         ));
     }
 
@@ -1561,7 +1700,7 @@ mod tests {
         app.execute(Command::ShowView(1));
         assert!(screen(&mut app)[1].contains("Nothing in this View matches the search."));
 
-        app.execute(Command::ClearSearch);
+        app.execute(Command::Clear);
         assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
         assert!(!screen(&mut app)[3].contains('/'));
     }
@@ -1642,19 +1781,20 @@ mod tests {
     }
 
     #[test]
-    fn selection_stays_put_while_the_search_still_shows_it() {
+    fn cursor_stays_put_while_the_search_still_shows_it() {
         let mut app = app();
-        app.execute(Command::SelectNext);
+        app.execute(Command::Down);
 
         app.execute(Command::Search);
         type_text(&mut app, "n");
 
-        assert_eq!(selected_title(&app), Some("Old news"));
+        assert_eq!(cursor_title(&app), Some("Old news"));
     }
 
-    /// The key a help label names: a character, or `Tab`, `Shift-Tab`, `Enter`, `Esc`, `Ctrl-C`, `↓`, `↑`.
+    /// The key a help label names: a character, or `Space`, `Tab`, `Shift-Tab`, `Enter`, `Esc`, `Ctrl-C`, `↓`, `↑`.
     fn key_named(label: &str) -> KeyEvent {
         let (code, modifiers) = match label {
+            "Space" => (KeyCode::Char(' '), KeyModifiers::NONE),
             "Tab" => (KeyCode::Tab, KeyModifiers::NONE),
             "Shift-Tab" => (KeyCode::BackTab, KeyModifiers::SHIFT),
             "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
@@ -1697,6 +1837,8 @@ mod tests {
                 .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
         };
         for label in [
+            "Space",
+            "A",
             "j",
             "k",
             "↓",
@@ -1799,7 +1941,7 @@ mod tests {
             repository: Style::new().fg(rgb(2)),
             read: Style::new().fg(rgb(3)),
             unread: Style::new().add_modifier(Modifier::BOLD),
-            selection: Style::new().bg(rgb(4)),
+            cursor: Style::new().bg(rgb(4)),
             tab_current: Style::new().fg(rgb(5)),
             kind_pull_request: Style::new().fg(rgb(6)),
             ..Theme::default()
@@ -1813,10 +1955,10 @@ mod tests {
             .expect("test backend never fails");
 
         let buffer = terminal.backend().buffer();
-        let selected_unread = cell_at(buffer, 1, "wcgw/ghd");
-        assert_eq!(selected_unread.fg, rgb(2), "the column's color");
-        assert_eq!(selected_unread.bg, rgb(4), "the selection");
-        assert!(selected_unread.modifier.contains(Modifier::BOLD), "unread");
+        let unread_at_cursor = cell_at(buffer, 1, "wcgw/ghd");
+        assert_eq!(unread_at_cursor.fg, rgb(2), "the column's color");
+        assert_eq!(unread_at_cursor.bg, rgb(4), "the cursor");
+        assert!(unread_at_cursor.modifier.contains(Modifier::BOLD), "unread");
         let read = cell_at(buffer, 2, "wcgw/other");
         assert_eq!(read.fg, rgb(3), "read rows go over the column's color");
         assert_eq!(read.bg, rgb(1), "the background");
@@ -1860,14 +2002,14 @@ mod tests {
         assert_eq!(cell_at(buffer, y, "mark Done").bg, Color::Rgb(1, 1, 1));
     }
 
-    /// What [`app`] would keep with "Read" on screen and "Old news" selected in the Inbox View, two hours before
+    /// What [`app`] would keep with "Read" on screen and the cursor on "Old news" in the Inbox View, two hours before
     /// `now`.
     fn snapshot(now: DateTime<Utc>) -> Snapshot {
         Snapshot {
             inbox: notifications().into_iter().collect(),
             saved_at: now - TimeDelta::hours(2),
             view: "Read".to_owned(),
-            selected: BTreeMap::from([
+            cursors: BTreeMap::from([
                 ("Inbox".to_owned(), ThreadId(2)),
                 ("Read".to_owned(), ThreadId(2)),
                 ("Gone".to_owned(), ThreadId(1)),
@@ -1890,13 +2032,9 @@ mod tests {
         app.restore(snapshot(now), now);
 
         assert_eq!(app.current, 2, "the View that was on screen");
-        assert_eq!(selected_title(&app), Some("Old news"));
+        assert_eq!(cursor_title(&app), Some("Old news"));
         app.execute(Command::ShowView(0));
-        assert_eq!(
-            selected_title(&app),
-            Some("Old news"),
-            "each View's selection"
-        );
+        assert_eq!(cursor_title(&app), Some("Old news"), "each View's cursor");
         let lines = screen(&mut app);
         assert_eq!(titles(&lines), ["Add polling", "Old news"]);
         assert!(
@@ -1906,7 +2044,7 @@ mod tests {
 
         app.fetched(fetched(notifications()));
         assert_eq!(screen(&mut app)[4].trim(), "", "the latest has arrived");
-        assert_eq!(selected_title(&app), Some("Old news"));
+        assert_eq!(cursor_title(&app), Some("Old news"));
     }
 
     #[test]
@@ -1926,10 +2064,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_has_the_view_on_screen_and_each_selection() {
+    fn snapshot_has_the_view_on_screen_and_each_cursor() {
         let now = Utc::now();
         let mut app = app();
-        app.execute(Command::SelectNext);
+        app.execute(Command::Down);
         app.execute(Command::ShowView(2));
         app.execute(Command::Search);
         type_text(&mut app, "old");
@@ -1939,7 +2077,7 @@ mod tests {
         assert_eq!(snapshot.view, "Read");
         assert_eq!(snapshot.saved_at, now);
         assert_eq!(
-            snapshot.selected,
+            snapshot.cursors,
             BTreeMap::from([
                 ("Inbox".to_owned(), ThreadId(2)),
                 ("Read".to_owned(), ThreadId(2))
@@ -1955,12 +2093,183 @@ mod tests {
         assert!(app_without_inbox().into_snapshot(Utc::now()).is_none());
     }
 
+    fn selected_titles(app: &App) -> Vec<&str> {
+        let mut titles: Vec<&str> = app
+            .inbox()
+            .into_iter()
+            .flat_map(Inbox::iter)
+            .filter(|n| app.selection.contains(&n.thread))
+            .map(|n| n.subject_title.as_str())
+            .collect();
+        titles.sort_unstable();
+        titles
+    }
+
+    #[test]
+    fn space_selects_and_moves_down() {
+        let mut app = app();
+
+        app.press(key_named("Space"));
+        assert_eq!(selected_titles(&app), ["Add polling"]);
+        assert_eq!(cursor_title(&app), Some("Old news"), "moved down");
+        app.press(key_named("Space"));
+        assert_eq!(selected_titles(&app), ["Add polling", "Old news"]);
+
+        app.press(key_named("k"));
+        app.press(key_named("Space"));
+        assert_eq!(selected_titles(&app), ["Add polling"], "unselected");
+    }
+
+    #[test]
+    fn a_selects_all_shown_or_unselects_them() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "old");
+        type_key(&mut app, KeyCode::Enter);
+
+        app.press(key_named("A"));
+        assert_eq!(
+            selected_titles(&app),
+            ["Old news"],
+            "only what the search shows"
+        );
+        app.press(key_named("Esc"));
+        app.press(key_named("Esc"));
+        assert!(app.search_input.is_empty());
+
+        app.press(key_named("Space"));
+        app.press(key_named("A"));
+        assert_eq!(
+            selected_titles(&app),
+            ["Add polling", "Old news"],
+            "some were selected: all are"
+        );
+        app.press(key_named("A"));
+        assert!(
+            selected_titles(&app).is_empty(),
+            "all were selected: none are"
+        );
+    }
+
+    #[test]
+    fn esc_clears_the_selection_before_the_search() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "o");
+        type_key(&mut app, KeyCode::Enter);
+        app.press(key_named("A"));
+
+        app.press(key_named("Esc"));
+        assert!(selected_titles(&app).is_empty());
+        assert_eq!(app.search_input, "o", "the search stays");
+        app.press(key_named("Esc"));
+        assert!(app.search_input.is_empty());
+    }
+
+    #[test]
+    fn done_acts_on_the_whole_selection_across_views() {
+        let mut app = app();
+        app.press(key_named("A"));
+        app.execute(Command::ShowView(1));
+
+        let changes = app.execute(Command::MarkDone);
+
+        assert_eq!(
+            changes.len(),
+            2,
+            "Old news isn't in Reviews, but it's selected"
+        );
+        assert!(
+            matches!(changes.as_slice(), [Change::MarkDone(first), Change::MarkDone(second)]
+            if first.thread == ThreadId(1) && second.thread == ThreadId(2))
+        );
+        assert!(selected_titles(&app).is_empty(), "the selection is used up");
+        app.execute(Command::ShowView(0));
+        let lines = screen(&mut app);
+        assert!(lines[1].contains("Nothing in your Inbox."), "{lines:#?}");
+        assert!(lines[4].starts_with("Marked 2 Done"), "{lines:#?}");
+    }
+
+    #[test]
+    fn refused_part_of_a_batch_comes_back_alone() {
+        let mut app = app();
+        app.press(key_named("A"));
+        let mut changes = app.execute(Command::MarkDone);
+        let old_news = changes.pop().expect("two changes");
+        let add_polling = changes.pop().expect("two changes");
+
+        app.settle(Reply {
+            change: add_polling,
+            accepted: Ok(()),
+        });
+        app.settle(Reply {
+            change: old_news,
+            accepted: refused(),
+        });
+
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+    }
+
+    #[test]
+    fn read_acts_on_the_unread_part_of_the_selection() {
+        let mut app = app();
+        app.press(key_named("A"));
+
+        let changes = app.execute(Command::MarkRead);
+
+        assert!(matches!(changes.as_slice(), [Change::MarkRead(n)] if n.thread == ThreadId(1)));
+        assert!(screen(&mut app)[0].contains("Inbox (0)"));
+        assert!(selected_titles(&app).is_empty());
+    }
+
+    #[test]
+    fn selection_drops_what_the_inbox_no_longer_holds() {
+        let mut app = app();
+        app.press(key_named("A"));
+
+        app.fetched(fetched(notifications().split_off(1)));
+
+        assert_eq!(selected_titles(&app), ["Old news"]);
+        assert_eq!(app.selection.len(), 1);
+    }
+
+    #[test]
+    fn selection_is_marked_and_counted() {
+        let theme = Theme {
+            selected: Style::new().fg(Color::Rgb(7, 7, 7)),
+            ..Theme::default()
+        };
+        let mut app = app_in(theme);
+        app.press(key_named("j"));
+        app.press(key_named("Space"));
+        let mut terminal =
+            Terminal::new(TestBackend::new(SCREEN_WIDTH, 5)).expect("test backend never fails");
+
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(cell_at(buffer, 2, "▌").fg, Color::Rgb(7, 7, 7));
+        assert_eq!(
+            cell_at(buffer, 2, "wcgw/other").fg,
+            Color::Rgb(7, 7, 7),
+            "the whole row"
+        );
+        assert_ne!(
+            cell_at(buffer, 1, "wcgw/ghd").fg,
+            Color::Rgb(7, 7, 7),
+            "not the others"
+        );
+        assert_eq!(cell_at(buffer, 3, " 1 selected ").fg, Color::Rgb(7, 7, 7));
+    }
+
     #[test]
     fn nothing_to_act_on_while_loading() {
         let mut app = inbox_view_only();
 
-        assert!(app.execute(Command::MarkDone).is_none());
-        assert!(app.execute(Command::MarkRead).is_none());
-        assert!(app.execute(Command::Open).is_none());
+        assert!(app.execute(Command::MarkDone).is_empty());
+        assert!(app.execute(Command::MarkRead).is_empty());
+        assert!(app.execute(Command::Open).is_empty());
     }
 }

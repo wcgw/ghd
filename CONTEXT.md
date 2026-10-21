@@ -32,6 +32,14 @@ _Avoid_: archived, dismissed, read
 A rule that a **Notification** either matches or doesn't; it has no name and is never shown on its own.
 _Avoid_: query, rule, search
 
+**Cursor**:
+The highlighted row of the **View** on screen: what a single action (open, mark read, mark **Done**) acts on when nothing is selected.
+_Avoid_: selection, current row
+
+**Selection**:
+The **Notifications** the user has marked to act on together; when there is one, actions act on all of it instead of the **Cursor**.
+_Avoid_: marked, picked, cursor
+
 **Search**:
 Text the user types, for the moment, to narrow the **View** on screen to the **Notifications** it matches; unlike a **Filter**, it matches parts of words and isn't kept anywhere.
 _Avoid_: filter, query, find
@@ -48,6 +56,7 @@ _Avoid_: folder, bucket, tab, filter
 - A **View** has exactly one **Filter**
 - There is always one built-in **View**, named "Inbox", that shows the whole **Inbox**; it comes first and can't be removed or redefined, and configured **Views** follow in config order
 - A **Notification** can appear in zero, one or many configured **Views** (and always in the Inbox **View**); Views do not claim Notifications from each other
+- There is one **Selection** at a time, across **Views** like the **Search**: it can hold **Notifications** the **View** on screen doesn't show, and an action acts on all of them
 - There is at most one **Search** at a time, and it narrows whichever **View** is on screen, so it follows the user from **View** to **View**
 - **Unread** can only be cleared from ghd, never set again: GitHub's API has no way to mark a **Notification** unread
 
@@ -62,5 +71,6 @@ _Avoid_: folder, bucket, tab, filter
 
 - "Inbox" names both the set of not-Done **Notifications** and the built-in **View** that shows it. Resolved: **Inbox** is the set; say "the Inbox View" for the tab.
 - "read" and "done" are easy to conflate. Resolved: reading a **Notification** only clears **Unread**; only marking it **Done** removes it from the **Inbox**.
+- "selection" meant the highlighted row until several **Notifications** could be marked. Resolved: the highlighted row is the **Cursor**; the **Selection** is what's marked.
 - "search" could mean a **Filter** or a **Search**. Resolved: a **Filter** belongs to a **View** and is configured; a **Search** is typed, temporary, and narrows the **View** on screen.
 - "filters/views" was used as if they were one concept. Resolved: a **Filter** is the matching rule, a **View** is the named tab in the TUI that applies one.

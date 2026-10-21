@@ -39,7 +39,8 @@ text = { fg = "fg" }
 border = { fg = "dark3" }
 tab = { fg = "dark5" }
 tab_current = { fg = "bg", bg = "blue", bold = true }
-selection = { bg = "bg_highlight" }
+cursor = { bg = "bg_highlight" }
+selected = { fg = "yellow", bg = "blue7" }
 unread = { bold = true }
 read = { fg = "comment" }
 unread_marker = { fg = "orange" }

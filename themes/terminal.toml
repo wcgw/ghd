@@ -2,7 +2,8 @@
 
 [styles]
 tab_current = { reversed = true }
-selection = { reversed = true }
+cursor = { reversed = true }
+selected = { bold = true }
 unread = { bold = true }
 read = { dim = true }
 error = { fg = "red" }

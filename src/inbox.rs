@@ -18,6 +18,16 @@ impl Inbox {
         self.notifications.iter()
     }
 
+    /// The Notification for `thread`; `None` if the Inbox doesn't hold one.
+    pub fn get(&self, thread: ThreadId) -> Option<&Notification> {
+        self.notifications.iter().find(|n| n.thread == thread)
+    }
+
+    /// Whether the Inbox holds a Notification for `thread`.
+    pub fn contains(&self, thread: ThreadId) -> bool {
+        self.get(thread).is_some()
+    }
+
     /// Whether the Inbox holds no Notification at all.
     pub fn is_empty(&self) -> bool {
         self.notifications.is_empty()

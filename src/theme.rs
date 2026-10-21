@@ -71,8 +71,11 @@ theme! {
     /// A View's tab, other than the one on screen.
     tab = "tab",
     tab_current = "tab_current",
-    /// The selected row, over the rest of its style.
-    selection = "selection",
+    /// The cursor's row, over the rest of its style.
+    cursor = "cursor",
+    /// A selected Notification's row, over its other styles but the cursor's, and the `▌` marking it; also how many
+    /// are selected, in the bottom border.
+    selected = "selected",
     /// An unread Notification's row, over its columns' styles.
     unread = "unread",
     /// A read Notification's row, over its columns' styles.
@@ -333,7 +336,7 @@ mod tests {
             text = { fg = "white", bg = "bg" }
             tab_current = { fg = "bg", bg = "blue", bold = true, underlined = true }
             read = { fg = "#636da6", dim = true, italic = true }
-            selection = { reversed = true }
+            cursor = { reversed = true }
 
             [styles.kind]
             pull_request = { fg = "12" }
@@ -359,10 +362,7 @@ mod tests {
                 .fg(Color::Rgb(0x63, 0x6d, 0xa6))
                 .add_modifier(Modifier::DIM | Modifier::ITALIC)
         );
-        assert_eq!(
-            theme.selection,
-            Style::new().add_modifier(Modifier::REVERSED)
-        );
+        assert_eq!(theme.cursor, Style::new().add_modifier(Modifier::REVERSED));
         assert_eq!(
             theme.kind(&SubjectKind::PullRequest),
             Style::new().fg(Color::Indexed(12))
