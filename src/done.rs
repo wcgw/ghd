@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::inbox::{Inbox, Notification, ThreadId};
 
 /// The threads ghd marked Done, each with the activity it had then (its `updated_at`). Like GitHub, ghd brings a
-/// Done thread back to the Inbox when it gets newer activity.
+/// Done thread back to the Inbox when it gets newer activity, or GitHub lists it unread.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarkedDone {
     threads: HashMap<ThreadId, DateTime<Utc>>,
@@ -26,18 +26,18 @@ impl MarkedDone {
         self.threads.remove(&thread);
     }
 
-    /// Takes out of `inbox`, as GitHub listed it, the Notifications marked Done that have had no activity since.
-    /// Forgets the others: they're back in the Inbox with newer activity, or GitHub doesn't list them any more.
+    /// Takes out of `inbox`, as GitHub listed it, the Notifications marked Done that are read and have had no
+    /// activity since. Forgets the others: they're back in the Inbox, unread (marked unread on github.com, say) or
+    /// with newer activity, or GitHub doesn't list them any more.
     pub fn hide_from(&mut self, inbox: &mut Inbox) {
-        self.threads.retain(|&thread, &mut done_at| {
-            match inbox.get(thread).map(|n| n.updated_at) {
-                Some(updated_at) if updated_at <= done_at => {
+        self.threads
+            .retain(|&thread, &mut done_at| match inbox.get(thread) {
+                Some(n) if !n.unread && n.updated_at <= done_at => {
                     inbox.remove(thread);
                     true
                 }
                 Some(_) | None => false,
-            }
-        });
+            });
     }
 
     /// The threads, each with the activity it had when marked Done, in no particular order.
@@ -99,6 +99,24 @@ mod tests {
         done.hide_from(&mut active);
         assert_eq!(threads(&active), [1], "back with new activity");
         assert_eq!(done.iter().count(), 0, "and no longer Done");
+    }
+
+    #[test]
+    fn unread_threads_show_though_marked_done() {
+        let then = "2026-10-21T12:00:00Z".parse().expect("valid RFC 3339");
+        let mut done = MarkedDone::default();
+        done.insert(&notification(1, then));
+        // Marked unread on github.com, say: no newer activity, but GitHub's inbox shows it again.
+        let unread = Notification {
+            unread: true,
+            ..notification(1, then)
+        };
+
+        let mut listed: Inbox = [unread].into_iter().collect();
+        done.hide_from(&mut listed);
+
+        assert_eq!(threads(&listed), [1]);
+        assert_eq!(done.iter().count(), 0, "no longer Done");
     }
 
     #[test]

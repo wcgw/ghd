@@ -1733,7 +1733,7 @@ mod tests {
     #[test]
     fn done_stays_done_though_github_keeps_listing_it() {
         let mut app = app();
-        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let mut held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
         let done = app
             .execute(Command::MarkDone)
             .pop()
@@ -1743,6 +1743,8 @@ mod tests {
             accepted: Ok(()),
         });
 
+        // As GitHub lists a thread marked Done: read.
+        held[0].unread = false;
         app.fetched(Fetched {
             began: Instant::now() + Duration::from_secs(1),
             ..fetched(held.clone())
@@ -1755,6 +1757,7 @@ mod tests {
 
         let mut newer = held;
         newer[0].updated_at += TimeDelta::minutes(5);
+        newer[0].unread = true;
         app.fetched(Fetched {
             began: Instant::now() + Duration::from_secs(2),
             ..fetched(newer)
@@ -1764,6 +1767,28 @@ mod tests {
             ["Add polling", "Old news"],
             "new activity brings it back, as on GitHub"
         );
+    }
+
+    #[test]
+    fn done_thread_github_lists_unread_shows_again() {
+        let mut app = app();
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let done = app
+            .execute(Command::MarkDone)
+            .pop()
+            .expect("a Notification at the cursor");
+        app.settle(Reply {
+            change: done,
+            accepted: Ok(()),
+        });
+
+        // "Add polling" is unread in what GitHub lists, with no newer activity: marked unread on github.com.
+        app.fetched(Fetched {
+            began: Instant::now() + Duration::from_secs(1),
+            ..fetched(held)
+        });
+
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
     }
 
     #[test]
@@ -1787,7 +1812,9 @@ mod tests {
     #[test]
     fn done_is_remembered_across_runs() {
         let mut app = app();
-        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let mut held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        // As GitHub lists a thread marked Done: read.
+        held[0].unread = false;
         let done = app
             .execute(Command::MarkDone)
             .pop()

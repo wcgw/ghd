@@ -5,8 +5,8 @@ nothing in a listed thread says it is Done. (Seen on 2026-10-21: `DELETE /notifi
 the thread left github.com's inbox, and every later list still had it, read, with no `last_read_at`.) So ghd hides,
 on top of what GitHub lists:
 
-- the threads ghd itself marked Done, kept in its cache, until they get newer activity, as GitHub brings Done threads
-  back to the inbox;
+- the threads ghd itself marked Done, kept in its cache, until they get newer activity or GitHub lists them unread
+  again (marked unread on github.com, say), as GitHub brings such threads back to the inbox;
 - read threads with no `last_read_at`, as the thread marked Done had.
 
 ## Considered Options
