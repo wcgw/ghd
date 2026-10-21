@@ -7,6 +7,7 @@ use std::ops::Range;
 use std::str::FromStr;
 
 use crate::inbox::{Notification, Reason, SubjectKind};
+use crate::state::SubjectState;
 
 /// A rule that a Notification either matches or doesn't. The default Filter matches every Notification.
 #[derive(Debug, Clone, Default)]
@@ -19,16 +20,16 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Whether `notification` matches.
-    pub fn matches(&self, notification: &Notification) -> bool {
+    /// Whether `notification` matches, its Subject in `state` if that's known.
+    pub fn matches(&self, notification: &Notification, state: Option<SubjectState>) -> bool {
         self.any_of.iter().all(|group| {
             group
                 .iter()
-                .any(|condition| condition.matches(notification))
+                .any(|condition| condition.matches(notification, state))
         }) && !self
             .none_of
             .iter()
-            .any(|condition| condition.matches(notification))
+            .any(|condition| condition.matches(notification, state))
     }
 }
 
@@ -88,7 +89,7 @@ impl FromStr for Filter {
 }
 
 /// What a single `qualifier:value` term asks of a Notification. Each variant is its own qualifier as far as
-/// repeating goes; `is:` is two of them, because a Subject's kind and its read state are unrelated.
+/// repeating goes; `is:` is three of them, because a Subject's kind, its read state and its State are unrelated.
 #[derive(Debug, Clone)]
 enum Condition {
     /// `repo:`: the repository's `owner/name` fits this lowercase pattern, `*` standing for any run of characters.
@@ -99,6 +100,8 @@ enum Condition {
     Kind(Vec<SubjectKind>),
     /// `is:unread` (`true`) or `is:read` (`false`).
     Unread(bool),
+    /// `is:` with a State: the Subject's State is known, and any of these.
+    State(Vec<SubjectState>),
     /// `reason:`.
     Reason(Reason),
 }
@@ -141,6 +144,20 @@ impl Condition {
             "check-suite" => vec![CheckSuite],
             "unread" => return Ok(Self::Unread(true)),
             "read" => return Ok(Self::Unread(false)),
+            // As in GitHub's search: drafts are open, and merged pull requests are closed.
+            "open" => return Ok(Self::State(vec![SubjectState::Open, SubjectState::Draft])),
+            "draft" => return Ok(Self::State(vec![SubjectState::Draft])),
+            "merged" => return Ok(Self::State(vec![SubjectState::Merged])),
+            "closed" => {
+                return Ok(Self::State(vec![
+                    SubjectState::Closed,
+                    SubjectState::Merged,
+                    SubjectState::Completed,
+                    SubjectState::NotPlanned,
+                ]));
+            }
+            "completed" => return Ok(Self::State(vec![SubjectState::Completed])),
+            "not-planned" => return Ok(Self::State(vec![SubjectState::NotPlanned])),
             "done" => {
                 return Err(Rejection::Value(
                     "the Inbox never holds Done notifications, so `is:done` would match nothing"
@@ -182,7 +199,7 @@ impl Condition {
         Err(Rejection::Value(problem))
     }
 
-    fn matches(&self, notification: &Notification) -> bool {
+    fn matches(&self, notification: &Notification, state: Option<SubjectState>) -> bool {
         match self {
             Self::Repository(pattern) => {
                 fits(pattern, &notification.repository.to_ascii_lowercase())
@@ -194,6 +211,7 @@ impl Condition {
             Self::Kind(kinds) => kinds.contains(&notification.subject_kind),
             Self::Unread(unread) => notification.unread == *unread,
             Self::Reason(reason) => notification.reason == *reason,
+            Self::State(states) => state.is_some_and(|state| states.contains(&state)),
         }
     }
 }
@@ -272,6 +290,7 @@ mod tests {
 
     use super::*;
     use crate::inbox::{Reason, SubjectKind, ThreadId};
+    use crate::state::SubjectState;
 
     /// An unread pull request in `repository`, there because of `reason`.
     fn notification(repository: &str, reason: Reason) -> Notification {
@@ -307,56 +326,57 @@ mod tests {
     #[test]
     fn empty_filter_matches_everything() {
         let review = notification("wcgw/ghd", Reason::ReviewRequested);
-        assert!(Filter::default().matches(&review));
-        assert!(filter("").matches(&review));
-        assert!(filter("   ").matches(&review));
+        assert!(Filter::default().matches(&review, None));
+        assert!(filter("").matches(&review, None));
+        assert!(filter("   ").matches(&review, None));
     }
 
     #[test]
     fn repeated_qualifier_is_any_of() {
         let reviews = filter("reason:review-requested reason:team-mention");
 
-        assert!(reviews.matches(&notification("wcgw/ghd", Reason::ReviewRequested)));
-        assert!(reviews.matches(&notification("wcgw/ghd", Reason::TeamMention)));
-        assert!(!reviews.matches(&notification("wcgw/ghd", Reason::Mention)));
+        assert!(reviews.matches(&notification("wcgw/ghd", Reason::ReviewRequested), None));
+        assert!(reviews.matches(&notification("wcgw/ghd", Reason::TeamMention), None));
+        assert!(!reviews.matches(&notification("wcgw/ghd", Reason::Mention), None));
     }
 
     #[test]
     fn different_qualifiers_must_all_match() {
         let reviews_at_wcgw = filter("reason:review-requested org:wcgw");
 
-        assert!(reviews_at_wcgw.matches(&notification("wcgw/ghd", Reason::ReviewRequested)));
-        assert!(
-            !reviews_at_wcgw.matches(&notification("kuadrant/limitador", Reason::ReviewRequested))
-        );
-        assert!(!reviews_at_wcgw.matches(&notification("wcgw/ghd", Reason::Mention)));
+        assert!(reviews_at_wcgw.matches(&notification("wcgw/ghd", Reason::ReviewRequested), None));
+        assert!(!reviews_at_wcgw.matches(
+            &notification("kuadrant/limitador", Reason::ReviewRequested),
+            None
+        ));
+        assert!(!reviews_at_wcgw.matches(&notification("wcgw/ghd", Reason::Mention), None));
     }
 
     #[test]
     fn negated_qualifiers_each_exclude() {
         let quiet = filter("-reason:subscribed -reason:ci-activity");
 
-        assert!(quiet.matches(&notification("wcgw/ghd", Reason::Mention)));
-        assert!(!quiet.matches(&notification("wcgw/ghd", Reason::Subscribed)));
-        assert!(!quiet.matches(&notification("wcgw/ghd", Reason::CiActivity)));
+        assert!(quiet.matches(&notification("wcgw/ghd", Reason::Mention), None));
+        assert!(!quiet.matches(&notification("wcgw/ghd", Reason::Subscribed), None));
+        assert!(!quiet.matches(&notification("wcgw/ghd", Reason::CiActivity), None));
     }
 
     #[test]
     fn negation_narrows_what_the_rest_selects() {
         let wcgw_but_ghd = filter("org:wcgw -repo:wcgw/ghd");
 
-        assert!(wcgw_but_ghd.matches(&notification("wcgw/other", Reason::Mention)));
-        assert!(!wcgw_but_ghd.matches(&notification("wcgw/ghd", Reason::Mention)));
-        assert!(!wcgw_but_ghd.matches(&notification("kuadrant/limitador", Reason::Mention)));
+        assert!(wcgw_but_ghd.matches(&notification("wcgw/other", Reason::Mention), None));
+        assert!(!wcgw_but_ghd.matches(&notification("wcgw/ghd", Reason::Mention), None));
+        assert!(!wcgw_but_ghd.matches(&notification("kuadrant/limitador", Reason::Mention), None));
     }
 
     #[test]
     fn repo_matches_owner_and_name_ignoring_case() {
         let ghd = filter("repo:WCGW/ghd");
 
-        assert!(ghd.matches(&notification("wcgw/ghd", Reason::Mention)));
-        assert!(!ghd.matches(&notification("wcgw/ghd-extras", Reason::Mention)));
-        assert!(!ghd.matches(&notification("other/ghd", Reason::Mention)));
+        assert!(ghd.matches(&notification("wcgw/ghd", Reason::Mention), None));
+        assert!(!ghd.matches(&notification("wcgw/ghd-extras", Reason::Mention), None));
+        assert!(!ghd.matches(&notification("other/ghd", Reason::Mention), None));
     }
 
     #[test]
@@ -374,7 +394,7 @@ mod tests {
         ];
         for (text, repository, expected) in cases {
             assert_eq!(
-                filter(text).matches(&notification(repository, Reason::Mention)),
+                filter(text).matches(&notification(repository, Reason::Mention), None),
                 expected,
                 "{text} on {repository}"
             );
@@ -385,8 +405,8 @@ mod tests {
     fn org_matches_the_owner_ignoring_case() {
         let wcgw = filter("org:WCGW");
 
-        assert!(wcgw.matches(&notification("wcgw/ghd", Reason::Mention)));
-        assert!(!wcgw.matches(&notification("wcgw-labs/ghd", Reason::Mention)));
+        assert!(wcgw.matches(&notification("wcgw/ghd", Reason::Mention), None));
+        assert!(!wcgw.matches(&notification("wcgw-labs/ghd", Reason::Mention), None));
     }
 
     #[test]
@@ -402,14 +422,18 @@ mod tests {
         };
 
         for text in ["is:pr", "is:pull-request"] {
-            assert!(filter(text).matches(&pr), "{text}");
-            assert!(!filter(text).matches(&issue), "{text}");
+            assert!(filter(text).matches(&pr, None), "{text}");
+            assert!(!filter(text).matches(&issue, None), "{text}");
         }
-        assert!(filter("is:issue").matches(&issue));
-        assert!(!filter("is:issue").matches(&pr));
+        assert!(filter("is:issue").matches(&issue, None));
+        assert!(!filter("is:issue").matches(&pr, None));
         let either = filter("is:issue-or-pull-request");
-        assert!(either.matches(&pr) && either.matches(&issue) && !either.matches(&release));
-        assert!(filter("is:release").matches(&release));
+        assert!(
+            either.matches(&pr, None)
+                && either.matches(&issue, None)
+                && !either.matches(&release, None)
+        );
+        assert!(filter("is:release").matches(&release, None));
     }
 
     #[test]
@@ -424,23 +448,75 @@ mod tests {
             ..unread_pr.clone()
         };
 
-        assert!(filter("is:unread").matches(&unread_pr));
-        assert!(!filter("is:unread").matches(&read_pr));
-        assert!(filter("is:read").matches(&read_pr));
+        assert!(filter("is:unread").matches(&unread_pr, None));
+        assert!(!filter("is:unread").matches(&read_pr, None));
+        assert!(filter("is:read").matches(&read_pr, None));
 
         // Kind and read state each get their own any-of, and both must match.
         let unread_prs = filter("is:pr is:unread");
-        assert!(unread_prs.matches(&unread_pr));
-        assert!(!unread_prs.matches(&read_pr));
-        assert!(!unread_prs.matches(&unread_issue));
+        assert!(unread_prs.matches(&unread_pr, None));
+        assert!(!unread_prs.matches(&read_pr, None));
+        assert!(!unread_prs.matches(&unread_issue, None));
+    }
+
+    #[test]
+    fn is_asks_for_a_state_as_github_search_does() {
+        use SubjectState::*;
+        let pr = notification("wcgw/ghd", Reason::Mention);
+        let matching = |text: &str| -> Vec<SubjectState> {
+            [Open, Draft, Merged, Closed, Completed, NotPlanned]
+                .into_iter()
+                .filter(|&state| filter(text).matches(&pr, Some(state)))
+                .collect()
+        };
+
+        assert_eq!(matching("is:open"), [Open, Draft], "drafts are open");
+        assert_eq!(matching("is:draft"), [Draft]);
+        assert_eq!(matching("is:merged"), [Merged]);
+        assert_eq!(
+            matching("is:closed"),
+            [Merged, Closed, Completed, NotPlanned],
+            "merged is closed"
+        );
+        assert_eq!(matching("is:completed"), [Completed]);
+        assert_eq!(matching("is:not-planned"), [NotPlanned]);
+        assert_eq!(
+            matching("is:merged is:draft"),
+            [Draft, Merged],
+            "a repeated State is any of them"
+        );
+        assert_eq!(matching("-is:closed"), [Open, Draft]);
+    }
+
+    #[test]
+    fn unknown_state_is_only_reachable_by_negation() {
+        let release = notification("wcgw/ghd", Reason::Subscribed);
+
+        assert!(!filter("is:open").matches(&release, None));
+        assert!(!filter("is:closed").matches(&release, None));
+        assert!(filter("-is:merged").matches(&release, None));
+    }
+
+    #[test]
+    fn state_kind_and_read_state_must_all_match() {
+        let pr = notification("wcgw/ghd", Reason::Mention);
+        let issue = Notification {
+            subject_kind: SubjectKind::Issue,
+            ..pr.clone()
+        };
+        let merged_unread_prs = filter("is:pr is:merged is:unread");
+
+        assert!(merged_unread_prs.matches(&pr, Some(SubjectState::Merged)));
+        assert!(!merged_unread_prs.matches(&pr, Some(SubjectState::Open)));
+        assert!(!merged_unread_prs.matches(&issue, Some(SubjectState::Completed)));
     }
 
     #[test]
     fn unknown_reason_is_only_reachable_by_negation() {
         let new_reason = notification("wcgw/ghd", Reason::Other("brand_new_reason".to_owned()));
 
-        assert!(!filter("reason:mention").matches(&new_reason));
-        assert!(filter("-reason:mention").matches(&new_reason));
+        assert!(!filter("reason:mention").matches(&new_reason, None));
+        assert!(filter("-reason:mention").matches(&new_reason, None));
     }
 
     #[test]
@@ -466,7 +542,7 @@ mod tests {
         for name in names {
             let reason = Reason::from_api(&name.replace('-', "_"));
             assert!(
-                filter(&format!("reason:{name}")).matches(&notification("wcgw/ghd", reason)),
+                filter(&format!("reason:{name}")).matches(&notification("wcgw/ghd", reason), None),
                 "{name}"
             );
         }

@@ -15,9 +15,14 @@ configuration error. `reason:participating` is rejected: GitHub doesn't define w
 picked would silently disagree with github.com.
 
 Negated qualifiers are exclusions: a Notification matching any of them is left out, so `-reason:a -reason:b` drops both
-(read as OR, it would let nearly everything through). `is:` counts as two qualifiers for the repeat rule, because it
-covers two unrelated things: the Subject's kind (`is:pr`, `is:issue`, …) and its read state (`is:read`, `is:unread`).
-So `is:pr is:unread` means unread pull requests, not "pull requests or anything unread". `is:` values ghd can't
+(read as OR, it would let nearly everything through). `is:` counts as three qualifiers for the repeat rule, because it
+covers three unrelated things: the Subject's kind (`is:pr`, `is:issue`, …), its read state (`is:read`, `is:unread`) and
+its State (`is:open`, `is:draft`, `is:merged`, `is:closed`, `is:completed`, `is:not-planned`). So `is:pr is:unread`
+means unread pull requests, not "pull requests or anything unread". The States follow GitHub's search: `is:open`
+includes drafts, and `is:closed` includes merged pull requests and issues closed for any reason; `is:completed` and
+`is:not-planned` are ghd's, where GitHub's search uses `reason:` (taken here by the notification's Reason). A
+Notification whose State isn't known (not looked up yet, or a kind with none) matches no `is:` State, only negated
+ones, as with unknown reasons. `is:` values ghd can't
 evaluate are rejected rather than matching nothing: `is:done` (the Inbox never holds Done notifications), `is:saved`
 (the API doesn't expose it) and the kinds whose API names ghd doesn't know yet (`gist`, `repository-invitation`,
 `repository-vulnerability-alert`, `repository-advisory`).
@@ -37,5 +42,6 @@ evaluate are rejected rather than matching nothing: `is:done` (the Inbox never h
 - GitHub adds reasons over time (`agent_session_finished` is recent). A Notification with a reason ghd doesn't know is
   still shown, with the reason as GitHub sent it, but no `reason:` value selects it until ghd learns that reason;
   negated `-reason:` Filters still let it through.
-- `author:` and subject state (e.g. merged) are valid GitHub qualifiers that ghd can't evaluate yet: they need the
-  Subject's details. Pull requests' and issues' State is now looked up (to color them), but Filters don't use it yet.
+- `author:` is a valid GitHub qualifier that ghd can't evaluate yet: it needs the Subject's details, which ghd doesn't
+  look up. A Subject's State is looked up apart from the Inbox, so a View on a State fills in a moment after the Inbox
+  arrives.

@@ -45,6 +45,14 @@ impl SubjectState {
         }
     }
 
+    /// The State as it's typed in a Filter's `is:` and the Search's `state:`, hyphenated.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotPlanned => "not-planned",
+            state => state.name(),
+        }
+    }
+
     /// The State called `name`; `None` for any other name.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|state| state.name() == name)

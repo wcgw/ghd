@@ -1,11 +1,13 @@
 //! Searches: text typed to narrow the View on screen (see `CONTEXT.md`).
 
 use crate::inbox::{Notification, SubjectKind};
+use crate::state::SubjectState;
 
 /// What a Search is made of: space-separated terms, each either plain text or `field:text`, with `"` around text
 /// that has spaces in it (`title:"add polling"`). A Notification matches when it contains the text of every term,
-/// ignoring case. Plain text looks in the title and the repository; the fields are `title:`, `repo:`, `reason:`
-/// and `type:` (a Subject kind's name, as in Filters' `is:`, or `pr`). The default Search matches everything.
+/// ignoring case. Plain text looks in the title and the repository; the fields are `title:`, `repo:`, `reason:`,
+/// `type:` (a Subject kind's name, as in Filters' `is:`, or `pr`) and `state:` (a State, as in Filters' `is:`, of a
+/// pull request or an issue whose State is known). The default Search matches everything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Search {
     terms: Vec<Term>,
@@ -26,14 +28,16 @@ enum Field {
     Repository,
     Reason,
     Type,
+    State,
 }
 
 /// The fields a term can name, in the order completion offers them.
-const FIELD_NAMES: [(&str, Field); 4] = [
+const FIELD_NAMES: [(&str, Field); 5] = [
     ("title", Field::Title),
     ("repo", Field::Repository),
     ("reason", Field::Reason),
     ("type", Field::Type),
+    ("state", Field::State),
 ];
 
 impl Field {
@@ -104,9 +108,11 @@ impl Search {
         Self { terms }
     }
 
-    /// Whether `notification` matches every term.
-    pub fn matches(&self, notification: &Notification) -> bool {
-        self.terms.iter().all(|term| term.matches(notification))
+    /// Whether `notification` matches every term, its Subject in `state` if that\'s known.
+    pub fn matches(&self, notification: &Notification, state: Option<SubjectState>) -> bool {
+        self.terms
+            .iter()
+            .all(|term| term.matches(notification, state))
     }
 }
 
@@ -123,7 +129,7 @@ impl Term {
         })
     }
 
-    fn matches(&self, notification: &Notification) -> bool {
+    fn matches(&self, notification: &Notification, state: Option<SubjectState>) -> bool {
         let contains = |haystack: &str| haystack.to_lowercase().contains(&self.text);
         match self.field {
             Field::TitleOrRepository => {
@@ -136,6 +142,7 @@ impl Term {
                 contains(notification.subject_kind.name())
                     || (self.text == "pr" && notification.subject_kind == SubjectKind::PullRequest)
             }
+            Field::State => state.is_some_and(|state| state.label().contains(&self.text)),
         }
     }
 }
@@ -162,12 +169,12 @@ mod tests {
     }
 
     fn matches(input: &str) -> bool {
-        Search::parse(input).matches(&notification())
+        Search::parse(input).matches(&notification(), None)
     }
 
     #[test]
     fn empty_search_matches_everything() {
-        assert!(Search::default().matches(&notification()));
+        assert!(Search::default().matches(&notification(), None));
         for input in ["", "   ", "title:", r#""""#] {
             assert_eq!(Search::parse(input), Search::default(), "{input:?}");
         }
@@ -205,6 +212,22 @@ mod tests {
     }
 
     #[test]
+    fn state_field_looks_in_the_known_state() {
+        let merged = Some(SubjectState::Merged);
+        let state = |input: &str, state| Search::parse(input).matches(&notification(), state);
+
+        assert!(state("state:merg", merged));
+        assert!(!state("state:open", merged));
+        assert!(state("state:not-planned", Some(SubjectState::NotPlanned)));
+        assert!(state("state:planned", Some(SubjectState::NotPlanned)));
+        assert!(!state("state:merged", None), "no State known");
+        assert!(
+            !state("merged", merged),
+            "plain text doesn't look in the State"
+        );
+    }
+
+    #[test]
     fn quotes_keep_spaces_in_a_field() {
         assert!(matches(r#"title:"polling to""#));
         assert!(!matches(r#"title:"polling inbox""#));
@@ -213,7 +236,7 @@ mod tests {
 
     #[test]
     fn completion_offers_the_fields_a_word_could_start() {
-        let fields = ["title:", "repo:", "reason:", "type:"];
+        let fields = ["title:", "repo:", "reason:", "type:", "state:"];
         assert_eq!(completions(""), fields);
         assert_eq!(completions("re"), ["repo:", "reason:"]);
         assert_eq!(completions("TI"), ["title:"]);
@@ -254,12 +277,12 @@ mod tests {
             ..notification()
         };
 
-        assert!(Search::parse("fix:").matches(&fix), "unknown field");
-        assert!(Search::parse("fix: polling").matches(&fix));
+        assert!(Search::parse("fix:").matches(&fix, None), "unknown field");
+        assert!(Search::parse("fix: polling").matches(&fix, None));
         assert!(
-            Search::parse(r#""fix: poll""#).matches(&fix),
+            Search::parse(r#""fix: poll""#).matches(&fix, None),
             "colon inside quotes"
         );
-        assert!(!Search::parse("fix:").matches(&notification()));
+        assert!(!Search::parse("fix:").matches(&notification(), None));
     }
 }

@@ -594,7 +594,8 @@ impl App {
     /// Takes in Subjects' States looked up; a failed lookup is reported until an Inbox is fetched again.
     fn states_looked_up(&mut self, looked_up: LookedUp) {
         match looked_up.found {
-            Ok(found) => self.states.found(&looked_up.asked, &found),
+            // A View that asks for a State may show more or fewer rows now.
+            Ok(found) => self.keeping_cursors(|app| app.states.found(&looked_up.asked, &found)),
             Err(error) => {
                 self.status = Some(StatusMessage::FetchFailed(format!(
                     "Couldn't look up the state of pull requests and issues: {error:#}"
@@ -638,7 +639,8 @@ impl App {
             .views
             .iter()
             .filter_map(|shown_view| {
-                let notification = at_cursor_in(&self.inbox, shown_view, &self.search)?;
+                let notification =
+                    at_cursor_in(&self.inbox, shown_view, &self.search, &self.states)?;
                 Some((shown_view.view.name.clone(), notification.thread))
             })
             .collect();
@@ -661,7 +663,9 @@ impl App {
         let cursors = self
             .views
             .iter()
-            .map(|shown_view| at_cursor_in(&self.inbox, shown_view, &self.search).map(|n| n.thread))
+            .map(|shown_view| {
+                at_cursor_in(&self.inbox, shown_view, &self.search, &self.states).map(|n| n.thread)
+            })
             .collect();
         change(self);
         self.move_cursors(cursors);
@@ -671,7 +675,8 @@ impl App {
     fn move_cursors(&mut self, threads: Vec<Option<ThreadId>>) {
         for (shown_view, thread) in self.views.iter_mut().zip(threads) {
             let row = thread.and_then(|thread| {
-                shown(&self.inbox, &shown_view.view, &self.search).position(|n| n.thread == thread)
+                shown(&self.inbox, &shown_view.view, &self.search, &self.states)
+                    .position(|n| n.thread == thread)
             });
             if let Some(row) = row {
                 shown_view.cursor.select(Some(row));
@@ -718,10 +723,14 @@ impl App {
                 }
             }
             Command::SelectAllShown => {
-                let shown: Vec<ThreadId> =
-                    shown(&self.inbox, &self.views[self.current].view, &self.search)
-                        .map(|n| n.thread)
-                        .collect();
+                let shown: Vec<ThreadId> = shown(
+                    &self.inbox,
+                    &self.views[self.current].view,
+                    &self.search,
+                    &self.states,
+                )
+                .map(|n| n.thread)
+                .collect();
                 if !shown.is_empty() && shown.iter().all(|thread| self.selection.contains(thread)) {
                     for thread in &shown {
                         self.selection.remove(thread);
@@ -892,7 +901,12 @@ impl App {
 
     /// The Notification at the cursor of the View on screen; `None` until the Inbox arrives, or if the View shows none.
     fn at_cursor(&self) -> Option<&Notification> {
-        at_cursor_in(&self.inbox, &self.views[self.current], &self.search)
+        at_cursor_in(
+            &self.inbox,
+            &self.views[self.current],
+            &self.search,
+            &self.states,
+        )
     }
 
     fn inbox(&self) -> Option<&Inbox> {
@@ -943,7 +957,8 @@ impl App {
             ));
         }
         let current = &mut self.views[self.current];
-        let rows: Vec<&Notification> = shown(&self.inbox, &current.view, &self.search).collect();
+        let rows: Vec<&Notification> =
+            shown(&self.inbox, &current.view, &self.search, &self.states).collect();
         let message = match &self.inbox {
             InboxState::Loading => Paragraph::new("Fetching notifications…").style(theme.message),
             InboxState::Failed(error) => {
@@ -956,7 +971,7 @@ impl App {
             }
             InboxState::Loaded(_)
                 if rows.is_empty()
-                    && shown(&self.inbox, &current.view, &Search::default())
+                    && shown(&self.inbox, &current.view, &Search::default(), &self.states)
                         .next()
                         .is_some() =>
             {
@@ -1025,7 +1040,7 @@ impl App {
             }
             let label = match &self.inbox {
                 InboxState::Loaded(_) => {
-                    let unread = shown(&self.inbox, &shown_view.view, &self.search)
+                    let unread = shown(&self.inbox, &shown_view.view, &self.search, &self.states)
                         .filter(|n| n.unread)
                         .count();
                     format!("{} ({unread})", shown_view.view.name)
@@ -1094,24 +1109,26 @@ fn at_cursor_in<'a>(
     inbox: &'a InboxState,
     shown_view: &'a ShownView,
     search: &'a Search,
+    states: &'a States,
 ) -> Option<&'a Notification> {
-    shown(inbox, &shown_view.view, search).nth(shown_view.cursor.selected()?)
+    shown(inbox, &shown_view.view, search, states).nth(shown_view.cursor.selected()?)
 }
 
-/// The Notifications `view` shows narrowed by `search`, newest first; none until the Inbox has arrived.
+/// The Notifications `view` shows narrowed by `search`, their Subjects' States as in `states`, newest first; none until the Inbox has arrived.
 fn shown<'a>(
     inbox: &'a InboxState,
     view: &'a View,
     search: &'a Search,
+    states: &'a States,
 ) -> impl Iterator<Item = &'a Notification> {
     let inbox = match inbox {
         InboxState::Loaded(inbox) => Some(inbox),
         InboxState::Loading | InboxState::Failed(_) => None,
     };
-    inbox
-        .into_iter()
-        .flat_map(Inbox::iter)
-        .filter(|n| view.filter.matches(n) && search.matches(n))
+    inbox.into_iter().flat_map(Inbox::iter).filter(|n| {
+        let state = states.get(n);
+        view.filter.matches(n, state) && search.matches(n, state)
+    })
 }
 
 /// What decides how Notifications' rows look, besides the Notifications themselves.
@@ -1660,7 +1677,7 @@ mod tests {
 
         app.fetched(fetched(newer));
 
-        let inbox_view: Vec<&str> = shown(&app.inbox, &app.views[0].view, &app.search)
+        let inbox_view: Vec<&str> = shown(&app.inbox, &app.views[0].view, &app.search, &app.states)
             .map(|n| n.subject_title.as_str())
             .collect();
         assert_eq!(inbox_view, ["Brand new", "Add polling", "Old news"]);
@@ -1990,11 +2007,11 @@ mod tests {
         app.execute(Command::Search);
 
         type_key(&mut app, KeyCode::BackTab);
-        assert_eq!(app.search_input, "type:");
+        assert_eq!(app.search_input, "state:");
         type_key(&mut app, KeyCode::BackTab);
-        assert_eq!(app.search_input, "reason:");
-        type_key(&mut app, KeyCode::Tab);
         assert_eq!(app.search_input, "type:");
+        type_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_input, "state:");
     }
 
     #[test]
@@ -2710,6 +2727,76 @@ mod tests {
             kept.iter().map(|(thread, _)| thread.0).collect::<Vec<_>>(),
             [2]
         );
+    }
+
+    #[test]
+    fn views_on_a_state_fill_in_as_states_arrive() {
+        let view = |name: &str, filter: &str| View {
+            name: name.to_owned(),
+            filter: filter.parse().expect("valid filter"),
+        };
+        let mut app = App::new(
+            vec![
+                View {
+                    name: "Inbox".to_owned(),
+                    filter: Filter::default(),
+                },
+                view("Merged", "is:merged"),
+                view("Not merged", "-is:merged"),
+            ],
+            Theme::default(),
+            KindLabels::Text,
+        );
+        // "Add polling", then "Middle", then "Old news".
+        let mut notifications = notifications();
+        notifications.push(Notification {
+            thread: ThreadId(3),
+            subject_title: "Middle".to_owned(),
+            updated_at: Utc::now() - TimeDelta::days(1),
+            ..notifications[0].clone()
+        });
+        app.fetched(fetched(notifications));
+        app.execute(Command::ShowView(2));
+        app.execute(Command::Down);
+        assert_eq!(cursor_title(&app), Some("Middle"));
+        app.execute(Command::ShowView(1));
+        assert!(titles(&screen(&mut app)).is_empty(), "no State known yet");
+
+        let asked = app.states_to_look_up();
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([(ThreadId(1), SubjectState::Merged)])),
+        });
+
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
+        app.execute(Command::ShowView(2));
+        assert_eq!(
+            cursor_title(&app),
+            Some("Middle"),
+            "the cursor stays on its Notification"
+        );
+    }
+
+    #[test]
+    fn search_on_state() {
+        let mut app = app();
+        let asked = app.states_to_look_up();
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([
+                (ThreadId(1), SubjectState::Draft),
+                (ThreadId(2), SubjectState::NotPlanned),
+            ])),
+        });
+        app.execute(Command::Search);
+
+        type_text(&mut app, "state:planned");
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+        for _ in 0.."planned".len() {
+            type_key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "dra");
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
     }
 
     #[test]

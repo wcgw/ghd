@@ -257,7 +257,7 @@ mod tests {
         let matching: Vec<bool> = config
             .views
             .iter()
-            .map(|view| view.filter.matches(&review))
+            .map(|view| view.filter.matches(&review, None))
             .collect();
         assert_eq!(matching, [true, true, false]);
     }

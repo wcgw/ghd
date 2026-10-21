@@ -57,6 +57,7 @@ _Avoid_: folder, bucket, tab, filter
 - An **Inbox** belongs to exactly one **Account**
 - A **Notification** is about exactly one **Subject** and carries one **Reason**
 - A **Subject**'s **State** isn't part of its **Notification**: ghd looks it up apart, again whenever the **Notification** has new activity, and shows the last one it knows
+- A **Filter** or a **Search** can ask for a **State**; a **Notification** whose **State** isn't known matches none, only the negation of one
 - GitHub's API doesn't say which **Notifications** are **Done**: ghd takes for **Done** those it marked **Done** itself (until they get new activity) and read ones GitHub has no read time for (see `docs/adr/0002-inferring-done.md`)
 - Opening a **Notification** clears **Unread**; marking it **Done** removes it from the **Inbox** and so from every **View**
 - A **View** has exactly one **Filter**
