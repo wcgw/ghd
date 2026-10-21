@@ -3,6 +3,7 @@
 mod cache;
 mod change;
 mod config;
+mod done;
 mod filter;
 mod github;
 mod inbox;

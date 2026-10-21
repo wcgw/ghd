@@ -98,6 +98,8 @@ theme! {
     state_closed = "state.closed",
     state_completed = "state.completed",
     state_not_planned = "state.not_planned",
+    /// A State's color on a read Notification's row, over it: to tone it down, rather than lose it to `read`.
+    read_state = "read_state",
     repository = "repository",
     title = "title",
     reason = "reason",

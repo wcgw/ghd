@@ -220,6 +220,7 @@ impl GitHub {
         self.polling().last_modified = first.last_modified;
         Ok(notifications
             .into_iter()
+            .filter(seems_not_done)
             .map(|api| self.notification_from_api(api))
             .collect())
     }
@@ -504,6 +505,13 @@ impl GitHub {
         };
         format!("{}/{page}", self.web_root)
     }
+}
+
+/// Whether a thread GitHub lists seems to still be in the Inbox, not Done. The list has Done threads too, read, and
+/// nothing says which; a read thread with no `last_read_at` is taken for Done, as a thread marked Done turned out to
+/// be. A guess, not GitHub's word: see `docs/adr/0002-inferring-done.md`.
+fn seems_not_done(api: &ApiNotification) -> bool {
+    api.unread || api.last_read_at.is_some()
 }
 
 /// Where GraphQL queries go, for the REST API rooted at `api_root`: `/graphql` beside the API on github.com, but
@@ -1111,6 +1119,37 @@ mod tests {
             .expect_err("no data");
 
         assert!(format!("{error:#}").contains("Parse error"), "{error:#}");
+    }
+
+    /// GitHub's list keeps threads marked Done, read; one marked Done had no `last_read_at` (seen on 2026-10-21).
+    #[tokio::test]
+    async fn read_threads_without_a_read_time_are_taken_for_done() {
+        let server = MockServer::start().await;
+        let with = |id: u64, unread: bool, last_read_at: Value| {
+            let mut notification = api_notification(id, "mention", "2026-10-21T08:00:00Z");
+            notification["unread"] = unread.into();
+            notification["last_read_at"] = last_read_at;
+            notification
+        };
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                with(1, true, Value::Null),
+                with(2, true, json!("2026-10-20T08:00:00Z")),
+                with(3, false, json!("2026-10-21T09:00:00Z")),
+                with(4, false, Value::Null),
+            ])))
+            .mount(&server)
+            .await;
+
+        let inbox = github_for(&server)
+            .await
+            .inbox()
+            .await
+            .expect("GitHub answers 200");
+
+        let mut threads: Vec<u64> = inbox.iter().map(|n| n.thread.0).collect();
+        threads.sort_unstable();
+        assert_eq!(threads, [1, 2, 3], "read with no read time: Done");
     }
 
     #[tokio::test]

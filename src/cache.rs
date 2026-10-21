@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::done::MarkedDone;
 use crate::github::Account;
 use crate::inbox::{Inbox, Notification, Reason, SubjectKind, ThreadId};
 use crate::state::{Known, States, SubjectState};
@@ -27,6 +28,8 @@ pub struct Snapshot {
     pub cursors: BTreeMap<String, ThreadId>,
     /// The Subjects' States known.
     pub states: States,
+    /// What ghd marked Done.
+    pub marked_done: MarkedDone,
 }
 
 /// Where one Account's [`Snapshot`] is kept.
@@ -110,6 +113,16 @@ struct File {
     /// Missing from files saved before States were kept.
     #[serde(default)]
     states: Vec<CachedState>,
+    /// Missing from files saved before ghd kept what it marked Done.
+    #[serde(default)]
+    marked_done: Vec<CachedDone>,
+}
+
+/// A thread ghd marked Done, with the activity it had then.
+#[derive(Serialize, Deserialize)]
+struct CachedDone {
+    thread: u64,
+    done_at: DateTime<Utc>,
 }
 
 /// A Subject's State, as written: by its name, which a State of a newer ghd might not have.
@@ -167,6 +180,14 @@ impl File {
                     as_of: known.as_of,
                 })
                 .collect(),
+            marked_done: snapshot
+                .marked_done
+                .iter()
+                .map(|(thread, done_at)| CachedDone {
+                    thread: thread.0,
+                    done_at,
+                })
+                .collect(),
         }
     }
 
@@ -192,6 +213,11 @@ impl File {
                 .cursors
                 .into_iter()
                 .map(|(view, thread)| (view, ThreadId(thread)))
+                .collect(),
+            marked_done: self
+                .marked_done
+                .into_iter()
+                .map(|done| (ThreadId(done.thread), done.done_at))
                 .collect(),
             // A State this ghd doesn't know is left out, to be looked up again.
             states: self
@@ -270,6 +296,12 @@ mod tests {
                 ("Inbox".to_owned(), ThreadId(2)),
                 ("Reviews".to_owned(), ThreadId(1)),
             ]),
+            marked_done: [(
+                ThreadId(3),
+                "2026-10-21T09:00:00Z".parse().expect("valid RFC 3339"),
+            )]
+            .into_iter()
+            .collect(),
             states: [
                 (
                     ThreadId(1),
@@ -348,7 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_without_states_still_reads() {
+    async fn file_from_before_states_and_done_still_reads() {
         let dir = ScratchDir::new("cache-without-states");
         let cache = Cache::in_dir(Some(&dir.0), &Account::default());
         let path = cache.path.clone().expect("a cache directory");
@@ -356,12 +388,17 @@ mod tests {
             .expect("the directory is writable");
         let mut older = serde_json::to_value(File::from_snapshot(&snapshot())).expect("encodable");
         older.as_object_mut().expect("an object").remove("states");
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("marked_done");
         std::fs::write(&path, older.to_string()).expect("the directory is writable");
 
         let loaded = cache.load().await.expect("still readable");
 
         assert_eq!(loaded.inbox, snapshot().inbox);
         assert_eq!(loaded.states, States::default());
+        assert_eq!(loaded.marked_done, MarkedDone::default());
     }
 
     #[tokio::test]

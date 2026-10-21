@@ -43,6 +43,7 @@ cursor = { bg = "bg_highlight" }
 selected = { fg = "yellow", bg = "blue7" }
 unread = { bold = true }
 read = { fg = "comment" }
+read_state = { dim = true }
 unread_marker = { fg = "orange" }
 repository = { fg = "blue" }
 title = { fg = "fg" }

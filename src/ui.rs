@@ -20,6 +20,7 @@ use tokio::time::Instant;
 use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
+use crate::done::MarkedDone;
 use crate::github::GitHub;
 use crate::inbox::{Inbox, Notification, SubjectKind, ThreadId};
 use crate::search::{self, Search};
@@ -392,6 +393,8 @@ struct App {
     kind_labels: KindLabels,
     /// The Subjects' States known so far.
     states: States,
+    /// What ghd marked Done, which GitHub keeps listing.
+    marked_done: MarkedDone,
     /// An Inbox arrived since Subjects' States were last looked up: the ones it changed want looking up.
     states_wanted: bool,
 }
@@ -453,6 +456,7 @@ impl App {
             kind_labels,
             states: States::default(),
             states_wanted: false,
+            marked_done: MarkedDone::default(),
         }
     }
 
@@ -463,6 +467,7 @@ impl App {
             // Unchanged since the last fetch.
             Ok(None) => {}
             Ok(Some(mut inbox)) => {
+                self.marked_done.hide_from(&mut inbox);
                 self.recent.reapply(&mut inbox, fetched.began);
                 self.replace_inbox(inbox);
                 if matches!(
@@ -603,6 +608,7 @@ impl App {
     fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
         self.inbox = InboxState::Loaded(snapshot.inbox);
         self.states = snapshot.states;
+        self.marked_done = snapshot.marked_done;
         if let Some(index) = self
             .views
             .iter()
@@ -644,6 +650,7 @@ impl App {
             inbox,
             saved_at: now,
             states: self.states,
+            marked_done: self.marked_done,
             view,
             cursors,
         })
@@ -833,6 +840,11 @@ impl App {
             .filter_map(|thread| inbox.remove(thread))
             .map(Change::MarkDone)
             .collect();
+        for change in &changes {
+            if let Change::MarkDone(n) = change {
+                self.marked_done.insert(n);
+            }
+        }
         match changes.as_slice() {
             [] => {}
             [Change::MarkDone(notification)] => {
@@ -870,6 +882,9 @@ impl App {
             "GitHub refused to {}, undone: {error:#}",
             reply.change
         )));
+        if let Change::MarkDone(n) = &reply.change {
+            self.marked_done.remove(n.thread);
+        }
         if let Some(inbox) = self.inbox_mut() {
             reply.change.undo(inbox);
         }
@@ -1127,11 +1142,14 @@ fn notifications_table<'a>(
         }
         let cell =
             |text: Cow<'a, str>, column: Style| Cell::from(text).style(column.patch(row_style));
-        let kind_style = subject_state.map_or(theme.kind(&n.subject_kind), |subject_state| {
-            theme
-                .kind(&n.subject_kind)
-                .patch(theme.state(subject_state))
-        });
+        // A State's color goes over the row's style, so that a read Subject still shows it, as the theme tones it.
+        let mut kind_style = theme.kind(&n.subject_kind).patch(row_style);
+        if let Some(subject_state) = subject_state {
+            kind_style = kind_style.patch(theme.state(subject_state));
+            if !n.unread {
+                kind_style = kind_style.patch(theme.read_state);
+            }
+        }
         Row::new([
             cell(
                 Cow::Borrowed(if selected { "▌" } else { " " }),
@@ -1141,10 +1159,7 @@ fn notifications_table<'a>(
                 Cow::Borrowed(if n.unread { "●" } else { " " }),
                 theme.unread_marker,
             ),
-            cell(
-                Cow::Borrowed(look.kind_labels.label(&n.subject_kind, subject_state)),
-                kind_style,
-            ),
+            Cell::from(look.kind_labels.label(&n.subject_kind, subject_state)).style(kind_style),
             cell(Cow::Borrowed(&n.repository), theme.repository),
             cell(Cow::Borrowed(&n.subject_title), theme.title),
             cell(Cow::Owned(n.reason.to_string()), theme.reason),
@@ -1696,6 +1711,83 @@ mod tests {
         assert!(screen(&mut app)[0].contains("Inbox (1)"), "unread again");
     }
 
+    /// GitHub's `GET /notifications?all=true` keeps listing threads marked Done (seen on 2026-10-21): a fetch after
+    /// the Done is confirmed still has the thread.
+    #[test]
+    fn done_stays_done_though_github_keeps_listing_it() {
+        let mut app = app();
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let done = app
+            .execute(Command::MarkDone)
+            .pop()
+            .expect("a Notification at the cursor");
+        app.settle(Reply {
+            change: done,
+            accepted: Ok(()),
+        });
+
+        app.fetched(Fetched {
+            began: Instant::now() + Duration::from_secs(1),
+            ..fetched(held.clone())
+        });
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Old news"],
+            "still listed, but Done"
+        );
+
+        let mut newer = held;
+        newer[0].updated_at += TimeDelta::minutes(5);
+        app.fetched(Fetched {
+            began: Instant::now() + Duration::from_secs(2),
+            ..fetched(newer)
+        });
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Add polling", "Old news"],
+            "new activity brings it back, as on GitHub"
+        );
+    }
+
+    #[test]
+    fn refused_done_is_not_hidden_again() {
+        let mut app = app();
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let done = app
+            .execute(Command::MarkDone)
+            .pop()
+            .expect("a Notification at the cursor");
+
+        app.settle(Reply {
+            change: done,
+            accepted: refused(),
+        });
+        app.fetched(fetched(held));
+
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+    }
+
+    #[test]
+    fn done_is_remembered_across_runs() {
+        let mut app = app();
+        let held: Vec<Notification> = app.inbox().expect("fetched").iter().cloned().collect();
+        let done = app
+            .execute(Command::MarkDone)
+            .pop()
+            .expect("a Notification at the cursor");
+        app.settle(Reply {
+            change: done,
+            accepted: Ok(()),
+        });
+        let snapshot = app.into_snapshot(Utc::now()).expect("an Inbox");
+
+        let mut next_run = app_without_inbox();
+        next_run.restore(snapshot, Utc::now());
+        next_run.fetched(fetched(held));
+
+        assert_eq!(titles(&screen(&mut next_run)), ["Old news"]);
+    }
+
     #[test]
     fn unchanged_inbox_changes_nothing() {
         let mut app = app();
@@ -2152,6 +2244,7 @@ mod tests {
                 ("Read".to_owned(), ThreadId(2)),
                 ("Gone".to_owned(), ThreadId(1)),
             ]),
+            marked_done: MarkedDone::default(),
             // "Add polling" was merged, as of before its latest activity.
             states: [(
                 ThreadId(1),
@@ -2529,6 +2622,48 @@ mod tests {
             cell_at(buffer, 2, "\u{f517}").fg,
             Color::Rgb(9, 9, 9),
             "not planned"
+        );
+    }
+
+    #[test]
+    fn read_rows_keep_their_state_color_toned_down() {
+        let theme = Theme {
+            read: Style::new().fg(Color::Rgb(3, 3, 3)),
+            state_merged: Style::new().fg(Color::Rgb(8, 8, 8)),
+            state_completed: Style::new().fg(Color::Rgb(9, 9, 9)),
+            read_state: Style::new().add_modifier(Modifier::DIM),
+            ..Theme::default()
+        };
+        let mut app = app_in(theme);
+        let asked = app.states_to_look_up();
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([
+                (ThreadId(1), SubjectState::Merged),
+                (ThreadId(2), SubjectState::Completed),
+            ])),
+        });
+        let mut terminal =
+            Terminal::new(TestBackend::new(SCREEN_WIDTH, 5)).expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+
+        let buffer = terminal.backend().buffer();
+        let unread = cell_at(buffer, 1, "PR");
+        assert_eq!(unread.fg, Color::Rgb(8, 8, 8));
+        assert!(!unread.modifier.contains(Modifier::DIM));
+        let read = cell_at(buffer, 2, "ISS");
+        assert_eq!(
+            read.fg,
+            Color::Rgb(9, 9, 9),
+            "the State's color, not the read rows'"
+        );
+        assert!(read.modifier.contains(Modifier::DIM), "toned down");
+        assert_eq!(
+            cell_at(buffer, 2, "wcgw/other").fg,
+            Color::Rgb(3, 3, 3),
+            "the rest of the row is read"
         );
     }
 
