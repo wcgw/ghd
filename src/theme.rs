@@ -81,7 +81,7 @@ theme! {
     unread = "unread",
     /// A read Notification's row, over its columns' styles.
     read = "read",
-    /// The `●` before an unread Notification.
+    /// The `●` before an unread Notification; also "● unread only" in the bottom border.
     unread_marker = "unread_marker",
     kind_pull_request = "kind.pull_request",
     kind_issue = "kind.issue",

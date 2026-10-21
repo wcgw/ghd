@@ -250,12 +250,14 @@ enum Command {
     MarkDone,
     /// Shows the Done list in every View in place of the Inbox, or the Inbox again.
     ToggleDone,
+    /// Shows only the unread Notifications in the View on screen, or all of them again.
+    ToggleUnreadOnly,
     Help,
 }
 
 /// The help's lines for commands, in order, each with the commands its keys stand for. Adding a command means adding
 /// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
-const COMMAND_HELP: [(&[Command], KeyHelp); 15] = [
+const COMMAND_HELP: [(&[Command], KeyHelp); 16] = [
     (
         &[Command::Down, Command::Up],
         KeyHelp {
@@ -324,6 +326,13 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 15] = [
         KeyHelp {
             keys: "D",
             does: "show the Done list, or the Inbox again",
+        },
+    ),
+    (
+        &[Command::ToggleUnreadOnly],
+        KeyHelp {
+            keys: "u",
+            does: "show unread only, or all again",
         },
     ),
     (
@@ -412,6 +421,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('I') => Some(Command::MarkRead),
         KeyCode::Char('e') => Some(Command::MarkDone),
         KeyCode::Char('D') => Some(Command::ToggleDone),
+        KeyCode::Char('u') => Some(Command::ToggleUnreadOnly),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
@@ -448,6 +458,8 @@ struct ShownView {
     view: View,
     /// The cursor's row among the Notifications the View shows.
     cursor: TableState,
+    /// The View shows only its unread Notifications, while the Inbox is on screen.
+    unread_only: bool,
 }
 
 /// Everything on screen.
@@ -525,6 +537,7 @@ impl App {
             .map(|view| ShownView {
                 view,
                 cursor: TableState::new().with_selected(Some(0)),
+                unread_only: false,
             })
             .collect();
         Self {
@@ -727,16 +740,12 @@ impl App {
     /// What to keep for next time, as of `now`: the Inbox and the Done list, the View on screen and each View's
     /// cursor; `None` until there's an Inbox.
     fn into_snapshot(self, now: DateTime<Utc>) -> Option<Snapshot> {
+        let on_screen = self.on_screen();
         let cursors = self
             .views
             .iter()
             .filter_map(|shown_view| {
-                let notification = at_cursor_in(
-                    on_screen(&self.inbox, self.showing_done),
-                    shown_view,
-                    &self.search,
-                    &self.states,
-                )?;
+                let notification = on_screen.at_cursor(shown_view)?;
                 Some((shown_view.view.name.clone(), notification.thread))
             })
             .collect();
@@ -756,18 +765,11 @@ impl App {
 
     /// Runs `change`, keeping each View's cursor on the same Notification if the View still shows it.
     fn keeping_cursors(&mut self, change: impl FnOnce(&mut Self)) {
+        let on_screen = self.on_screen();
         let cursors = self
             .views
             .iter()
-            .map(|shown_view| {
-                at_cursor_in(
-                    on_screen(&self.inbox, self.showing_done),
-                    shown_view,
-                    &self.search,
-                    &self.states,
-                )
-                .map(|n| n.thread)
-            })
+            .map(|shown_view| on_screen.at_cursor(shown_view).map(|n| n.thread))
             .collect();
         change(self);
         self.move_cursors(cursors);
@@ -775,16 +777,11 @@ impl App {
 
     /// Selects in each View the Notification of the thread at the View's index in `threads`, if the View shows it.
     fn move_cursors(&mut self, threads: Vec<Option<ThreadId>>) {
+        // Not `self.on_screen()`: it would borrow the Views too.
+        let on_screen = OnScreen::new(&self.inbox, self.showing_done, &self.search, &self.states);
         for (shown_view, thread) in self.views.iter_mut().zip(threads) {
-            let row = thread.and_then(|thread| {
-                shown(
-                    on_screen(&self.inbox, self.showing_done),
-                    &shown_view.view,
-                    &self.search,
-                    &self.states,
-                )
-                .position(|n| n.thread == thread)
-            });
+            let row = thread
+                .and_then(|thread| on_screen.shown(shown_view).position(|n| n.thread == thread));
             if let Some(row) = row {
                 shown_view.cursor.select(Some(row));
             }
@@ -838,14 +835,11 @@ impl App {
                 }
             }
             Command::SelectAllShown => {
-                let shown: Vec<ThreadId> = shown(
-                    on_screen(&self.inbox, self.showing_done),
-                    &self.views[self.current].view,
-                    &self.search,
-                    &self.states,
-                )
-                .map(|n| n.thread)
-                .collect();
+                let shown: Vec<ThreadId> = self
+                    .on_screen()
+                    .shown(&self.views[self.current])
+                    .map(|n| n.thread)
+                    .collect();
                 if !shown.is_empty() && shown.iter().all(|thread| self.selection.contains(thread)) {
                     for thread in &shown {
                         self.selection.remove(thread);
@@ -882,6 +876,15 @@ impl App {
                 self.selection.clear();
                 self.keeping_cursors(|app| app.showing_done = !app.showing_done);
             }
+            Command::ToggleUnreadOnly if self.showing_done => {
+                self.status = Some(StatusMessage::Info(
+                    "Unread only is for the Inbox, not the Done list".to_owned(),
+                ));
+            }
+            Command::ToggleUnreadOnly => self.keeping_cursors(|app| {
+                let shown_view = &mut app.views[app.current];
+                shown_view.unread_only = !shown_view.unread_only;
+            }),
             Command::Open => return self.open(),
             Command::MarkRead => {
                 let targets = self.take_targets();
@@ -906,7 +909,8 @@ impl App {
             return self.at_cursor().map(|n| n.thread).into_iter().collect();
         }
         let selection = mem::take(&mut self.selection);
-        on_screen(&self.inbox, self.showing_done)
+        self.on_screen()
+            .list
             .into_iter()
             .flat_map(Inbox::iter)
             .filter(|n| selection.contains(&n.thread))
@@ -922,6 +926,7 @@ impl App {
         for thread in targets {
             let Some(url) = self
                 .on_screen()
+                .list
                 .and_then(|list| list.get(thread))
                 .map(|n| n.subject_url.clone())
             else {
@@ -1065,17 +1070,12 @@ impl App {
 
     /// The Notification at the cursor of the View on screen; `None` until the Inbox arrives, or if the View shows none.
     fn at_cursor(&self) -> Option<&Notification> {
-        at_cursor_in(
-            on_screen(&self.inbox, self.showing_done),
-            &self.views[self.current],
-            &self.search,
-            &self.states,
-        )
+        self.on_screen().at_cursor(&self.views[self.current])
     }
 
-    /// The list on screen: the Inbox, or the Done list; `None` until they arrive.
-    fn on_screen(&self) -> Option<&Inbox> {
-        on_screen(&self.inbox, self.showing_done)
+    /// The list on screen, the Inbox or the Done list, and what narrows it.
+    fn on_screen(&self) -> OnScreen<'_> {
+        OnScreen::new(&self.inbox, self.showing_done, &self.search, &self.states)
     }
 
     /// The Inbox; `None` until it arrives.
@@ -1119,9 +1119,15 @@ impl App {
         if fetching {
             block = block.title_top(Line::styled(" fetching… ", theme.fetching).right_aligned());
         }
+        // Not `self.on_screen()`: it would borrow the View on screen too, whose cursor the table moves.
+        let on_screen = OnScreen::new(&self.inbox, self.showing_done, &self.search, &self.states);
+        let unread_only = on_screen.unread_only(&self.views[self.current]);
         if !self.selection.is_empty() {
             let count = format!(" {} selected ", self.selection.len());
             block = block.title_bottom(Line::styled(count, theme.selected));
+        }
+        if unread_only {
+            block = block.title_bottom(Line::styled(" ● unread only ", theme.unread_marker));
         }
         if !self.search_input.is_empty() && !self.is_typing_search() {
             block = block.title_bottom(Line::styled(
@@ -1130,13 +1136,7 @@ impl App {
             ));
         }
         let current = &mut self.views[self.current];
-        let rows: Vec<&Notification> = shown(
-            on_screen(&self.inbox, self.showing_done),
-            &current.view,
-            &self.search,
-            &self.states,
-        )
-        .collect();
+        let rows: Vec<&Notification> = on_screen.shown(current).collect();
         let message = match &self.inbox {
             InboxState::Loading => Paragraph::new("Fetching notifications…").style(theme.message),
             InboxState::Failed(error) => {
@@ -1144,9 +1144,7 @@ impl App {
                     .style(theme.error)
                     .wrap(Wrap { trim: false })
             }
-            InboxState::Loaded(_)
-                if on_screen(&self.inbox, self.showing_done).is_none_or(Inbox::is_empty) =>
-            {
+            InboxState::Loaded(_) if on_screen.list.is_none_or(Inbox::is_empty) => {
                 Paragraph::new(if self.showing_done {
                     "Nothing in the Done list."
                 } else {
@@ -1156,23 +1154,27 @@ impl App {
             }
             InboxState::Loaded(_)
                 if rows.is_empty()
-                    && shown(
-                        on_screen(&self.inbox, self.showing_done),
-                        &current.view,
-                        &Search::default(),
-                        &self.states,
-                    )
-                    .next()
-                    .is_some() =>
+                    && on_screen
+                        .matching(&current.view, &Search::default())
+                        .next()
+                        .is_none() =>
             {
-                Paragraph::new("Nothing in this View matches the search.").style(theme.message)
+                Paragraph::new(if self.showing_done {
+                    "Nothing in the Done list matches this View."
+                } else {
+                    "Nothing in your Inbox matches this View."
+                })
+                .style(theme.message)
             }
-            InboxState::Loaded(_) if rows.is_empty() => Paragraph::new(if self.showing_done {
-                "Nothing in the Done list matches this View."
-            } else {
-                "Nothing in your Inbox matches this View."
-            })
-            .style(theme.message),
+            // The View shows some, but the Search or unread only leaves none.
+            InboxState::Loaded(_) if rows.is_empty() => {
+                Paragraph::new(match (unread_only, self.search_input.is_empty()) {
+                    (true, true) => "Nothing unread in this View.",
+                    (true, false) => "Nothing unread in this View matches the search.",
+                    (false, _) => "Nothing in this View matches the search.",
+                })
+                .style(theme.message)
+            }
             InboxState::Loaded(_) => {
                 let look = RowLook {
                     theme,
@@ -1234,18 +1236,14 @@ impl App {
                 Span::raw(": "),
             ]);
         }
+        let on_screen = self.on_screen();
         for (index, shown_view) in self.views.iter().enumerate() {
             if index > 0 {
                 spans.push(Span::raw(" │ "));
             }
             let label = match &self.inbox {
                 InboxState::Loaded(_) => {
-                    let shown_here = shown(
-                        on_screen(&self.inbox, self.showing_done),
-                        &shown_view.view,
-                        &self.search,
-                        &self.states,
-                    );
+                    let shown_here = on_screen.shown(shown_view);
                     let count = if self.showing_done {
                         shown_here.count()
                     } else {
@@ -1310,38 +1308,67 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     );
 }
 
-/// The list on screen: the Done list while `showing_done`, the Inbox otherwise; `None` until they've arrived.
-fn on_screen(inbox: &InboxState, showing_done: bool) -> Option<&Inbox> {
-    match inbox {
-        InboxState::Loaded(listing) if showing_done => Some(&listing.done),
-        InboxState::Loaded(listing) => Some(&listing.inbox),
-        InboxState::Loading | InboxState::Failed(_) => None,
+/// The list on screen, the Inbox or the Done list, and what narrows it in every View: the Search, and the Subjects'
+/// States that Filters and the Search look at.
+#[derive(Clone, Copy)]
+struct OnScreen<'a> {
+    /// `None` until the Inbox and the Done list arrive.
+    list: Option<&'a Inbox>,
+    /// `list` is the Done list.
+    done: bool,
+    search: &'a Search,
+    states: &'a States,
+}
+
+impl<'a> OnScreen<'a> {
+    /// The list on screen of `inbox`: the Done list while `showing_done`, the Inbox otherwise.
+    fn new(
+        inbox: &'a InboxState,
+        showing_done: bool,
+        search: &'a Search,
+        states: &'a States,
+    ) -> Self {
+        let list = match inbox {
+            InboxState::Loaded(listing) if showing_done => Some(&listing.done),
+            InboxState::Loaded(listing) => Some(&listing.inbox),
+            InboxState::Loading | InboxState::Failed(_) => None,
+        };
+        Self {
+            list,
+            done: showing_done,
+            search,
+            states,
+        }
     }
-}
 
-/// The Notification at the cursor of `shown_view` narrowed by `search`; `None` until the Inbox has arrived, or if
-/// nothing is shown.
-fn at_cursor_in<'a>(
-    list: Option<&'a Inbox>,
-    shown_view: &'a ShownView,
-    search: &'a Search,
-    states: &'a States,
-) -> Option<&'a Notification> {
-    shown(list, &shown_view.view, search, states).nth(shown_view.cursor.selected()?)
-}
+    /// The Notifications `shown_view` shows, newest first: the ones its Filter and the Search match, only the
+    /// unread ones if it shows unread only.
+    fn shown(self, shown_view: &ShownView) -> impl Iterator<Item = &'a Notification> {
+        let unread_only = self.unread_only(shown_view);
+        self.matching(&shown_view.view, self.search)
+            .filter(move |n| n.unread || !unread_only)
+    }
 
-/// The Notifications of `list` (the Inbox, or the Done list) that `view` shows, narrowed by `search`, their
-/// Subjects' States as in `states`, newest first; none until the Inbox has arrived.
-fn shown<'a>(
-    list: Option<&'a Inbox>,
-    view: &'a View,
-    search: &'a Search,
-    states: &'a States,
-) -> impl Iterator<Item = &'a Notification> {
-    list.into_iter().flat_map(Inbox::iter).filter(|n| {
-        let state = states.get(n);
-        view.filter.matches(n, state) && search.matches(n, state)
-    })
+    /// The Notification at `shown_view`'s cursor; `None` if it shows none.
+    fn at_cursor(self, shown_view: &ShownView) -> Option<&'a Notification> {
+        self.shown(shown_view).nth(shown_view.cursor.selected()?)
+    }
+
+    /// Whether `shown_view` shows unread only: never in the Done list, which GitHub lists all read.
+    fn unread_only(self, shown_view: &ShownView) -> bool {
+        shown_view.unread_only && !self.done
+    }
+
+    /// The Notifications that `view`'s Filter and `search` match, newest first.
+    fn matching(self, view: &View, search: &Search) -> impl Iterator<Item = &'a Notification> {
+        self.list
+            .into_iter()
+            .flat_map(Inbox::iter)
+            .filter(move |n| {
+                let state = self.states.get(n);
+                view.filter.matches(n, state) && search.matches(n, state)
+            })
+    }
 }
 
 /// What decides how Notifications' rows look, besides the Notifications themselves.
@@ -1719,8 +1746,7 @@ mod tests {
         );
         assert_eq!(
             press(KeyCode::Char('u'), none),
-            None,
-            "GitHub can't mark unread"
+            Some(Command::ToggleUnreadOnly)
         );
         assert_eq!(
             press(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -1860,6 +1886,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn u_shows_only_the_unread_in_the_view_on_screen() {
+        let mut app = app();
+
+        assert!(app.press(key_named("u")).is_none());
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Add polling"]);
+        assert!(lines[3].contains(" ● unread only "), "{lines:#?}");
+
+        app.execute(Command::ShowView(2));
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Old news"], "each View has its own");
+        assert!(!lines[3].contains("unread only"), "{lines:#?}");
+
+        app.execute(Command::ShowView(0));
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"], "and keeps it");
+        app.press(key_named("u"));
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+    }
+
+    #[test]
+    fn unread_only_keeps_the_cursor_on_its_notification() {
+        let mut app = inbox_view_only();
+        let mut held = notifications();
+        let brand_new = Notification {
+            thread: ThreadId(4),
+            subject_title: "Brand new".to_owned(),
+            unread: false,
+            updated_at: held[0].updated_at + TimeDelta::minutes(1),
+            ..held[0].clone()
+        };
+        held.push(brand_new);
+        app.fetched(fetched(held));
+        app.execute(Command::Down);
+        assert_eq!(cursor_title(&app), Some("Add polling"));
+
+        app.press(key_named("u"));
+
+        assert_eq!(cursor_title(&app), Some("Add polling"));
+    }
+
+    #[test]
+    fn read_leaves_a_view_showing_unread_only() {
+        let mut app = app();
+        app.press(key_named("u"));
+
+        assert!(app.press(key_named("I")).is_some());
+        let lines = screen(&mut app);
+        assert!(
+            lines[1].contains("Nothing unread in this View."),
+            "{lines:#?}"
+        );
+
+        app.set_search("polling".to_owned());
+        let lines = screen(&mut app);
+        assert!(
+            lines[1].contains("Nothing unread in this View matches the search."),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn unread_only_is_for_the_inbox() {
+        let mut app = app();
+        app.fetched(fetched_with_done(notifications()));
+        app.press(key_named("u"));
+
+        app.press(key_named("D"));
+        let lines = screen(&mut app);
+        assert_eq!(row_titles(&lines), ["Gone quiet"], "the whole Done list");
+        assert!(!lines[3].contains("unread only"), "{lines:#?}");
+
+        app.press(key_named("u"));
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Unread only is for the Inbox, not the Done list"),
+            "{lines:#?}"
+        );
+
+        app.press(key_named("D"));
+        assert_eq!(
+            titles(&screen(&mut app)),
+            ["Add polling"],
+            "still on in the Inbox"
+        );
+    }
+
     /// The app with an Inbox of `count` Notifications, "Notification 0" newest, drawn on a screen with room for
     /// `rows` of them.
     fn app_with_many(count: u64, rows: u16) -> App {
@@ -1961,14 +2074,11 @@ mod tests {
 
         app.fetched(fetched(newer));
 
-        let inbox_view: Vec<&str> = shown(
-            on_screen(&app.inbox, app.showing_done),
-            &app.views[0].view,
-            &app.search,
-            &app.states,
-        )
-        .map(|n| n.subject_title.as_str())
-        .collect();
+        let inbox_view: Vec<&str> = app
+            .on_screen()
+            .shown(&app.views[0])
+            .map(|n| n.subject_title.as_str())
+            .collect();
         assert_eq!(inbox_view, ["Brand new", "Add polling", "Old news"]);
         assert_eq!(cursor_title(&app), Some("Old news"));
     }
@@ -2561,6 +2671,7 @@ mod tests {
         };
         for label in [
             "D",
+            "u",
             "Space",
             "A",
             "j",

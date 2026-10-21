@@ -70,6 +70,7 @@ _Avoid_: folder, bucket, tab, filter
 - A **Notification** can appear in zero, one or many configured **Views** (and always in the Inbox **View**); Views do not claim Notifications from each other
 - There is one **Selection** at a time, across **Views** like the **Search**: it can hold **Notifications** the **View** on screen doesn't show, and an action acts on all of them
 - There is at most one **Search** at a time, and it narrows whichever **View** is on screen, so it follows the user from **View** to **View**
+- Each **View** can be narrowed, for the moment, to its **Unread** **Notifications**, independently of the other **Views**; it doesn't narrow the **Done list**
 - **Unread** can only be cleared from ghd, never set again: GitHub's API has no way to mark a **Notification** unread
 
 ## Example dialogue
