@@ -131,6 +131,18 @@ pub struct Notification {
     pub unread: bool,
     /// When the Subject last had activity the user was notified about.
     pub updated_at: DateTime<Utc>,
+    /// Where GitHub's REST API has the Subject and its latest comment, for the Preview.
+    pub api_paths: ApiPaths,
+}
+
+/// Where GitHub's REST API has a Subject and the latest comment on it, as paths from the host
+/// (`/repos/wcgw/ghd/issues/7`, under `/api/v3` on GitHub Enterprise Server).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiPaths {
+    /// The Subject's; `None` when GitHub gives none.
+    pub subject: Option<String>,
+    /// The latest comment's, as GitHub points to it, which can be the Subject's own; `None` when it points to none.
+    pub latest_comment: Option<String>,
 }
 
 /// The kind of GitHub item a Notification is about.
@@ -305,6 +317,7 @@ mod tests {
             updated_at: format!("2026-10-21T{hour:02}:00:00Z")
                 .parse()
                 .expect("valid RFC 3339"),
+            api_paths: ApiPaths::default(),
         }
     }
 

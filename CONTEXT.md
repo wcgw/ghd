@@ -52,6 +52,10 @@ _Avoid_: marked, picked, cursor
 Text the user types, for the moment, to narrow the **View** on screen to the **Notifications** it matches; unlike a **Filter**, it matches parts of words and isn't kept anywhere.
 _Avoid_: filter, query, find
 
+**Preview**:
+What ghd shows of the **Subject** at the **Cursor** without opening it: a header (number, title, **State**, author, labels), then the latest comment GitHub points to, or else the **Subject**'s body. Showing it never clears **Unread** nor marks **Done**.
+_Avoid_: details, peek
+
 **View**:
 A named tab, defined in configuration, that shows the **Inbox** **Notifications** matching its **Filter**.
 _Avoid_: folder, bucket, tab, filter

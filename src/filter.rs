@@ -289,7 +289,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::inbox::{Reason, SubjectKind, ThreadId};
+    use crate::inbox::{ApiPaths, Reason, SubjectKind, ThreadId};
     use crate::state::SubjectState;
 
     /// An unread pull request in `repository`, there because of `reason`.
@@ -303,6 +303,7 @@ mod tests {
             reason,
             unread: true,
             updated_at: Utc::now(),
+            api_paths: ApiPaths::default(),
         }
     }
 

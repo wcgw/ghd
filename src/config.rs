@@ -163,7 +163,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::inbox::{Notification, Reason, SubjectKind, ThreadId};
+    use crate::inbox::{ApiPaths, Notification, Reason, SubjectKind, ThreadId};
 
     fn names(config: &Config) -> Vec<&str> {
         config.views.iter().map(|view| view.name.as_str()).collect()
@@ -253,6 +253,7 @@ mod tests {
             reason: Reason::ReviewRequested,
             unread: true,
             updated_at: Utc::now(),
+            api_paths: ApiPaths::default(),
         };
         let matching: Vec<bool> = config
             .views

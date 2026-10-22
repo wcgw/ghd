@@ -11,11 +11,13 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 http = "1.5.0"
 octocrab = { version = "0.54", default-features = false, features = ["default-client", "rustls", "rustls-ring", "follow-redirect", "retry"] }
 open = "5.4.4"
-ratatui = "0.30"
+pulldown-cmark = { version = "0.13", default-features = false }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "process", "time", "fs", "io-util"] }
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
+tui-markdown = { version = "0.3.12", default-features = false }
 
 [dev-dependencies]
 wiremock = "0.6.5"

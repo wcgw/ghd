@@ -124,6 +124,17 @@ theme! {
     help_keys = "help_keys",
     /// The help's heading over the search prompt's keys.
     help_heading = "help_heading",
+    /// Headings in a Preview's Markdown, and tables' header rows.
+    markdown_heading = "markdown.heading",
+    /// Code in a Preview's Markdown, inline and in blocks.
+    markdown_code = "markdown.code",
+    /// Links in a Preview's Markdown: their text, and where they go.
+    markdown_link = "markdown.link",
+    /// Quotes and alerts (`> [!NOTE]`) in a Preview's Markdown.
+    markdown_quote = "markdown.quote",
+    /// What lays out a Preview's Markdown: list markers, table borders, heading markers, images' descriptions,
+    /// footnotes.
+    markdown_muted = "markdown.muted",
 }
 
 impl Theme {

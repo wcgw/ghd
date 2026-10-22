@@ -84,7 +84,7 @@ mod tests {
     use chrono::TimeDelta;
 
     use super::*;
-    use crate::inbox::{Inbox, Reason, SubjectKind};
+    use crate::inbox::{ApiPaths, Inbox, Reason, SubjectKind};
 
     fn notification(thread: u64, updated_at: DateTime<Utc>) -> Notification {
         Notification {
@@ -96,6 +96,7 @@ mod tests {
             reason: Reason::Mention,
             unread: false,
             updated_at,
+            api_paths: ApiPaths::default(),
         }
     }
 

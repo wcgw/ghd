@@ -7,6 +7,8 @@ mod done;
 mod filter;
 mod github;
 mod inbox;
+mod markdown;
+mod preview;
 mod search;
 mod state;
 mod theme;

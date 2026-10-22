@@ -8,7 +8,8 @@ use std::time::Duration;
 use std::collections::HashMap;
 
 use anyhow::{Context as _, anyhow, bail};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
+use futures_util::future::OptionFuture;
 use http::header::{HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED};
 use http::{StatusCode, Uri};
 use octocrab::models::activity::Notification as ApiNotification;
@@ -16,8 +17,10 @@ use octocrab::secrecy::SecretString;
 use octocrab::{FromResponse as _, GitHubError, Octocrab, Page};
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
-use crate::inbox::{Listing, Notification, Reason, SubjectKind, ThreadId};
+use crate::inbox::{ApiPaths, Listing, Notification, Reason, SubjectKind, ThreadId};
+use crate::preview::{Body, Comment, Preview, Shown};
 use crate::state::SubjectState;
 
 /// github.com's hostname.
@@ -413,6 +416,107 @@ impl GitHub {
         Ok(found)
     }
 
+    /// The Preview `request` asks for: its Subject, with the latest comment if there's one, fetched at the same
+    /// time. Only reads: the Notification stays unread, and in the Inbox.
+    ///
+    /// # Errors
+    ///
+    /// Fails if GitHub can't be reached, or doesn't give the Subject or the comment.
+    ///
+    /// # Cancel Safety
+    ///
+    /// Cancel safe: it only reads.
+    pub async fn preview(&self, request: &PreviewRequest) -> anyhow::Result<Preview> {
+        let comment = OptionFuture::from(
+            request
+                .comment_path
+                .as_deref()
+                .map(|path| self.get::<ApiComment>(path)),
+        );
+        let (subject, comment) = tokio::join!(self.preview_subject(request), comment);
+        let mut preview = subject?;
+        if let Some(comment) = comment.transpose()? {
+            preview.shown = Shown::Comment(Comment {
+                author: comment.user.map(|user| user.login),
+                created_at: comment.created_at,
+                path: comment.path,
+                body: comment.body.unwrap_or_default(),
+            });
+        }
+        Ok(preview)
+    }
+
+    /// The Preview of `request`'s Subject alone, showing its body.
+    async fn preview_subject(&self, request: &PreviewRequest) -> anyhow::Result<Preview> {
+        let path = request.subject_path.as_str();
+        let labels = |labels: Vec<ApiLabel>| labels.into_iter().map(|label| label.name).collect();
+        Ok(match request.subject {
+            PreviewSubject::PullRequest => {
+                let pull: ApiPullRequest = self.get(path).await?;
+                Preview {
+                    reference: format!("#{}", pull.number),
+                    state: pull_request_state(&pull.state, pull.draft, pull.merged),
+                    title: pull.title,
+                    author: pull.user.map(|user| user.login),
+                    labels: labels(pull.labels),
+                    shown: Shown::Body(Body::Markdown(pull.body.unwrap_or_default())),
+                }
+            }
+            PreviewSubject::Issue => {
+                let issue: ApiIssue = self.get(path).await?;
+                Preview {
+                    reference: format!("#{}", issue.number),
+                    state: issue_state(&issue.state, issue.state_reason.as_deref()),
+                    title: issue.title,
+                    author: issue.user.map(|user| user.login),
+                    labels: labels(issue.labels),
+                    shown: Shown::Body(Body::Markdown(issue.body.unwrap_or_default())),
+                }
+            }
+            PreviewSubject::Release => {
+                let release: ApiRelease = self.get(path).await?;
+                Preview {
+                    title: release
+                        .name
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| release.tag_name.clone()),
+                    reference: release.tag_name,
+                    state: None,
+                    author: release.author.map(|user| user.login),
+                    labels: Vec::new(),
+                    shown: Shown::Body(Body::Markdown(release.body.unwrap_or_default())),
+                }
+            }
+            PreviewSubject::Commit => {
+                let commit: ApiCommit = self.get(path).await?;
+                Preview {
+                    reference: commit.sha.chars().take(7).collect(),
+                    title: commit
+                        .commit
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    state: None,
+                    author: commit.author.map(|user| user.login),
+                    labels: Vec::new(),
+                    shown: Shown::Body(Body::Plain(commit.commit.message)),
+                }
+            }
+        })
+    }
+
+    /// What the REST API has at `path`, from the host's root. Sent as a path rather than a whole URL: octocrab
+    /// only sends the token with a request to `api.github.com` or one without a host, which it then sends to the
+    /// API's host.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        self.client
+            .get(path, None::<&()>)
+            .await
+            .map_err(|error| self.explain(error))
+    }
+
     /// Puts `error` in the user's terms: what GitHub answered, or that it couldn't be reached, and what to do about
     /// it where there's something to do.
     fn explain(&self, error: octocrab::Error) -> anyhow::Error {
@@ -485,6 +589,13 @@ impl GitHub {
             reason: Reason::from_api(&api.reason),
             unread: api.unread,
             updated_at: api.updated_at,
+            api_paths: ApiPaths {
+                subject: api.subject.url.map(|url| url.path().to_owned()),
+                latest_comment: api
+                    .subject
+                    .latest_comment_url
+                    .map(|url| url.path().to_owned()),
+            },
         }
     }
 
@@ -492,17 +603,7 @@ impl GitHub {
     /// (`owner/name`) when there's no API URL, or it doesn't point at a page of its own (a release's API URL has
     /// its numeric id, but its page uses the tag).
     fn subject_page(&self, api_path: Option<&str>, repository: &str) -> String {
-        let segments: Vec<&str> = api_path
-            .unwrap_or_default()
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect();
-        // API paths are `repos/{owner}/{name}/…`, under `api/v3/` on GitHub Enterprise Server.
-        let below_repos = match segments.as_slice() {
-            ["repos", rest @ ..] | ["api", "v3", "repos", rest @ ..] => rest,
-            _ => &[],
-        };
-        let page = match below_repos {
+        let page = match below_repos(api_path.unwrap_or_default()).as_slice() {
             [owner, name, "pulls", number] => format!("{owner}/{name}/pull/{number}"),
             [owner, name, kind @ ("issues" | "discussions"), number] => {
                 format!("{owner}/{name}/{kind}/{number}")
@@ -513,6 +614,174 @@ impl GitHub {
         };
         format!("{}/{page}", self.web_root)
     }
+}
+
+/// The segments of a REST API path after `repos`, from the owner on (`["wcgw", "ghd", "issues", "7"]`); empty for
+/// a path that isn't below `repos`. API paths are `/repos/{owner}/{name}/…`, under `/api/v3` on GitHub Enterprise
+/// Server.
+fn below_repos(api_path: &str) -> Vec<&str> {
+    let segments: Vec<&str> = api_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        ["repos", rest @ ..] | ["api", "v3", "repos", rest @ ..] => rest.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// What to fetch for a Notification's Preview: its Subject, and the latest comment on it when GitHub points to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRequest {
+    subject: PreviewSubject,
+    /// The Subject's path in the REST API.
+    subject_path: String,
+    /// The latest comment's path in the REST API, if GitHub points to a comment.
+    comment_path: Option<String>,
+}
+
+/// The kinds of Subject the REST API can preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewSubject {
+    PullRequest,
+    Issue,
+    Release,
+    Commit,
+}
+
+impl PreviewRequest {
+    /// What to fetch for `notification`'s Preview; `None` when the REST API can't show its Subject: a Discussion, a
+    /// check suite, or a Subject GitHub gives no path for.
+    pub fn for_notification(notification: &Notification) -> Option<Self> {
+        let subject_path = notification.api_paths.subject.as_deref()?;
+        let subject = match below_repos(subject_path).as_slice() {
+            [_, _, "pulls", _] => PreviewSubject::PullRequest,
+            [_, _, "issues", _] => PreviewSubject::Issue,
+            [_, _, "releases", _] => PreviewSubject::Release,
+            [_, _, "commits", _] => PreviewSubject::Commit,
+            _ => return None,
+        };
+        // GitHub points to the Subject itself when there's no comment yet.
+        let comment_path = notification
+            .api_paths
+            .latest_comment
+            .clone()
+            .filter(|path| {
+                matches!(
+                    below_repos(path).as_slice(),
+                    [_, _, "issues" | "pulls", "comments", _]
+                        | [_, _, "comments", _]
+                        | [_, _, "pulls", _, "reviews", _]
+                )
+            });
+        Some(Self {
+            subject,
+            subject_path: subject_path.to_owned(),
+            comment_path,
+        })
+    }
+}
+
+/// A pull request's State, from its `state` as either API spells it (REST's `open` and `closed`, GraphQL's `OPEN`,
+/// `MERGED` and `CLOSED`), whether it's a draft, and whether it's merged; `None` for a state ghd doesn't know.
+fn pull_request_state(state: &str, draft: bool, merged: bool) -> Option<SubjectState> {
+    match state.to_ascii_lowercase().as_str() {
+        "open" if draft => Some(SubjectState::Draft),
+        "open" => Some(SubjectState::Open),
+        "merged" => Some(SubjectState::Merged),
+        "closed" if merged => Some(SubjectState::Merged),
+        "closed" => Some(SubjectState::Closed),
+        _ => None,
+    }
+}
+
+/// An issue's State, from its `state` and the reason it was closed, as either API spells them; `None` for a state
+/// ghd doesn't know.
+fn issue_state(state: &str, reason: Option<&str>) -> Option<SubjectState> {
+    let reason = reason.map(str::to_ascii_lowercase);
+    match (state.to_ascii_lowercase().as_str(), reason.as_deref()) {
+        ("open", _) => Some(SubjectState::Open),
+        // Closed as a duplicate shows as not planned, as on GitHub; with no reason, as completed.
+        ("closed", Some("not_planned" | "duplicate")) => Some(SubjectState::NotPlanned),
+        ("closed", _) => Some(SubjectState::Completed),
+        _ => None,
+    }
+}
+
+/// A GitHub account, as the REST API names it.
+#[derive(Deserialize)]
+struct ApiUser {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct ApiLabel {
+    name: String,
+}
+
+/// An issue, as the REST API describes it.
+#[derive(Deserialize)]
+struct ApiIssue {
+    number: u64,
+    title: String,
+    state: String,
+    state_reason: Option<String>,
+    user: Option<ApiUser>,
+    #[serde(default)]
+    labels: Vec<ApiLabel>,
+    body: Option<String>,
+}
+
+/// A pull request, as the REST API describes it.
+#[derive(Deserialize)]
+struct ApiPullRequest {
+    number: u64,
+    title: String,
+    state: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    merged: bool,
+    user: Option<ApiUser>,
+    #[serde(default)]
+    labels: Vec<ApiLabel>,
+    body: Option<String>,
+}
+
+/// A release, as the REST API describes it.
+#[derive(Deserialize)]
+struct ApiRelease {
+    tag_name: String,
+    name: Option<String>,
+    author: Option<ApiUser>,
+    body: Option<String>,
+}
+
+/// A commit, as the REST API describes it.
+#[derive(Deserialize)]
+struct ApiCommit {
+    sha: String,
+    /// The GitHub account of the commit's author; `None` when the author's email isn't one's.
+    author: Option<ApiUser>,
+    commit: ApiCommitDetails,
+}
+
+#[derive(Deserialize)]
+struct ApiCommitDetails {
+    message: String,
+}
+
+/// A comment on an issue, a pull request (its conversation or its changes) or a commit, or a pull request review,
+/// as the REST API describes it.
+#[derive(Deserialize)]
+struct ApiComment {
+    user: Option<ApiUser>,
+    body: Option<String>,
+    /// A review's is `submitted_at`.
+    #[serde(alias = "submitted_at")]
+    created_at: DateTime<Utc>,
+    /// The file, for a comment on a pull request's changes.
+    path: Option<String>,
 }
 
 /// Whether a thread GitHub lists seems to still be in the Inbox, not Done. The list has Done threads too, read, and
@@ -561,23 +830,12 @@ impl Resource {
     /// The Subject's State; `None` for a kind of Subject with none, or a state ghd doesn't know.
     fn state(&self) -> Option<SubjectState> {
         match self {
-            Self::PullRequest { state, is_draft } => match state.as_str() {
-                "OPEN" if *is_draft => Some(SubjectState::Draft),
-                "OPEN" => Some(SubjectState::Open),
-                "MERGED" => Some(SubjectState::Merged),
-                "CLOSED" => Some(SubjectState::Closed),
-                _ => None,
-            },
+            // GraphQL says `MERGED` rather than whether it's merged.
+            Self::PullRequest { state, is_draft } => pull_request_state(state, *is_draft, false),
             Self::Issue {
                 state,
                 state_reason,
-            } => match (state.as_str(), state_reason.as_deref()) {
-                ("OPEN", _) => Some(SubjectState::Open),
-                // Closed as a duplicate shows as not planned, as on GitHub; with no reason, as completed.
-                ("CLOSED", Some("NOT_PLANNED" | "DUPLICATE")) => Some(SubjectState::NotPlanned),
-                ("CLOSED", _) => Some(SubjectState::Completed),
-                _ => None,
-            },
+            } => issue_state(state, state_reason.as_deref()),
             Self::Other => None,
         }
     }
@@ -634,7 +892,7 @@ async fn borrow_token(account: &Account) -> anyhow::Result<SecretString> {
 mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
-    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
@@ -1227,6 +1485,309 @@ mod tests {
             .expect("the Inbox holds three Notifications");
         assert_eq!(newest.thread, ThreadId(3));
         assert_eq!(newest.subject_url, "https://github.com/wcgw/ghd/issues/3");
+        assert_eq!(
+            newest.api_paths,
+            ApiPaths {
+                subject: Some("/repos/wcgw/ghd/issues/3".to_owned()),
+                latest_comment: None,
+            }
+        );
+    }
+
+    /// A Notification whose Subject and latest comment the REST API has at `subject` and `latest_comment`.
+    fn notification_at(subject: Option<&str>, latest_comment: Option<&str>) -> Notification {
+        Notification {
+            thread: ThreadId(7),
+            subject_url: "https://github.com/wcgw/ghd/issues/7".to_owned(),
+            repository: "wcgw/ghd".to_owned(),
+            subject_kind: SubjectKind::Issue,
+            subject_title: "Subject 7".to_owned(),
+            reason: Reason::Mention,
+            unread: true,
+            updated_at: "2026-10-22T12:00:00Z".parse().expect("valid RFC 3339"),
+            api_paths: ApiPaths {
+                subject: subject.map(str::to_owned),
+                latest_comment: latest_comment.map(str::to_owned),
+            },
+        }
+    }
+
+    fn preview_request(subject: &str, latest_comment: Option<&str>) -> PreviewRequest {
+        PreviewRequest::for_notification(&notification_at(Some(subject), latest_comment))
+            .expect("a Subject the REST API previews")
+    }
+
+    #[test]
+    fn previews_are_of_subjects_the_rest_api_has() {
+        let previewable =
+            |subject| PreviewRequest::for_notification(&notification_at(subject, None)).is_some();
+        assert!(previewable(Some("/repos/wcgw/ghd/pulls/7")));
+        assert!(previewable(Some("/repos/wcgw/ghd/issues/7")));
+        assert!(previewable(Some("/repos/wcgw/ghd/releases/1")));
+        assert!(previewable(Some("/repos/wcgw/ghd/commits/0123abc")));
+        assert!(previewable(Some("/api/v3/repos/wcgw/ghd/issues/7")));
+        assert!(!previewable(Some("/repos/wcgw/ghd/discussions/7")));
+        assert!(!previewable(Some("/repos/wcgw/ghd/check-suites/1")));
+        assert!(!previewable(None));
+    }
+
+    #[test]
+    fn only_a_comment_is_fetched_as_the_latest_comment() {
+        let issue = "/repos/wcgw/ghd/issues/7";
+        for comment in [
+            "/repos/wcgw/ghd/issues/comments/70",
+            "/repos/wcgw/ghd/pulls/comments/71",
+            "/repos/wcgw/ghd/comments/72",
+            "/repos/wcgw/ghd/pulls/7/reviews/73",
+        ] {
+            assert_eq!(
+                preview_request(issue, Some(comment))
+                    .comment_path
+                    .as_deref(),
+                Some(comment)
+            );
+        }
+        assert_eq!(
+            preview_request(issue, Some(issue)).comment_path,
+            None,
+            "GitHub points to the Subject when there's no comment"
+        );
+        assert_eq!(preview_request(issue, None).comment_path, None);
+    }
+
+    /// Answers a GET of `at` with `body`, once, and only if it carries the token.
+    async fn serve(server: &MockServer, at: &str, body: Value) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn preview_shows_the_latest_comment_under_the_subject() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/issues/7",
+            json!({
+                "number": 7,
+                "title": "Add previews",
+                "state": "closed",
+                "state_reason": "not_planned",
+                "user": { "login": "octocat" },
+                "labels": [{ "name": "ui" }, { "name": "help wanted" }],
+                "body": "The description",
+            }),
+        )
+        .await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/issues/comments/70",
+            json!({
+                "user": { "login": "hubot" },
+                "body": "@alxs what do you think?",
+                "created_at": "2026-10-22T11:00:00Z",
+            }),
+        )
+        .await;
+
+        let preview = github_for(&server)
+            .await
+            .preview(&preview_request(
+                "/repos/wcgw/ghd/issues/7",
+                Some("/repos/wcgw/ghd/issues/comments/70"),
+            ))
+            .await
+            .expect("both are served");
+
+        assert_eq!(
+            preview,
+            Preview {
+                reference: "#7".to_owned(),
+                title: "Add previews".to_owned(),
+                state: Some(SubjectState::NotPlanned),
+                author: Some("octocat".to_owned()),
+                labels: vec!["ui".to_owned(), "help wanted".to_owned()],
+                shown: Shown::Comment(Comment {
+                    author: Some("hubot".to_owned()),
+                    created_at: "2026-10-22T11:00:00Z".parse().expect("valid RFC 3339"),
+                    path: None,
+                    body: "@alxs what do you think?".to_owned(),
+                }),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_without_a_comment_shows_the_body() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/pulls/8",
+            json!({
+                "number": 8,
+                "title": "Draft it",
+                "state": "open",
+                "draft": true,
+                "merged": false,
+                "user": null,
+                "labels": [],
+                "body": null,
+            }),
+        )
+        .await;
+
+        let preview = github_for(&server)
+            .await
+            .preview(&preview_request(
+                "/repos/wcgw/ghd/pulls/8",
+                Some("/repos/wcgw/ghd/pulls/8"),
+            ))
+            .await
+            .expect("served");
+
+        assert_eq!(preview.reference, "#8");
+        assert_eq!(preview.state, Some(SubjectState::Draft));
+        assert_eq!(preview.author, None, "a deleted account");
+        assert_eq!(preview.shown, Shown::Body(Body::Markdown(String::new())));
+    }
+
+    #[tokio::test]
+    async fn review_comment_names_its_file() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/pulls/8",
+            json!({ "number": 8, "title": "T", "state": "closed", "merged": true, "body": "" }),
+        )
+        .await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/pulls/comments/71",
+            json!({
+                "user": { "login": "hubot" },
+                "body": "Typo",
+                "created_at": "2026-10-22T11:00:00Z",
+                "path": "src/ui.rs",
+            }),
+        )
+        .await;
+
+        let preview = github_for(&server)
+            .await
+            .preview(&preview_request(
+                "/repos/wcgw/ghd/pulls/8",
+                Some("/repos/wcgw/ghd/pulls/comments/71"),
+            ))
+            .await
+            .expect("both are served");
+
+        assert_eq!(preview.state, Some(SubjectState::Merged));
+        let Shown::Comment(comment) = preview.shown else {
+            panic!("shows the comment, not {:?}", preview.shown);
+        };
+        assert_eq!(comment.path.as_deref(), Some("src/ui.rs"));
+    }
+
+    #[tokio::test]
+    async fn release_and_commit_previews_show_their_text() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/releases/1",
+            json!({
+                "tag_name": "v0.1.0",
+                "name": "First",
+                "author": { "login": "octocat" },
+                "body": "## Notes",
+            }),
+        )
+        .await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/commits/0123456789abcdef",
+            json!({
+                "sha": "0123456789abcdef",
+                "author": null,
+                "commit": { "message": "Fix the thing\n\nIt was broken." },
+            }),
+        )
+        .await;
+        let github = github_for(&server).await;
+
+        let release = github
+            .preview(&preview_request("/repos/wcgw/ghd/releases/1", None))
+            .await
+            .expect("served");
+        let commit = github
+            .preview(&preview_request(
+                "/repos/wcgw/ghd/commits/0123456789abcdef",
+                None,
+            ))
+            .await
+            .expect("served");
+
+        assert_eq!(
+            (release.reference.as_str(), release.title.as_str()),
+            ("v0.1.0", "First")
+        );
+        assert_eq!(
+            release.shown,
+            Shown::Body(Body::Markdown("## Notes".to_owned()))
+        );
+        assert_eq!(
+            (commit.reference.as_str(), commit.title.as_str()),
+            ("0123456", "Fix the thing")
+        );
+        assert_eq!(
+            commit.shown,
+            Shown::Body(Body::Plain("Fix the thing\n\nIt was broken.".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn enterprise_server_previews_stay_under_its_api() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/api/v3/repos/wcgw/ghd/issues/7",
+            json!({ "number": 7, "title": "T", "state": "open", "body": "B" }),
+        )
+        .await;
+        let github = GitHub::with_token(
+            "test-token".to_owned().into(),
+            &Account::default(),
+            &format!("{}/api/v3", server.uri()),
+        )
+        .expect("mock server address is valid");
+
+        let preview = github
+            .preview(&preview_request("/api/v3/repos/wcgw/ghd/issues/7", None))
+            .await;
+
+        assert_eq!(preview.expect("served").reference, "#7");
+    }
+
+    #[tokio::test]
+    async fn missing_subject_fails_the_preview() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })),
+            )
+            .mount(&server)
+            .await;
+
+        let error = github_for(&server)
+            .await
+            .preview(&preview_request("/repos/wcgw/ghd/issues/7", None))
+            .await
+            .expect_err("nothing to show");
+
+        assert!(format!("{error:#}").contains("404: Not Found"), "{error:#}");
     }
 
     #[tokio::test]

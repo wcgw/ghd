@@ -12,6 +12,12 @@ completion_current = { reversed = true }
 help_keys = { bold = true }
 help_heading = { dim = true }
 
+[styles.markdown]
+heading = { bold = true }
+link = { underlined = true }
+quote = { italic = true }
+muted = { dim = true }
+
 [styles.state]
 open = { fg = "green" }
 draft = { dim = true }

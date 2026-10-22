@@ -140,7 +140,7 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
 
     use super::*;
-    use crate::inbox::{Reason, SubjectKind};
+    use crate::inbox::{ApiPaths, Reason, SubjectKind};
 
     fn notification(thread: u64) -> Notification {
         Notification {
@@ -156,6 +156,7 @@ mod tests {
                 .parse::<DateTime<Utc>>()
                 .expect("valid RFC 3339")
                 - TimeDelta::hours(thread.try_into().expect("small thread ids")),
+            api_paths: ApiPaths::default(),
         }
     }
 

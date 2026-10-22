@@ -152,7 +152,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::inbox::{Reason, ThreadId};
+    use crate::inbox::{ApiPaths, Reason, ThreadId};
 
     /// "Add polling to the Inbox", an unread review request on a pull request in wcgw/ghd.
     fn notification() -> Notification {
@@ -165,6 +165,7 @@ mod tests {
             reason: Reason::ReviewRequested,
             unread: true,
             updated_at: Utc::now(),
+            api_paths: ApiPaths::default(),
         }
     }
 

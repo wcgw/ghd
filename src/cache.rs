@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::done::{DoneMark, DoneMarks};
 use crate::github::Account;
-use crate::inbox::{Listing, Notification, Reason, SubjectKind, ThreadId};
+use crate::inbox::{ApiPaths, Listing, Notification, Reason, SubjectKind, ThreadId};
 use crate::state::{Known, States, SubjectState};
 use crate::xdg;
 
@@ -155,6 +155,11 @@ struct CachedNotification {
     reason: String,
     unread: bool,
     updated_at: DateTime<Utc>,
+    /// Missing from files saved before ghd had Previews, as are the next.
+    #[serde(default)]
+    subject_api_path: Option<String>,
+    #[serde(default)]
+    latest_comment_api_path: Option<String>,
 }
 
 impl From<&Notification> for CachedNotification {
@@ -168,6 +173,8 @@ impl From<&Notification> for CachedNotification {
             reason: n.reason.api_name().to_owned(),
             unread: n.unread,
             updated_at: n.updated_at,
+            subject_api_path: n.api_paths.subject.clone(),
+            latest_comment_api_path: n.api_paths.latest_comment.clone(),
         }
     }
 }
@@ -183,6 +190,10 @@ impl From<CachedNotification> for Notification {
             reason: Reason::from_api(&n.reason),
             unread: n.unread,
             updated_at: n.updated_at,
+            api_paths: ApiPaths {
+                subject: n.subject_api_path,
+                latest_comment: n.latest_comment_api_path,
+            },
         }
     }
 }
@@ -313,6 +324,10 @@ mod tests {
                 updated_at: format!("2026-10-21T1{thread}:00:00Z")
                     .parse()
                     .expect("valid RFC 3339"),
+                api_paths: ApiPaths {
+                    subject: Some(format!("/repos/wcgw/ghd/pulls/{thread}")),
+                    latest_comment: Some(format!("/repos/wcgw/ghd/issues/comments/{thread}0")),
+                },
             };
         Snapshot {
             listing: Listing {

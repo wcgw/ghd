@@ -21,8 +21,10 @@ use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::done::DoneMarks;
-use crate::github::GitHub;
+use crate::github::{GitHub, PreviewRequest};
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
+use crate::markdown;
+use crate::preview::{self, Body, Preview, Previews, Shown};
 use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
 use crate::theme::Theme;
@@ -32,6 +34,13 @@ const MAX_REPOSITORY_WIDTH: u16 = 32;
 
 /// Longest that quitting waits for changes still on their way to GitHub.
 const QUIT_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the cursor stays on a Notification before its Preview is fetched, so that moving through the list
+/// fetches nothing.
+const PREVIEW_REST: Duration = Duration::from_millis(200);
+
+/// The fewest lines the screen needs for the Preview pane: a few rows of the list, and of the Preview.
+const PREVIEW_MIN_HEIGHT: u16 = 12;
 
 /// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`, naming Subject
 /// kinds with `kind_labels`. Meanwhile it
@@ -70,6 +79,9 @@ pub async fn run(
     let mut in_flight = FuturesUnordered::new();
     // The lookup of Subjects' States under way, if any; never more than one.
     let mut lookup = None;
+    // The fetch of a Preview under way, if any; never more than one. One the cursor has left still arrives, and is
+    // kept for when it comes back.
+    let mut preview_fetch = None;
 
     loop {
         if lookup.is_none() {
@@ -78,6 +90,15 @@ pub async fn run(
                 lookup = Some(Box::pin(look_up_states(github, wanted)));
             }
         }
+        let now = Instant::now();
+        app.note_cursor(now);
+        if preview_fetch.is_none()
+            && let Some(wanted) = app.preview_to_fetch(now)
+        {
+            preview_fetch = Some(Box::pin(fetch_preview(github, wanted)));
+        }
+        // When to wake up to fetch the Preview at the cursor, once it's stayed there.
+        let preview_due = app.preview_due().map(|(due, _)| due);
         let fetching = fetch.is_some() || lookup.is_some();
         terminal
             .draw(|frame| app.render(frame, fetching))
@@ -96,6 +117,13 @@ pub async fn run(
             () = tokio::time::sleep_until(next_poll), if fetch.is_none() => {
                 fetch = Some(Box::pin(fetch_inbox(github, Fetch::IfChanged)));
             }
+            Some(fetched) = OptionFuture::from(preview_fetch.as_mut()), if preview_fetch.is_some() => {
+                preview_fetch = None;
+                app.preview_fetched(fetched);
+            }
+            // Nothing to do but go round again, to fetch it.
+            () = tokio::time::sleep_until(preview_due.unwrap_or(now)),
+                if preview_fetch.is_none() && preview_due.is_some() => {}
             Some(reply) = in_flight.next(), if !in_flight.is_empty() => app.settle(reply),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match app.press(key) {
@@ -219,6 +247,34 @@ async fn look_up_states(github: &GitHub, asked: Vec<Lookup>) -> LookedUp {
     LookedUp { asked, found }
 }
 
+/// A Preview to fetch, for the activity its Notification has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WantedPreview {
+    thread: ThreadId,
+    as_of: DateTime<Utc>,
+    request: PreviewRequest,
+}
+
+/// The outcome of fetching a Preview, for the thread and activity it was asked for.
+struct PreviewFetched {
+    thread: ThreadId,
+    as_of: DateTime<Utc>,
+    preview: anyhow::Result<Preview>,
+}
+
+/// Fetches the Preview `wanted` from `github`.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::preview`] is.
+async fn fetch_preview(github: &GitHub, wanted: WantedPreview) -> PreviewFetched {
+    PreviewFetched {
+        preview: github.preview(&wanted.request).await,
+        thread: wanted.thread,
+        as_of: wanted.as_of,
+    }
+}
+
 /// What a key press can ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -252,12 +308,18 @@ enum Command {
     ToggleDone,
     /// Shows only the unread Notifications in the View on screen, or all of them again.
     ToggleUnreadOnly,
+    /// Opens the Preview of the Notification at the cursor below the list, or closes it.
+    TogglePreview,
+    /// Scrolls the Preview down by half its height.
+    ScrollPreviewDown,
+    /// Scrolls the Preview up by half its height.
+    ScrollPreviewUp,
     Help,
 }
 
 /// The help's lines for commands, in order, each with the commands its keys stand for. Adding a command means adding
 /// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
-const COMMAND_HELP: [(&[Command], KeyHelp); 16] = [
+const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     (
         &[Command::Down, Command::Up],
         KeyHelp {
@@ -333,6 +395,17 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 16] = [
         KeyHelp {
             keys: "u",
             does: "show unread only, or all again",
+        },
+    ),
+    (
+        &[
+            Command::TogglePreview,
+            Command::ScrollPreviewDown,
+            Command::ScrollPreviewUp,
+        ],
+        KeyHelp {
+            keys: "p  J  K",
+            does: "show or hide the Preview; scroll it",
         },
     ),
     (
@@ -422,6 +495,9 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('e') => Some(Command::MarkDone),
         KeyCode::Char('D') => Some(Command::ToggleDone),
         KeyCode::Char('u') => Some(Command::ToggleUnreadOnly),
+        KeyCode::Char('p') => Some(Command::TogglePreview),
+        KeyCode::Char('J') => Some(Command::ScrollPreviewDown),
+        KeyCode::Char('K') => Some(Command::ScrollPreviewUp),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
@@ -495,6 +571,33 @@ struct App {
     showing_done: bool,
     /// An Inbox arrived since Subjects' States were last looked up: the ones it changed want looking up.
     states_wanted: bool,
+    /// The Preview pane below the list, while it's open.
+    preview: Option<PreviewPane>,
+    /// The Previews fetched so far.
+    previews: Previews,
+    /// How many lines the screen had at the last draw.
+    screen_height: u16,
+}
+
+/// The Preview pane, and where it's at.
+#[derive(Debug, Default)]
+struct PreviewPane {
+    /// The thread at the cursor, and since when: its Preview is fetched once the cursor has stayed on it for
+    /// [`PREVIEW_REST`].
+    at: Option<(ThreadId, Instant)>,
+    /// How many lines the Preview is scrolled down.
+    scroll: u16,
+    /// How many lines the pane had room for at the last draw.
+    rows: u16,
+    /// How many lines the Preview took at the last draw, wrapped to the pane's width.
+    lines: u16,
+}
+
+impl PreviewPane {
+    /// The furthest the Preview can be scrolled: until its last line is at the bottom of the pane.
+    fn max_scroll(&self) -> u16 {
+        self.lines.saturating_sub(self.rows)
+    }
 }
 
 /// The prompt the user types a Search into.
@@ -558,6 +661,9 @@ impl App {
             states_wanted: false,
             marks: DoneMarks::default(),
             showing_done: false,
+            preview: None,
+            previews: Previews::default(),
+            screen_height: 0,
         }
     }
 
@@ -596,6 +702,7 @@ impl App {
     fn replace_listing(&mut self, listing: Listing) {
         self.selection.retain(|&thread| listing.contains(thread));
         self.states.retain_in(&listing);
+        self.previews.retain_in(&listing);
         self.states_wanted = true;
         self.keeping_cursors(|app| app.inbox = InboxState::Loaded(listing));
     }
@@ -709,6 +816,59 @@ impl App {
         }
     }
 
+    /// Notes where the cursor is `now`, while the Preview is open. When it's moved to another Notification, the
+    /// Preview shows that one from its top, once fetched; one that failed to be fetched is tried again.
+    fn note_cursor(&mut self, now: Instant) {
+        let thread = self.at_cursor().map(|n| n.thread);
+        let Some(pane) = &mut self.preview else {
+            return;
+        };
+        if pane.at.map(|(at, _)| at) == thread {
+            return;
+        }
+        pane.at = thread.map(|thread| (thread, now));
+        pane.scroll = 0;
+        if let Some(thread) = thread {
+            self.previews.forget_failed(thread);
+        }
+    }
+
+    /// The Preview there is to fetch, and when: once the cursor has stayed on its Notification for
+    /// [`PREVIEW_REST`]. `None` while the Preview is closed, or the one at the cursor is fetched, being fetched, or
+    /// can't be.
+    fn preview_due(&self) -> Option<(Instant, WantedPreview)> {
+        let (thread, since) = self.preview.as_ref()?.at?;
+        let notification = self.at_cursor().filter(|n| n.thread == thread)?;
+        if self.previews.get(notification).is_some() {
+            return None;
+        }
+        let request = PreviewRequest::for_notification(notification)?;
+        Some((
+            since + PREVIEW_REST,
+            WantedPreview {
+                thread,
+                as_of: notification.updated_at,
+                request,
+            },
+        ))
+    }
+
+    /// The Preview to fetch `now`, if one is due, noted as being fetched.
+    fn preview_to_fetch(&mut self, now: Instant) -> Option<WantedPreview> {
+        let (due, wanted) = self.preview_due()?;
+        if due > now {
+            return None;
+        }
+        self.previews.fetching(wanted.thread, wanted.as_of);
+        Some(wanted)
+    }
+
+    /// Takes in a fetched Preview, or why it couldn't be fetched.
+    fn preview_fetched(&mut self, fetched: PreviewFetched) {
+        self.previews
+            .fetched(fetched.thread, fetched.as_of, fetched.preview);
+    }
+
     /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives, with the View that was on screen and
     /// each View's cursor as they were, where they still can be.
     fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
@@ -802,7 +962,15 @@ impl App {
         }
         match command_for(key)? {
             Command::Quit => Some(Outcome::Quit),
-            Command::Refresh => Some(Outcome::Refresh),
+            Command::Refresh => {
+                // The Preview on screen too: what it shows can change without notifying, like labels.
+                if self.preview.is_some()
+                    && let Some(thread) = self.at_cursor().map(|n| n.thread)
+                {
+                    self.previews.forget(thread);
+                }
+                Some(Outcome::Refresh)
+            }
             command => {
                 let changes = self.execute(command);
                 (!changes.is_empty()).then_some(Outcome::Send(changes))
@@ -885,6 +1053,24 @@ impl App {
                 let shown_view = &mut app.views[app.current];
                 shown_view.unread_only = !shown_view.unread_only;
             }),
+            Command::TogglePreview if self.preview.is_some() => self.preview = None,
+            Command::TogglePreview if self.screen_height < PREVIEW_MIN_HEIGHT => {
+                self.status = Some(StatusMessage::Info(format!(
+                    "The Preview needs a terminal at least {PREVIEW_MIN_HEIGHT} lines tall"
+                )));
+            }
+            Command::TogglePreview => self.preview = Some(PreviewPane::default()),
+            Command::ScrollPreviewDown => {
+                if let Some(pane) = &mut self.preview {
+                    let half = (pane.rows / 2).max(1);
+                    pane.scroll = pane.scroll.saturating_add(half).min(pane.max_scroll());
+                }
+            }
+            Command::ScrollPreviewUp => {
+                if let Some(pane) = &mut self.preview {
+                    pane.scroll = pane.scroll.saturating_sub((pane.rows / 2).max(1));
+                }
+            }
             Command::Open => return self.open(),
             Command::MarkRead => {
                 let targets = self.take_targets();
@@ -1098,10 +1284,20 @@ impl App {
     fn render(&mut self, frame: &mut Frame, fetching: bool) {
         // The theme's text style, background included, under everything else.
         frame.render_widget(Block::new().style(self.theme.text), frame.area());
+        self.screen_height = frame.area().height;
         let [view_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
-        self.render_view(frame, view_area, fetching);
+        // On a terminal made too short while it's open, the Preview waits for it to grow again.
+        if self.preview.is_some() && self.screen_height >= PREVIEW_MIN_HEIGHT {
+            let [list_area, preview_area] =
+                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(view_area);
+            self.render_view(frame, list_area, fetching);
+            self.render_preview(frame, preview_area);
+        } else {
+            self.render_view(frame, view_area, fetching);
+        }
         if self.help_shown {
             render_help(frame, &self.theme);
         }
@@ -1190,6 +1386,74 @@ impl App {
         frame.render_widget(message.block(block), area);
     }
 
+    /// Draws the Preview of the Notification at the cursor in `area`, as far down as it's scrolled.
+    fn render_preview(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme;
+        // Inside the border.
+        let width = area.width.saturating_sub(2);
+        let paragraph =
+            Paragraph::new(self.preview_lines(Utc::now(), width)).wrap(Wrap { trim: false });
+        let Some(pane) = &mut self.preview else {
+            return;
+        };
+        pane.rows = area.height.saturating_sub(2);
+        pane.lines = u16::try_from(paragraph.line_count(width)).unwrap_or(u16::MAX);
+        // A shorter Preview, or a taller pane, than at the last scroll.
+        pane.scroll = pane.scroll.min(pane.max_scroll());
+        let block = Block::bordered()
+            .border_style(theme.border)
+            .title(Line::styled(" Preview ", theme.tab));
+        frame.render_widget(paragraph.scroll((pane.scroll, 0)).block(block), area);
+    }
+
+    /// What the Preview pane shows of the Notification at the cursor, as of `now`, `width` cells wide: its Preview
+    /// once fetched, and until then, or when there's none to fetch, what the Notification itself says.
+    fn preview_lines(&self, now: DateTime<Utc>, width: u16) -> Vec<Line<'static>> {
+        let theme = &self.theme;
+        let Some(notification) = self.at_cursor() else {
+            return vec![Line::styled("Nothing to preview.", theme.message)];
+        };
+        let (says, style) = match (
+            PreviewRequest::for_notification(notification),
+            self.previews.get(notification),
+        ) {
+            (None, _) => (
+                "No Preview for this kind of Notification yet: o opens it.".to_owned(),
+                theme.message,
+            ),
+            (Some(_), Some(preview::Fetched::Done(preview))) => {
+                return preview_lines(preview, &notification.repository, theme, now, width);
+            }
+            (Some(_), Some(preview::Fetched::Failed(why))) => {
+                (format!("Couldn't fetch the Preview: {why}"), theme.error)
+            }
+            (Some(_), None | Some(preview::Fetched::Fetching)) => {
+                ("Fetching…".to_owned(), theme.message)
+            }
+        };
+        let mut lines = vec![
+            Line::styled(notification.subject_title.clone(), theme.title.bold()),
+            separated(
+                [
+                    Some(Span::styled(
+                        notification.repository.clone(),
+                        theme.repository,
+                    )),
+                    self.states
+                        .get(notification)
+                        .map(|state| state_span(state, theme)),
+                    Some(Span::styled(notification.reason.to_string(), theme.reason)),
+                    Some(Span::styled(age(notification.updated_at, now), theme.age)),
+                ]
+                .into_iter()
+                .flatten(),
+            ),
+            Line::default(),
+        ];
+        lines.push(Line::styled(says, style));
+        lines
+    }
+
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         if let Some(prompt) = &self.search_prompt {
             let typed = format!("/{}", self.search_input);
@@ -1265,6 +1529,87 @@ impl App {
     }
 }
 
+/// The lines of `preview`, of a Subject in `repository`, as of `now`, `width` cells wide: its header, then the
+/// latest comment or the Subject's body.
+fn preview_lines(
+    preview: &Preview,
+    repository: &str,
+    theme: &Theme,
+    now: DateTime<Utc>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let labels =
+        (!preview.labels.is_empty()).then(|| Span::styled(preview.labels.join(", "), theme.reason));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", preview.reference), theme.age),
+            Span::styled(preview.title.clone(), theme.title.bold()),
+        ]),
+        separated(
+            [
+                Some(Span::styled(repository.to_owned(), theme.repository)),
+                preview.state.map(|state| state_span(state, theme)),
+                preview
+                    .author
+                    .as_ref()
+                    .map(|author| Span::raw(format!("@{author}"))),
+                labels,
+            ]
+            .into_iter()
+            .flatten(),
+        ),
+        Line::default(),
+    ];
+    match &preview.shown {
+        Shown::Comment(comment) => {
+            let who = comment
+                .author
+                .as_ref()
+                .map_or_else(|| "Someone".to_owned(), |author| format!("@{author}"));
+            let when = match age(comment.created_at, now).as_str() {
+                "now" => "just now".to_owned(),
+                age => format!("{age} ago"),
+            };
+            let on = comment
+                .path
+                .as_ref()
+                .map(|path| format!(" on {path}"))
+                .unwrap_or_default();
+            lines.push(Line::styled(
+                format!("{who} commented{on} {when}"),
+                theme.age,
+            ));
+            lines.push(Line::default());
+            lines.extend(markdown::lines(&comment.body, theme, width));
+        }
+        Shown::Body(Body::Markdown(body) | Body::Plain(body)) if body.trim().is_empty() => {
+            lines.push(Line::styled("No description.", theme.message));
+        }
+        Shown::Body(Body::Markdown(body)) => lines.extend(markdown::lines(body, theme, width)),
+        Shown::Body(Body::Plain(body)) => {
+            lines.extend(body.lines().map(|line| Line::raw(line.to_owned())));
+        }
+    }
+    lines
+}
+
+/// `state`'s name, in its color in `theme`.
+fn state_span(state: SubjectState, theme: &Theme) -> Span<'static> {
+    Span::styled(state.name().replace('_', " "), theme.state(state))
+}
+
+/// One line of `spans`, with ` · ` between them.
+fn separated(spans: impl IntoIterator<Item = Span<'static>>) -> Line<'static> {
+    let mut line = Line::default();
+    for (index, span) in spans.into_iter().enumerate() {
+        if index > 0 {
+            line.push_span(Span::raw(" · "));
+        }
+        line.push_span(span);
+    }
+    line
+}
+
 /// Draws the help over the middle of `frame` in `theme`: every command's keys and what it does.
 fn render_help(frame: &mut Frame, theme: &Theme) {
     let keys_width = COMMAND_HELP
@@ -1281,8 +1626,8 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
         ])
     };
     let mut lines: Vec<Line> = COMMAND_HELP.iter().map(|(_, help)| line(help)).collect();
+    // No blank line before these: with it, the help wouldn't fit a 24-line terminal.
     lines.extend([
-        Line::default(),
         Line::styled(SELECTION_HELP, theme.help_heading),
         Line::styled("In the search prompt:", theme.help_heading),
     ]);
@@ -1534,7 +1879,7 @@ mod tests {
 
     use super::*;
     use crate::filter::Filter;
-    use crate::inbox::{Reason, ThreadId};
+    use crate::inbox::{ApiPaths, Reason, ThreadId};
     use crate::state::Known;
 
     #[test]
@@ -1575,6 +1920,7 @@ mod tests {
                 reason: Reason::ReviewRequested,
                 unread: true,
                 updated_at: Utc::now(),
+                api_paths: ApiPaths::default(),
             },
             Notification {
                 thread: ThreadId(2),
@@ -1585,6 +1931,7 @@ mod tests {
                 reason: Reason::Subscribed,
                 unread: false,
                 updated_at: Utc::now() - TimeDelta::days(2),
+                api_paths: ApiPaths::default(),
             },
         ]
     }
@@ -1749,6 +2096,18 @@ mod tests {
             Some(Command::ToggleUnreadOnly)
         );
         assert_eq!(
+            press(KeyCode::Char('p'), none),
+            Some(Command::TogglePreview)
+        );
+        assert_eq!(
+            press(KeyCode::Char('J'), KeyModifiers::SHIFT),
+            Some(Command::ScrollPreviewDown)
+        );
+        assert_eq!(
+            press(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            Some(Command::ScrollPreviewUp)
+        );
+        assert_eq!(
             press(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(Command::Quit)
         );
@@ -1884,6 +2243,309 @@ mod tests {
             ["Add polling"],
             "no ninth View: stays put"
         );
+    }
+
+    /// [`notifications`], with the REST API paths of their Subjects: each an issue numbered as its thread.
+    fn previewable(notifications: Vec<Notification>) -> Vec<Notification> {
+        notifications
+            .into_iter()
+            .map(|n| Notification {
+                api_paths: ApiPaths {
+                    subject: Some(format!("/repos/{}/issues/{}", n.repository, n.thread.0)),
+                    latest_comment: None,
+                },
+                ..n
+            })
+            .collect()
+    }
+
+    /// The lines `app` draws on a screen `height` lines tall.
+    fn screen_of(app: &mut App, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, height))
+            .expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(SCREEN_WIDTH.into())
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    /// Height of the screen the Preview tests draw on.
+    const PREVIEW_SCREEN_HEIGHT: u16 = 20;
+
+    /// [`app`], its Notifications previewable, drawn on a screen tall enough for the Preview, and the Preview open
+    /// with the cursor on "Add polling" since the moment returned.
+    fn app_previewing() -> (App, Instant) {
+        let mut app = app();
+        app.fetched(fetched(previewable(notifications())));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("p"));
+        let since = Instant::now();
+        app.note_cursor(since);
+        (app, since)
+    }
+
+    /// The Preview of "Add polling", showing `shown`.
+    fn add_polling_preview(shown: Shown) -> Preview {
+        Preview {
+            reference: "#1".to_owned(),
+            title: "Add polling".to_owned(),
+            state: Some(SubjectState::Open),
+            author: Some("octocat".to_owned()),
+            labels: vec!["ui".to_owned()],
+            shown,
+        }
+    }
+
+    /// Fetches the Preview due at `now`, with `preview` as its outcome.
+    fn fetch_preview_at(app: &mut App, now: Instant, preview: anyhow::Result<Preview>) {
+        let wanted = app.preview_to_fetch(now).expect("a Preview is due");
+        app.preview_fetched(PreviewFetched {
+            thread: wanted.thread,
+            as_of: wanted.as_of,
+            preview,
+        });
+    }
+
+    fn shows(lines: &[String], text: &str) -> bool {
+        lines.iter().any(|line| line.contains(text))
+    }
+
+    #[test]
+    fn p_opens_the_preview_below_the_list() {
+        let (mut app, since) = app_previewing();
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let pane_top = lines
+            .iter()
+            .position(|line| line.contains(" Preview "))
+            .expect("the Preview is open");
+        assert!(
+            (8..=10).contains(&pane_top),
+            "in the bottom half: {lines:#?}"
+        );
+        assert!(shows(&lines, "Fetching…"), "{lines:#?}");
+        assert!(
+            shows(&lines, "wcgw/ghd · review-requested · now"),
+            "{lines:#?}"
+        );
+
+        let body = Shown::Body(Body::Markdown("Polls the Inbox.".to_owned()));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(body)),
+        );
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "#1 Add polling"), "{lines:#?}");
+        assert!(
+            shows(&lines, "wcgw/ghd · open · @octocat · ui"),
+            "{lines:#?}"
+        );
+        assert!(shows(&lines, "Polls the Inbox."), "{lines:#?}");
+
+        app.press(key_named("p"));
+        assert!(!shows(
+            &screen_of(&mut app, PREVIEW_SCREEN_HEIGHT),
+            " Preview "
+        ));
+    }
+
+    #[test]
+    fn preview_waits_for_the_cursor_to_stay() {
+        let (mut app, since) = app_previewing();
+        let moved = since + PREVIEW_REST / 2;
+
+        assert!(app.preview_to_fetch(moved).is_none(), "not yet");
+        app.execute(Command::Down);
+        app.note_cursor(moved);
+        assert!(
+            app.preview_to_fetch(since + PREVIEW_REST).is_none(),
+            "the cursor moved on"
+        );
+
+        let wanted = app
+            .preview_to_fetch(moved + PREVIEW_REST)
+            .expect("the cursor stayed");
+        assert_eq!(wanted.thread, ThreadId(2));
+        assert!(app.preview_due().is_none(), "being fetched");
+    }
+
+    #[test]
+    fn closed_preview_fetches_nothing() {
+        let mut app = app();
+        app.fetched(fetched(previewable(notifications())));
+        let now = Instant::now();
+
+        app.note_cursor(now);
+
+        assert!(app.preview_due().is_none());
+        assert!(app.preview_to_fetch(now + PREVIEW_REST).is_none());
+    }
+
+    #[test]
+    fn newer_activity_fetches_the_preview_again() {
+        let (mut app, since) = app_previewing();
+        let body = Shown::Body(Body::Markdown(String::new()));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(body)),
+        );
+        assert!(app.preview_due().is_none(), "fetched");
+
+        let mut newer = previewable(notifications());
+        newer[0].updated_at += TimeDelta::minutes(5);
+        app.fetched(fetched(newer));
+
+        assert!(app.preview_due().is_some());
+    }
+
+    #[test]
+    fn failed_preview_is_tried_again_when_the_cursor_comes_back() {
+        let (mut app, since) = app_previewing();
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Err(anyhow!("timed out")));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            shows(&lines, "Couldn't fetch the Preview: timed out"),
+            "{lines:#?}"
+        );
+        assert!(app.preview_due().is_none(), "not again and again");
+
+        let back = since + PREVIEW_REST * 2;
+        app.execute(Command::Down);
+        app.note_cursor(back);
+        app.execute(Command::Up);
+        app.note_cursor(back);
+
+        assert_eq!(
+            app.preview_due().map(|(due, wanted)| (due, wanted.thread)),
+            Some((back + PREVIEW_REST, ThreadId(1)))
+        );
+    }
+
+    #[test]
+    fn r_fetches_the_preview_on_screen_again() {
+        let (mut app, since) = app_previewing();
+        let body = Shown::Body(Body::Markdown(String::new()));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(body)),
+        );
+
+        assert!(matches!(app.press(key_named("r")), Some(Outcome::Refresh)));
+
+        assert!(app.preview_due().is_some());
+    }
+
+    #[test]
+    fn shift_j_and_k_scroll_the_preview_half_its_height() {
+        let (mut app, since) = app_previewing();
+        let body: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+        let shown = Shown::Body(Body::Markdown(body.join("\n")));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(shown)),
+        );
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let pane = |app: &App| {
+            let pane = app.preview.as_ref().expect("open");
+            (pane.scroll, pane.rows, pane.lines)
+        };
+        let (_, rows, lines) = pane(&app);
+        // The header's three lines, then the body's forty.
+        assert_eq!(lines, 43);
+
+        app.press(key_named("J"));
+        assert_eq!(pane(&app).0, rows / 2);
+        let screen = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let pane_top = screen
+            .iter()
+            .position(|line| line.contains(" Preview "))
+            .expect("open");
+        assert!(
+            screen[pane_top + 1].contains(&format!("Line {}", rows / 2 - 3)),
+            "{screen:#?}"
+        );
+
+        for _ in 0..20 {
+            app.press(key_named("J"));
+        }
+        assert_eq!(pane(&app).0, lines - rows, "no further than the last line");
+        app.press(key_named("K"));
+        assert_eq!(pane(&app).0, lines - rows - rows / 2);
+
+        app.execute(Command::Down);
+        app.note_cursor(since);
+        assert_eq!(pane(&app).0, 0, "the next Notification's from its top");
+    }
+
+    #[test]
+    fn comment_shows_who_wrote_it_and_where() {
+        let (mut app, since) = app_previewing();
+        let comment = Shown::Comment(crate::preview::Comment {
+            author: Some("hubot".to_owned()),
+            created_at: Utc::now() - TimeDelta::hours(2),
+            path: Some("src/ui.rs".to_owned()),
+            body: "Typo here".to_owned(),
+        });
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(comment)),
+        );
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert!(
+            shows(&lines, "@hubot commented on src/ui.rs 2h ago"),
+            "{lines:#?}"
+        );
+        assert!(shows(&lines, "Typo here"), "{lines:#?}");
+    }
+
+    #[test]
+    fn too_short_a_terminal_keeps_the_preview_closed() {
+        let mut app = app();
+        screen_of(&mut app, PREVIEW_MIN_HEIGHT - 1);
+
+        app.press(key_named("p"));
+
+        assert!(app.preview.is_none());
+        let lines = screen_of(&mut app, PREVIEW_MIN_HEIGHT - 1);
+        assert!(
+            shows(
+                &lines,
+                "The Preview needs a terminal at least 12 lines tall"
+            ),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn kinds_without_a_preview_say_so() {
+        let mut app = app();
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("p"));
+        app.note_cursor(Instant::now());
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert!(
+            shows(
+                &lines,
+                "No Preview for this kind of Notification yet: o opens it."
+            ),
+            "{lines:#?}"
+        );
+        assert!(app.preview_due().is_none());
     }
 
     #[test]
@@ -2672,6 +3334,9 @@ mod tests {
         for label in [
             "D",
             "u",
+            "p",
+            "J",
+            "K",
             "Space",
             "A",
             "j",
