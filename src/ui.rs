@@ -1615,8 +1615,9 @@ impl App {
             let heat = self.heat().to_vec();
             let theme = self.theme;
             if tall_enough {
+                // The file is what's read: a quarter is plenty for the list.
                 let [list_area, file_area] =
-                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    Layout::vertical([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
                         .areas(view_area);
                 self.files.render_list(frame, list_area, &theme);
                 self.files
@@ -3447,7 +3448,8 @@ mod tests {
     fn f_shows_a_pull_requests_files_and_a_new_one_whole() {
         let mut app = app_with_files(changed_files());
 
-        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        // Tall enough for the four files, in the list's quarter of it.
+        let lines = screen_of(&mut app, 24);
 
         assert!(
             shows(&lines, "#1 Add polling · 4 files · +9 \u{2212}7"),
@@ -3550,6 +3552,137 @@ mod tests {
             Color::Magenta,
             "whole, highlighted apart from its diff"
         );
+    }
+
+    #[test]
+    fn whole_files_show_what_changed_in_their_gutter() {
+        let modified = changed(
+            "src/ui.rs",
+            FileStatus::Modified,
+            Some("@@ -1,5 +1,4 @@\n-first\n fn a() {}\n-old\n+new\n+added\n kept\n-gone"),
+        );
+        let mut app = app_with_files(vec![modified]);
+        app.theme = Theme {
+            diff_added: Style::new().fg(Color::Green),
+            diff_removed: Style::new().fg(Color::Red),
+            diff_changed: Style::new().fg(Color::Yellow),
+            ..Theme::default()
+        };
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn a() {}\nnew\nadded\nkept\n".to_owned())),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        for line in [
+            "│\u{2594} fn a() {}",
+            "│\u{258e} new",
+            "│\u{258e} added",
+            "│\u{2581} kept",
+        ] {
+            assert!(shows(&lines, line), "{line:?} in {lines:#?}");
+        }
+        assert_eq!(cell_of(&mut app, "\u{2594} fn").fg, Color::Red);
+        assert_eq!(cell_of(&mut app, "\u{258e} new").fg, Color::Yellow);
+        assert_eq!(cell_of(&mut app, "\u{258e} added").fg, Color::Green);
+        assert_eq!(cell_of(&mut app, "\u{2581} kept").fg, Color::Red);
+    }
+
+    #[test]
+    fn markdown_shown_whole_shows_what_changed_in_its_gutter() {
+        // "Gone." is removed below a blank line, which isn't drawn.
+        let patch = "@@ -1,7 +1,6 @@\n # Guide\n \n-Old words.\n+New words.\n \n Kept.\n \n-Gone.";
+        let table = format!("| {} |\n|---|\n| cell |\n", "wide ".repeat(30));
+        let mut app = app_with_files(vec![changed(
+            "docs/guide.md",
+            FileStatus::Modified,
+            Some(patch),
+        )]);
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of(format!(
+                "# Guide\n\nNew words.\n\nKept.\n\n{table}"
+            ))),
+        });
+
+        let lines = screen_of(&mut app, 30);
+
+        for line in ["│  # Guide", "│\u{258e} New words.", "│\u{2581} Kept."] {
+            assert!(shows(&lines, line), "{line:?} in {lines:#?}");
+        }
+        assert!(
+            shows(&lines, "\u{2510}│"),
+            "the table fits beside the gutter: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn the_file_takes_three_quarters_of_the_files_screen() {
+        let mut app = app_with_files(changed_files());
+
+        // A line for the status, 20 for the screen.
+        let lines = screen_of(&mut app, 21);
+
+        let file_pane = lines
+            .iter()
+            .position(|line| line.starts_with("┌ docs/guide.md"))
+            .expect("the file's pane");
+        assert_eq!(file_pane, 5, "{lines:#?}");
+    }
+
+    #[test]
+    fn no_gutter_without_a_patch() {
+        let mut app = app_with_files(vec![changed("src/big.rs", FileStatus::Modified, None)]);
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn big() {}\n".to_owned())),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert!(shows(&lines, "│fn big() {}"), "{lines:#?}");
+    }
+
+    #[test]
+    fn gutter_shows_lines_removed_next_to_lines_drawn() {
+        use crate::files::LineChange::{Added, Modified, RemovedAbove, RemovedBelow};
+
+        assert_eq!(
+            files::gutter_changes(&[None, Some(RemovedBelow)], &[Some(0), Some(1)]),
+            [None, Some(RemovedBelow)],
+            "drawn, where they are"
+        );
+        // Lines 0 and 2 aren't drawn: blank lines, say. Lines removed below line 2 show below line 1.
+        assert_eq!(
+            files::gutter_changes(&[None, None, Some(RemovedBelow)], &[None, Some(1), Some(3)]),
+            [None, Some(RemovedBelow), None],
+        );
+        assert_eq!(
+            files::gutter_changes(
+                &[None, Some(Added), Some(RemovedBelow), Some(Modified)],
+                &[Some(1), None, Some(3)]
+            ),
+            [Some(Added), None, Some(Modified)],
+            "already showing a change"
+        );
+        // With nothing drawn above, lines removed below line 0 are above the first line drawn.
+        for change in [RemovedAbove, RemovedBelow] {
+            assert_eq!(
+                files::gutter_changes(&[Some(change), None], &[None, Some(1)]),
+                [None, Some(RemovedAbove)],
+                "{change:?}"
+            );
+        }
     }
 
     #[test]

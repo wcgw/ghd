@@ -5,6 +5,7 @@ mod cache;
 mod change;
 mod config;
 mod done;
+mod drawn;
 mod fetched;
 mod files;
 mod filter;

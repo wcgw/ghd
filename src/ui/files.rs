@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, counted};
 use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
-use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText};
+use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText, LineChange};
 use crate::github::{FilesRequest, GitHub};
 use crate::inbox::{Listing, Notification, ThreadId};
 use crate::markdown;
@@ -490,8 +490,9 @@ impl Files {
         lines
     }
 
-    /// `file`, whole, `width` cells wide: rendered if it's Markdown, as the Heatmap of `heat`; or why it can't be shown
-    /// yet, or at all.
+    /// `file`, whole, `width` cells wide: rendered if it's Markdown, as the Heatmap of `heat`, or else highlighted down
+    /// to line `down_to` at least; with a gutter showing what the pull request did to its lines, when its patch says.
+    /// Or why it can't be shown yet, or at all.
     fn whole_lines_of(
         &self,
         file: &ChangedFile,
@@ -528,10 +529,27 @@ impl Files {
         if text.trim().is_empty() {
             return vec![Line::styled("Empty file.", theme.message)];
         }
-        let mut lines = if file.is_markdown() {
-            markdown::lines(&text, theme, width, heat)
+        let changes = file.line_changes();
+        // No gutter without a patch to say what changed.
+        let gutter = !changes.is_empty();
+        let drawn = if file.is_markdown() {
+            let width = if gutter {
+                width.saturating_sub(GUTTER_WIDTH)
+            } else {
+                width
+            };
+            markdown::lines_with_sources(&text, theme, width, heat)
         } else {
             self.code_lines(file, &text, theme, down_to)
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| (line, Some(index)))
+                .collect()
+        };
+        let mut lines = if gutter {
+            with_gutter(drawn, &changes, theme)
+        } else {
+            drawn.into_iter().map(|(line, _)| line).collect()
         };
         if truncated {
             lines.push(Line::default());
@@ -715,6 +733,73 @@ pub(super) async fn fetch_text(github: &GitHub, wanted: WantedText) -> TextFetch
 /// `line` with its tabs as four spaces, which a terminal cell can't hold.
 fn untabbed(line: &str) -> String {
     line.replace('\t', "    ")
+}
+
+/// How many cells wide the gutter of a file shown whole is: its sign, and a space.
+const GUTTER_WIDTH: u16 = 2;
+
+/// The lines `drawn`, each with a gutter in front: see [`gutter_changes`]. Each comes with the index of the line of the
+/// file it draws, if it draws one, and `changes` are those of the file's lines.
+fn with_gutter(
+    drawn: Vec<(Line<'static>, Option<usize>)>,
+    changes: &[Option<LineChange>],
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let sources: Vec<Option<usize>> = drawn.iter().map(|(_, source)| *source).collect();
+    drawn
+        .into_iter()
+        .zip(gutter_changes(changes, &sources))
+        .map(|((mut line, _), change)| {
+            line.spans.insert(0, gutter(change, theme));
+            line
+        })
+        .collect()
+}
+
+/// What the gutter shows next to each line drawn, the line of the file each draws given by `sources`: what the pull
+/// request did to that line, its `changes`. Lines removed next to a line not drawn, like a blank one between
+/// paragraphs, show next to the last line drawn before it, or else the first.
+pub(super) fn gutter_changes(
+    changes: &[Option<LineChange>],
+    sources: &[Option<usize>],
+) -> Vec<Option<LineChange>> {
+    let mut shown: Vec<Option<LineChange>> = sources
+        .iter()
+        .map(|source| source.and_then(|line| changes.get(line).copied().flatten()))
+        .collect();
+    let drawn: HashSet<usize> = sources.iter().flatten().copied().collect();
+    for (line, change) in changes.iter().enumerate() {
+        if !matches!(
+            change,
+            Some(LineChange::RemovedBelow | LineChange::RemovedAbove)
+        ) || drawn.contains(&line)
+        {
+            continue;
+        }
+        let before = sources
+            .iter()
+            .rposition(|source| source.is_some_and(|source| source < line));
+        let (at, change) = match before {
+            Some(at) => (at, LineChange::RemovedBelow),
+            None => match sources.iter().position(Option::is_some) {
+                Some(at) => (at, LineChange::RemovedAbove),
+                None => continue,
+            },
+        };
+        shown[at].get_or_insert(change);
+    }
+    shown
+}
+
+/// What the gutter shows of a line the pull request did `change` to, and the space after it.
+fn gutter(change: Option<LineChange>, theme: &Theme) -> Span<'static> {
+    match change {
+        Some(LineChange::Added) => Span::styled("\u{258e} ", theme.diff_added),
+        Some(LineChange::Modified) => Span::styled("\u{258e} ", theme.diff_changed),
+        Some(LineChange::RemovedBelow) => Span::styled("\u{2581} ", theme.diff_removed),
+        Some(LineChange::RemovedAbove) => Span::styled("\u{2594} ", theme.diff_removed),
+        None => Span::raw("  "),
+    }
 }
 
 /// `line` as spans, highlighted by `classes` if there are any, its tabs as spaces.

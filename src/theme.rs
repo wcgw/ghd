@@ -147,17 +147,19 @@ theme! {
     /// … types, and keys in JSON, YAML and such.
     syntax_type = "syntax.type",
     syntax_operator = "syntax.operator",
-    /// Lines added: how many, in a pull request's Preview; the `+` of each in a file's diff; in a diff in Markdown.
-    /// And on the Files screen, an added file's letter.
+    /// Lines added: how many, in a pull request's Preview; the `+` of each in a file's diff, and the `▎` in the gutter
+    /// of a file shown whole; in a diff in Markdown. And on the Files screen, an added file's letter.
     diff_added = "diff.added",
-    /// Lines removed: how many, in a pull request's Preview; the `-` of each in a file's diff; in a diff in Markdown.
-    /// And on the Files screen, a removed file's letter.
+    /// Lines removed: how many, in a pull request's Preview; the `-` of each in a file's diff, and the `▁` or `▔` next to
+    /// them in the gutter of a file shown whole; in a diff in Markdown. And on the Files screen, a removed file's
+    /// letter.
     diff_removed = "diff.removed",
     /// A line added, in a file's diff, under its highlighted code: a background, say.
     diff_added_line = "diff.added_line",
     /// A line removed, in a file's diff, under its highlighted code.
     diff_removed_line = "diff.removed_line",
-    /// On the Files screen, a modified, renamed or copied file's letter.
+    /// On the Files screen, a modified, renamed or copied file's letter; and the `▎` in the gutter of a file shown
+    /// whole for a line that took the place of one removed.
     diff_changed = "diff.changed",
     /// A pull request's checks, in its Preview: all passed.
     ci_passing = "ci.passing",
