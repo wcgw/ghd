@@ -12,6 +12,15 @@ completion_current = { reversed = true }
 help_keys = { bold = true }
 help_heading = { dim = true }
 
+[styles.diff]
+added = { fg = "green" }
+removed = { fg = "red" }
+
+[styles.ci]
+passing = { fg = "green" }
+failing = { fg = "red" }
+pending = { fg = "yellow" }
+
 [styles.markdown]
 heading = { bold = true }
 link = { underlined = true }

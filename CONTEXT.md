@@ -53,7 +53,7 @@ Text the user types, for the moment, to narrow the **View** on screen to the **N
 _Avoid_: filter, query, find
 
 **Preview**:
-What ghd shows of the **Subject** at the **Cursor** without opening it: a header (number, title, **State**, author, labels), then the latest comment GitHub points to, or else the **Subject**'s body. Showing it never clears **Unread** nor marks **Done**.
+What ghd shows of the **Subject** at the **Cursor** without opening it: a header (number, title, **State**, author, labels, and who merged or closed it), then what its **Reason** calls for: the comment that mentions the user, the description for a review request or an assignment, or else the latest comment GitHub points to, or the **Subject**'s body. Showing it never clears **Unread** nor marks **Done**.
 _Avoid_: details, peek
 
 **View**:

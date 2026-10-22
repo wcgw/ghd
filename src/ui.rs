@@ -24,7 +24,9 @@ use crate::done::DoneMarks;
 use crate::github::{GitHub, PreviewRequest};
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
 use crate::markdown;
-use crate::preview::{self, Body, Preview, Previews, Shown};
+use crate::preview::{
+    self, Body, Ci, Note, Preview, Previews, PullRequestSummary, ReviewDecision, Shown, Why,
+};
 use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
 use crate::theme::Theme;
@@ -1538,8 +1540,16 @@ fn preview_lines(
     now: DateTime<Utc>,
     width: u16,
 ) -> Vec<Line<'static>> {
+    let ago = |then| match age(then, now).as_str() {
+        "now" => "just now".to_owned(),
+        age => format!("{age} ago"),
+    };
+    let who = |login: Option<&String>| {
+        login.map_or_else(|| "Someone".to_owned(), |login| format!("@{login}"))
+    };
     let labels =
         (!preview.labels.is_empty()).then(|| Span::styled(preview.labels.join(", "), theme.reason));
+    let discussion = preview.discussion.as_ref();
     let mut lines = vec![
         Line::from(vec![
             Span::styled(format!("{} ", preview.reference), theme.age),
@@ -1548,7 +1558,11 @@ fn preview_lines(
         separated(
             [
                 Some(Span::styled(repository.to_owned(), theme.repository)),
+                discussion.map(|discussion| Span::raw(discussion.category.clone())),
                 preview.state.map(|state| state_span(state, theme)),
+                discussion
+                    .filter(|discussion| discussion.answered)
+                    .map(|_| Span::raw("answered")),
                 preview
                     .author
                     .as_ref()
@@ -1558,17 +1572,51 @@ fn preview_lines(
             .into_iter()
             .flatten(),
         ),
-        Line::default(),
     ];
+    if let Some(closed) = &preview.closed {
+        let how = if closed.merged { "Merged" } else { "Closed" };
+        let by = closed
+            .by
+            .as_ref()
+            .map(|by| format!(" by @{by}"))
+            .unwrap_or_default();
+        let reason = match preview.state {
+            Some(SubjectState::Completed) => " as completed",
+            Some(SubjectState::NotPlanned) => " as not planned",
+            _ => "",
+        };
+        lines.push(Line::styled(
+            format!("{how}{by}{reason} {}", ago(closed.at)),
+            theme.age,
+        ));
+    }
+    if let Some(summary) = &preview.pull_request {
+        lines.push(pull_request_line(summary, theme));
+    }
+    lines.push(Line::default());
+    match &preview.note {
+        Some(Note::BodyMentionsYou) => lines.push(Line::styled(
+            format!(
+                "{} mentioned you in the description",
+                who(preview.author.as_ref())
+            ),
+            theme.age,
+        )),
+        Some(Note::MentionNotLookedFor(why)) => {
+            lines.push(Line::styled(
+                format!("Couldn't look for the mention: {why}"),
+                theme.hint,
+            ));
+            lines.push(Line::default());
+        }
+        None => {}
+    }
     match &preview.shown {
         Shown::Comment(comment) => {
-            let who = comment
-                .author
-                .as_ref()
-                .map_or_else(|| "Someone".to_owned(), |author| format!("@{author}"));
-            let when = match age(comment.created_at, now).as_str() {
-                "now" => "just now".to_owned(),
-                age => format!("{age} ago"),
+            let did = match comment.why {
+                Why::Latest => "commented",
+                Why::MentionsYou => "mentioned you",
+                Why::Answer => "answered",
             };
             let on = comment
                 .path
@@ -1576,7 +1624,11 @@ fn preview_lines(
                 .map(|path| format!(" on {path}"))
                 .unwrap_or_default();
             lines.push(Line::styled(
-                format!("{who} commented{on} {when}"),
+                format!(
+                    "{} {did}{on} {}",
+                    who(comment.author.as_ref()),
+                    ago(comment.created_at)
+                ),
                 theme.age,
             ));
             lines.push(Line::default());
@@ -1591,6 +1643,40 @@ fn preview_lines(
         }
     }
     lines
+}
+
+/// A pull request's line in its Preview: its changes, then its checks and review decision, when known.
+fn pull_request_line(summary: &PullRequestSummary, theme: &Theme) -> Line<'static> {
+    let counted = |count: u64, what: &str| match count {
+        1 => format!("1 {what}"),
+        count => format!("{count} {what}s"),
+    };
+    let mut line = Line::from(vec![
+        Span::styled(format!("+{}", summary.additions), theme.diff_added),
+        Span::raw(" "),
+        Span::styled(format!("\u{2212}{}", summary.deletions), theme.diff_removed),
+    ]);
+    let rest = [
+        Some(Span::raw(counted(summary.changed_files, "file"))),
+        Some(Span::raw(counted(summary.commits, "commit"))),
+        summary.ci.map(|ci| match ci {
+            Ci::Passing => Span::styled("CI passing", theme.ci_passing),
+            Ci::Failing => Span::styled("CI failing", theme.ci_failing),
+            Ci::Pending => Span::styled("CI pending", theme.ci_pending),
+        }),
+        summary.review.map(|review| {
+            Span::raw(match review {
+                ReviewDecision::Approved => "approved",
+                ReviewDecision::ChangesRequested => "changes requested",
+                ReviewDecision::ReviewRequired => "review required",
+            })
+        }),
+    ];
+    for span in rest.into_iter().flatten() {
+        line.push_span(Span::raw(" · "));
+        line.push_span(span);
+    }
+    line
 }
 
 /// `state`'s name, in its color in `theme`.
@@ -2298,7 +2384,11 @@ mod tests {
             state: Some(SubjectState::Open),
             author: Some("octocat".to_owned()),
             labels: vec!["ui".to_owned()],
+            closed: None,
+            pull_request: None,
+            discussion: None,
             shown,
+            note: None,
         }
     }
 
@@ -2495,6 +2585,7 @@ mod tests {
             created_at: Utc::now() - TimeDelta::hours(2),
             path: Some("src/ui.rs".to_owned()),
             body: "Typo here".to_owned(),
+            why: Why::Latest,
         });
         fetch_preview_at(
             &mut app,
@@ -2509,6 +2600,115 @@ mod tests {
             "{lines:#?}"
         );
         assert!(shows(&lines, "Typo here"), "{lines:#?}");
+    }
+
+    /// The lines `app` draws once the Preview at the cursor is fetched as `preview`.
+    fn previewing(preview: Preview) -> Vec<String> {
+        let (mut app, since) = app_previewing();
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(preview));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT)
+    }
+
+    #[test]
+    fn pull_request_preview_shows_its_changes_and_checks() {
+        let body = Shown::Body(Body::Markdown("What it does".to_owned()));
+        let lines = previewing(Preview {
+            state: Some(SubjectState::Merged),
+            closed: Some(crate::preview::Closed {
+                by: Some("alxs".to_owned()),
+                at: Utc::now() - TimeDelta::hours(2),
+                merged: true,
+            }),
+            pull_request: Some(PullRequestSummary {
+                additions: 120,
+                deletions: 30,
+                changed_files: 7,
+                commits: 1,
+                ci: Some(Ci::Passing),
+                review: Some(ReviewDecision::Approved),
+            }),
+            ..add_polling_preview(body)
+        });
+
+        assert!(shows(&lines, "Merged by @alxs 2h ago"), "{lines:#?}");
+        assert!(
+            shows(
+                &lines,
+                "+120 \u{2212}30 · 7 files · 1 commit · CI passing · approved"
+            ),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn closed_issue_says_why() {
+        let lines = previewing(Preview {
+            state: Some(SubjectState::NotPlanned),
+            closed: Some(crate::preview::Closed {
+                by: None,
+                at: Utc::now() - TimeDelta::days(3),
+                merged: false,
+            }),
+            ..add_polling_preview(Shown::Body(Body::Markdown("Body".to_owned())))
+        });
+
+        assert!(shows(&lines, "Closed as not planned 3d ago"), "{lines:#?}");
+    }
+
+    #[test]
+    fn mentions_say_where_you_were_mentioned() {
+        let mentioned = Shown::Comment(crate::preview::Comment {
+            author: Some("hubot".to_owned()),
+            created_at: Utc::now() - TimeDelta::hours(2),
+            path: None,
+            body: "@alxs look".to_owned(),
+            why: Why::MentionsYou,
+        });
+        let lines = previewing(add_polling_preview(mentioned));
+        assert!(shows(&lines, "@hubot mentioned you 2h ago"), "{lines:#?}");
+
+        let lines = previewing(Preview {
+            note: Some(Note::BodyMentionsYou),
+            ..add_polling_preview(Shown::Body(Body::Markdown("cc @alxs".to_owned())))
+        });
+        assert!(
+            shows(&lines, "@octocat mentioned you in the description"),
+            "{lines:#?}"
+        );
+
+        let lines = previewing(Preview {
+            note: Some(Note::MentionNotLookedFor("rate limited".to_owned())),
+            ..add_polling_preview(Shown::Body(Body::Markdown(String::new())))
+        });
+        assert!(
+            shows(&lines, "Couldn't look for the mention: rate limited"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn discussion_preview_shows_its_category_and_answer() {
+        let answer = Shown::Comment(crate::preview::Comment {
+            author: Some("alxs".to_owned()),
+            created_at: Utc::now() - TimeDelta::days(3),
+            path: None,
+            body: "Like so".to_owned(),
+            why: Why::Answer,
+        });
+        let lines = previewing(Preview {
+            state: None,
+            discussion: Some(crate::preview::DiscussionSummary {
+                category: "Q&A".to_owned(),
+                answered: true,
+            }),
+            ..add_polling_preview(answer)
+        });
+
+        assert!(
+            shows(&lines, "wcgw/ghd · Q&A · answered · @octocat · ui"),
+            "{lines:#?}"
+        );
+        assert!(shows(&lines, "@alxs answered 3d ago"), "{lines:#?}");
     }
 
     #[test]

@@ -135,6 +135,16 @@ theme! {
     /// What lays out a Preview's Markdown: list markers, table borders, heading markers, images' descriptions,
     /// footnotes.
     markdown_muted = "markdown.muted",
+    /// Lines added, in a pull request's Preview.
+    diff_added = "diff.added",
+    /// Lines removed, in a pull request's Preview.
+    diff_removed = "diff.removed",
+    /// A pull request's checks, in its Preview: all passed.
+    ci_passing = "ci.passing",
+    /// Some failed.
+    ci_failing = "ci.failing",
+    /// Some haven't finished, none failed.
+    ci_pending = "ci.pending",
 }
 
 impl Theme {

@@ -61,6 +61,15 @@ hint = { fg = "dark3" }
 help_keys = { fg = "blue1", bold = true }
 help_heading = { fg = "comment" }
 
+[styles.diff]
+added = { fg = "green" }
+removed = { fg = "red" }
+
+[styles.ci]
+passing = { fg = "green" }
+failing = { fg = "red" }
+pending = { fg = "yellow" }
+
 [styles.markdown]
 heading = { fg = "blue", bold = true }
 code = { fg = "green1" }

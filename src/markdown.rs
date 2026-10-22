@@ -30,6 +30,31 @@ pub fn lines(markdown: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Whether `markdown` mentions `handle`, a login (`octocat`) or a team (`github/docs`), as GitHub notifies for:
+/// `@` and the handle, ignoring case, not within a longer name, and not in code.
+pub fn mentions(markdown: &str, handle: &str) -> bool {
+    // The text outside code, a space where code was, so that nothing joins across it.
+    let mut text = String::with_capacity(markdown.len());
+    let mut in_code_block = false;
+    for event in Parser::new_ext(markdown, parse_options()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            Event::Text(part) if !in_code_block => text.push_str(&part),
+            _ => text.push(' '),
+        }
+    }
+    let text = text.to_lowercase();
+    let wanted = format!("@{}", handle.to_lowercase());
+    text.match_indices(&wanted).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + wanted.len()..].chars().next();
+        // `me@octocat.com` isn't a mention, nor is `@octocat-bot` one of `@octocat`, nor `@octocat/docs` (a team).
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/'))
+    })
+}
+
 /// A line break within a paragraph, in Markdown: two spaces, then a new line.
 const HARD_BREAK: &str = "  \n";
 
@@ -366,6 +391,27 @@ mod tests {
         };
         assert_eq!(style_of("Title"), Some(Some(Color::Red)));
         assert_eq!(style_of("ghd"), Some(Some(Color::Green)));
+    }
+
+    #[test]
+    fn mentions_are_of_the_whole_handle() {
+        assert!(mentions("cc @alxs, what do you think?", "alxs"));
+        assert!(mentions("@ALXS", "alxs"), "ignoring case");
+        assert!(mentions("Thanks @wcgw/maintainers!", "wcgw/maintainers"));
+        assert!(!mentions("cc @alxs-bot", "alxs"));
+        assert!(!mentions("mail me@alxs.dev", "alxs"));
+        assert!(
+            !mentions("ping @wcgw/maintainers", "wcgw"),
+            "a team of wcgw"
+        );
+        assert!(!mentions("Nobody here", "alxs"));
+    }
+
+    #[test]
+    fn mentions_in_code_dont_count() {
+        assert!(!mentions("Run `ghd --user @alxs`", "alxs"));
+        assert!(!mentions("```\n@alxs\n```", "alxs"));
+        assert!(mentions("```\ncode\n```\n\n@alxs see above", "alxs"));
     }
 
     #[test]

@@ -7,11 +7,11 @@ use chrono::{DateTime, Utc};
 use crate::inbox::{Listing, Notification, ThreadId};
 use crate::state::SubjectState;
 
-/// What a Preview shows of a Subject: a header, then one thing to read.
+/// What a Preview shows of a Subject: a header, then the one thing its Notification's Reason calls for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
-    /// How GitHub refers to the Subject: `#123` for a pull request or an issue, a release's tag, a commit's
-    /// short SHA.
+    /// How GitHub refers to the Subject: `#123` for a pull request, an issue or a Discussion, a release's tag, a
+    /// commit's short SHA.
     pub reference: String,
     pub title: String,
     /// `None` for a kind of Subject with no State.
@@ -20,13 +20,69 @@ pub struct Preview {
     /// one).
     pub author: Option<String>,
     pub labels: Vec<String>,
+    /// When it was closed or merged, and by whom; `None` while it's open, and for Subjects that never close.
+    pub closed: Option<Closed>,
+    /// A pull request's changes and how far along it is; `None` for any other Subject.
+    pub pull_request: Option<PullRequestSummary>,
+    /// A Discussion's category and whether it's answered; `None` for any other Subject.
+    pub discussion: Option<DiscussionSummary>,
     pub shown: Shown,
+    /// Something to know about what's shown, said above it.
+    pub note: Option<Note>,
+}
+
+/// How a Subject came to be closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Closed {
+    /// Who closed or merged it; `None` when GitHub doesn't say.
+    pub by: Option<String>,
+    pub at: DateTime<Utc>,
+    /// A pull request merged, not just closed.
+    pub merged: bool,
+}
+
+/// A pull request's changes, and how far along it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSummary {
+    /// Lines added.
+    pub additions: u64,
+    /// Lines removed.
+    pub deletions: u64,
+    pub changed_files: u64,
+    pub commits: u64,
+    /// `None` when it has no checks, or they couldn't be looked up.
+    pub ci: Option<Ci>,
+    /// `None` when the repository requires no review, or it couldn't be looked up.
+    pub review: Option<ReviewDecision>,
+}
+
+/// How a pull request's checks went, all of them together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ci {
+    Passing,
+    Failing,
+    Pending,
+}
+
+/// Where a pull request stands with the reviews it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+/// A Discussion's category, and whether one of its comments is the accepted answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscussionSummary {
+    pub category: String,
+    pub answered: bool,
 }
 
 /// The one thing a Preview shows to read, under its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shown {
-    /// The latest comment on the Subject, as GitHub points to it.
+    /// A comment on the Subject.
     Comment(Comment),
     /// The Subject's own text: a pull request's or an issue's description, a release's notes, a commit's message.
     Body(Body),
@@ -42,6 +98,28 @@ pub struct Comment {
     pub path: Option<String>,
     /// In Markdown.
     pub body: String,
+    /// Why it's the comment shown.
+    pub why: Why,
+}
+
+/// Why a Preview shows a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// It's the latest.
+    Latest,
+    /// It's the latest to mention the user, or one of their teams.
+    MentionsYou,
+    /// It's a Discussion's accepted answer.
+    Answer,
+}
+
+/// Something to know about what a Preview shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    /// The Subject's own text is shown for mentioning the user.
+    BodyMentionsYou,
+    /// Why ghd couldn't look for the comment mentioning the user, and shows the latest one instead.
+    MentionNotLookedFor(String),
 }
 
 /// A Subject's own text, empty when it has none.
@@ -57,7 +135,7 @@ pub enum Body {
 pub enum Fetched {
     /// Being fetched.
     Fetching,
-    Done(Preview),
+    Done(Box<Preview>),
     /// Why it couldn't be fetched.
     Failed(String),
 }
@@ -92,7 +170,7 @@ impl Previews {
         preview: anyhow::Result<Preview>,
     ) {
         let fetched = match preview {
-            Ok(preview) => Fetched::Done(preview),
+            Ok(preview) => Fetched::Done(Box::new(preview)),
             Err(error) => Fetched::Failed(format!("{error:#}")),
         };
         self.by_thread.insert(thread, (as_of, fetched));
@@ -149,7 +227,11 @@ mod tests {
             state: Some(SubjectState::Open),
             author: Some("octocat".to_owned()),
             labels: Vec::new(),
+            closed: None,
+            pull_request: None,
+            discussion: None,
             shown: Shown::Body(Body::Markdown("Hello".to_owned())),
+            note: None,
         }
     }
 
@@ -161,7 +243,10 @@ mod tests {
         assert_eq!(previews.get(&seen), Some(&Fetched::Fetching));
 
         previews.fetched(seen.thread, seen.updated_at, Ok(preview()));
-        assert_eq!(previews.get(&seen), Some(&Fetched::Done(preview())));
+        assert_eq!(
+            previews.get(&seen),
+            Some(&Fetched::Done(Box::new(preview())))
+        );
 
         let newer = notification(1, then() + TimeDelta::minutes(5));
         assert_eq!(previews.get(&newer), None, "wants fetching again");
@@ -190,7 +275,10 @@ mod tests {
 
         previews.forget_failed(seen.thread);
 
-        assert_eq!(previews.get(&seen), Some(&Fetched::Done(preview())));
+        assert_eq!(
+            previews.get(&seen),
+            Some(&Fetched::Done(Box::new(preview())))
+        );
     }
 
     #[test]
