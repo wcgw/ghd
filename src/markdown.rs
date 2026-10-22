@@ -60,7 +60,7 @@ const HARD_BREAK: &str = "  \n";
 
 /// `markdown`, with new lines within paragraphs made line breaks and its HTML rewritten (see [`lines`]). Only
 /// what the Markdown parser takes for those is touched: never code, where `Vec<T>` is just text.
-fn as_github_shows(markdown: &str) -> String {
+pub fn as_github_shows(markdown: &str) -> String {
     let mut rewritten: Vec<(Range<usize>, String)> = Vec::new();
     let mut in_html_block = false;
     for (event, range) in Parser::new_ext(markdown, parse_options()).into_offset_iter() {

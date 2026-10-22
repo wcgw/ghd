@@ -5,6 +5,8 @@
 //! user = "alexsnaps"            # optional, `gh`'s active account on the host by default
 //! theme = "terminal"            # optional, tokyonight-moon by default
 //! icons = true                  # optional, false by default: Nerd Font icons for kinds of Subject
+//! voight = "metal"              # optional, "cpu" by default: where voight assesses Previews ("cpu", "metal" or
+//!                               # "cuda"; a GPU needs ghd built with `--features cuda` or `metal`), or "off"
 //!
 //! [[view]]
 //! name = "Reviews"
@@ -16,6 +18,7 @@ use std::io::ErrorKind;
 use anyhow::{Context as _, bail};
 use serde::Deserialize;
 
+use crate::assessment::Device;
 use crate::filter::Filter;
 use crate::github::Account;
 use crate::{theme, xdg};
@@ -38,6 +41,8 @@ pub struct Config {
     theme: String,
     /// Kinds of Subject show as Nerd Font icons rather than text.
     icons: bool,
+    /// Where voight runs to assess Previews; `None` when it's off.
+    voight: Option<Device>,
     /// The built-in Inbox View, then the configured ones in the file's order; names are unique, ignoring case.
     views: Vec<View>,
 }
@@ -78,6 +83,12 @@ impl Config {
         self.icons
     }
 
+    /// Where voight runs to assess Previews; `None` when it's off. On the CPU unless the file says otherwise, if
+    /// ghd was built with voight.
+    pub fn voight(&self) -> Option<Device> {
+        self.voight
+    }
+
     /// The Views to show as tabs: the built-in Inbox View first, then the configured ones in the file's order.
     pub fn into_views(self) -> Vec<View> {
         self.views
@@ -90,6 +101,19 @@ impl Config {
             account: Account::new(file.host.as_deref(), file.user.as_deref())?,
             theme: file.theme.unwrap_or_else(|| theme::DEFAULT.to_owned()),
             icons: file.icons.unwrap_or_default(),
+            voight: match file.voight.map(VoightSetting::device) {
+                None => Self::default().voight,
+                Some(None) => None,
+                Some(Some(device)) if !cfg!(feature = "voight") => bail!(
+                    "voight = \"{device}\", but this ghd was built without voight: set voight = \"off\", or \
+                     build ghd with its `voight` feature"
+                ),
+                Some(Some(device)) if !device.is_built_in() => bail!(
+                    "voight = \"{device}\", but this ghd was built without {device} support: set voight = \
+                     \"cpu\", or build ghd with `--features {device}`"
+                ),
+                Some(Some(device)) => Some(device),
+            },
             ..Self::default()
         };
         for entry in file.views {
@@ -130,6 +154,7 @@ impl Default for Config {
             account: Account::default(),
             theme: theme::DEFAULT.to_owned(),
             icons: false,
+            voight: cfg!(feature = "voight").then_some(Device::Cpu),
             views: vec![View {
                 name: INBOX_VIEW.to_owned(),
                 filter: Filter::default(),
@@ -146,8 +171,31 @@ struct File {
     user: Option<String>,
     theme: Option<String>,
     icons: Option<bool>,
+    voight: Option<VoightSetting>,
     #[serde(default, rename = "view")]
     views: Vec<ViewEntry>,
+}
+
+/// The `voight` setting, as written: `"off"`, or the device to run on.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VoightSetting {
+    Off,
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl VoightSetting {
+    /// The device voight runs on; `None` when it's off.
+    fn device(self) -> Option<Device> {
+        match self {
+            Self::Off => None,
+            Self::Cpu => Some(Device::Cpu),
+            Self::Metal => Some(Device::Metal),
+            Self::Cuda => Some(Device::Cuda),
+        }
+    }
 }
 
 /// A `[[view]]` table, as written.
@@ -210,6 +258,40 @@ mod tests {
         assert!(!Config::parse("").expect("valid").icons());
         assert!(Config::parse("icons = true").expect("valid").icons());
         assert!(rejection("icons = \"yes\"").contains("icons"));
+    }
+
+    #[cfg(feature = "voight")]
+    #[test]
+    fn voight_runs_on_the_cpu_unless_the_file_says() {
+        let voight = |text| Config::parse(text).expect("valid").voight();
+        assert_eq!(Config::default().voight(), Some(Device::Cpu));
+        assert_eq!(voight(""), Some(Device::Cpu));
+        assert_eq!(voight("voight = \"off\""), None);
+        if Device::Metal.is_built_in() {
+            assert_eq!(voight("voight = \"metal\""), Some(Device::Metal));
+        }
+        if Device::Cuda.is_built_in() {
+            assert_eq!(voight("voight = \"cuda\""), Some(Device::Cuda));
+        }
+        assert!(rejection("voight = \"gpu\"").contains("voight"));
+        assert!(rejection("voight = true").contains("voight"));
+    }
+
+    #[cfg(all(feature = "voight", not(feature = "cuda")))]
+    #[test]
+    fn cuda_needs_building_in() {
+        assert!(rejection("voight = \"cuda\"").contains("--features cuda"));
+    }
+
+    #[cfg(not(feature = "voight"))]
+    #[test]
+    fn voight_is_off_without_it_built_in() {
+        assert_eq!(Config::default().voight(), None);
+        assert_eq!(
+            Config::parse("voight = \"off\"").expect("valid").voight(),
+            None
+        );
+        assert!(rejection("voight = \"cpu\"").contains("built without voight"));
     }
 
     #[test]

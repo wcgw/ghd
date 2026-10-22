@@ -60,6 +60,7 @@ fetching = { fg = "blue1", italic = true }
 hint = { fg = "dark3" }
 help_keys = { fg = "blue1", bold = true }
 help_heading = { fg = "comment" }
+voight = { fg = "magenta" }
 
 [styles.diff]
 added = { fg = "green" }

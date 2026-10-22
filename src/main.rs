@@ -1,5 +1,6 @@
 //! ghd: a terminal UI to GitHub, starting with notifications.
 
+mod assessment;
 mod cache;
 mod change;
 mod config;
@@ -35,10 +36,29 @@ async fn main() -> anyhow::Result<()> {
     } else {
         KindLabels::Text
     };
+    // Before taking over the terminal too: the first time, voight downloads its model, showing its progress.
+    let assessor = match config.voight() {
+        #[cfg(feature = "voight")]
+        Some(device) => Some(assessment::Assessor::start(device).await.context(
+            "couldn't fetch voight's model; set voight = \"off\" in the configuration to start without it",
+        )?),
+        #[cfg(not(feature = "voight"))]
+        Some(_) => unreachable!("the configuration can't turn voight on in a ghd built without it"),
+        None => None,
+    };
     let views = config.into_views();
 
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
-    let outcome = ui::run(&mut terminal, &github, views, theme, kind_labels, &cache).await;
+    let outcome = ui::run(
+        &mut terminal,
+        &github,
+        views,
+        theme,
+        kind_labels,
+        &cache,
+        assessor,
+    )
+    .await;
     ratatui::restore();
     outcome
 }

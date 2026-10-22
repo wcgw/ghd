@@ -15,9 +15,26 @@ pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1", default-features = false, features = ["rt", "macros", "process", "time", "fs", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "process", "time", "fs", "io-util", "sync"] }
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 tui-markdown = { version = "0.3.12", default-features = false }
+voight = { path = "../voight", default-features = false, optional = true }
 
 [dev-dependencies]
 wiremock = "0.6.5"
+
+[features]
+default = ["voight"]
+# Assessments of Previews' text, by voight's model (about 1.7 GB, loaded at startup unless `voight = "off"`).
+voight = ["dep:voight"]
+# voight on an NVIDIA GPU (`voight = "cuda"`): CUDA in voight and the candle crates it runs its model with. Needs
+# the CUDA toolkit (`nvcc`) to build.
+cuda = ["voight", "voight/cuda"]
+# voight on a Mac's GPU (`voight = "metal"`): Metal in voight and its candle crates. Already on for Apple silicon,
+# where voight always builds with Metal.
+metal = ["voight", "voight/metal"]
+
+# voight's model is unusably slow unoptimized (an Assessment didn't finish in five minutes): dependencies are built
+# optimized even in debug builds, which keep ghd's own code easy to debug.
+[profile.dev.package."*"]
+opt-level = 3

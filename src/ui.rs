@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Table
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 
+use crate::assessment::{self, Assessed, Assessments, Assessor, Readiness};
 use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
@@ -48,7 +49,7 @@ const PREVIEW_MIN_HEIGHT: u16 = 12;
 /// kinds with `kind_labels`. Meanwhile it
 /// keeps the Inbox up to date from `github`, polling as often as GitHub allows, and sends it the changes the user
 /// makes. Until the first fetch arrives, it shows what `cache` kept from last time; on quitting, it keeps the Inbox
-/// there for next time.
+/// there for next time. With `assessor`, voight assesses the text each Preview shows, once its model is loaded.
 ///
 /// # Errors
 ///
@@ -66,8 +67,12 @@ pub async fn run(
     theme: Theme,
     kind_labels: KindLabels,
     cache: &Cache,
+    mut assessor: Option<Assessor>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(views, theme, kind_labels);
+    if assessor.is_some() {
+        app.assessments = Some(Assessments::default());
+    }
     if let Some(snapshot) = cache.load().await {
         app.restore(snapshot, Utc::now());
     }
@@ -101,6 +106,11 @@ pub async fn run(
         }
         // When to wake up to fetch the Preview at the cursor, once it's stayed there.
         let preview_due = app.preview_due().map(|(due, _)| due);
+        if let Some(assessor) = &assessor
+            && let Some((key, text)) = app.assessment_to_start()
+        {
+            assessor.assess(key, text);
+        }
         let fetching = fetch.is_some() || lookup.is_some();
         terminal
             .draw(|frame| app.render(frame, fetching))
@@ -126,6 +136,13 @@ pub async fn run(
             // Nothing to do but go round again, to fetch it.
             () = tokio::time::sleep_until(preview_due.unwrap_or(now)),
                 if preview_fetch.is_none() && preview_due.is_some() => {}
+            Some(said) = OptionFuture::from(assessor.as_mut().map(Assessor::next)), if assessor.is_some() => {
+                match said {
+                    Some(event) => app.voight_said(event),
+                    // Its thread stopped, having said why.
+                    None => assessor = None,
+                }
+            }
             Some(reply) = in_flight.next(), if !in_flight.is_empty() => app.settle(reply),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match app.press(key) {
@@ -579,6 +596,8 @@ struct App {
     previews: Previews,
     /// How many lines the screen had at the last draw.
     screen_height: u16,
+    /// voight's Assessments of Previews, and whether it's ready to make more; `None` while voight is off.
+    assessments: Option<Assessments>,
 }
 
 /// The Preview pane, and where it's at.
@@ -666,6 +685,7 @@ impl App {
             preview: None,
             previews: Previews::default(),
             screen_height: 0,
+            assessments: None,
         }
     }
 
@@ -705,6 +725,9 @@ impl App {
         self.selection.retain(|&thread| listing.contains(thread));
         self.states.retain_in(&listing);
         self.previews.retain_in(&listing);
+        if let Some(assessments) = &mut self.assessments {
+            assessments.retain_in(&listing);
+        }
         self.states_wanted = true;
         self.keeping_cursors(|app| app.inbox = InboxState::Loaded(listing));
     }
@@ -871,6 +894,82 @@ impl App {
             .fetched(fetched.thread, fetched.as_of, fetched.preview);
     }
 
+    /// The Preview on screen, fetched, with what it's of; `None` while it's closed, not fetched yet, or has nothing
+    /// to show.
+    fn preview_on_screen(&self) -> Option<(assessment::Key, &Preview)> {
+        self.preview.as_ref()?;
+        let notification = self.at_cursor()?;
+        let preview::Fetched::Done(preview) = self.previews.get(notification)? else {
+            return None;
+        };
+        let key = assessment::Key {
+            thread: notification.thread,
+            as_of: notification.updated_at,
+        };
+        Some((key, preview))
+    }
+
+    /// The text to assess now, and what it's of, noted as being assessed: what the Preview on screen shows, once
+    /// voight is ready and assessing nothing else. `None` otherwise, and when voight is off.
+    fn assessment_to_start(&mut self) -> Option<(assessment::Key, String)> {
+        if !self.assessments.as_ref()?.can_assess() {
+            return None;
+        }
+        let (key, preview) = self.preview_on_screen()?;
+        let assessments = self.assessments.as_ref()?;
+        if assessments.get(key).is_some() {
+            return None;
+        }
+        // Markdown as the Preview draws it: no HTML comments left by templates, say, which the author didn't write.
+        let text = match &preview.shown {
+            Shown::Comment(comment) => markdown::as_github_shows(&comment.body),
+            Shown::Body(Body::Markdown(body)) => markdown::as_github_shows(body),
+            Shown::Body(Body::Plain(body)) => body.clone(),
+        };
+        self.assessments.as_mut()?.assessing(key);
+        Some((key, text))
+    }
+
+    /// Takes in what voight says: that its model is loaded, or why it couldn't be, or an Assessment.
+    fn voight_said(&mut self, event: assessment::Event) {
+        let Some(assessments) = &mut self.assessments else {
+            return;
+        };
+        match event {
+            assessment::Event::Loaded { fallback } => {
+                assessments.loaded(true);
+                if let Some(fallback) = fallback {
+                    self.status = Some(StatusMessage::Info(fallback));
+                }
+            }
+            assessment::Event::Failed(why) => {
+                assessments.loaded(false);
+                self.status = Some(StatusMessage::Error(format!(
+                    "voight couldn't load its model: {why}"
+                )));
+            }
+            assessment::Event::Assessed { key, share } => assessments.assessed(key, share),
+        }
+    }
+
+    /// What the Preview's border says of voight: that it's loading, assessing, or its Assessment; `None` when there's
+    /// nothing to say, as for a text with too little prose.
+    fn assessment_label(&self) -> Option<String> {
+        let assessments = self.assessments.as_ref()?;
+        match assessments.readiness() {
+            Readiness::Loading => return Some(" voight loading… ".to_owned()),
+            Readiness::Failed => return None,
+            Readiness::Ready => {}
+        }
+        let (key, _) = self.preview_on_screen()?;
+        match assessments.get(key) {
+            None | Some(Assessed::Assessing) => Some(" voight … ".to_owned()),
+            Some(Assessed::Done(Some(share))) => Some(format!(" voight {:.0}% ", share * 100.0)),
+            Some(Assessed::Done(None)) => None,
+            Some(Assessed::Failed(_)) => Some(" voight failed ".to_owned()),
+        }
+    }
+
     /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives, with the View that was on screen and
     /// each View's cursor as they were, where they still can be.
     fn restore(&mut self, snapshot: Snapshot, now: DateTime<Utc>) {
@@ -970,6 +1069,9 @@ impl App {
                     && let Some(thread) = self.at_cursor().map(|n| n.thread)
                 {
                     self.previews.forget(thread);
+                    if let Some(assessments) = &mut self.assessments {
+                        assessments.forget(thread);
+                    }
                 }
                 Some(Outcome::Refresh)
             }
@@ -1402,10 +1504,14 @@ impl App {
         pane.lines = u16::try_from(paragraph.line_count(width)).unwrap_or(u16::MAX);
         // A shorter Preview, or a taller pane, than at the last scroll.
         pane.scroll = pane.scroll.min(pane.max_scroll());
-        let block = Block::bordered()
+        let scroll = pane.scroll;
+        let mut block = Block::bordered()
             .border_style(theme.border)
             .title(Line::styled(" Preview ", theme.tab));
-        frame.render_widget(paragraph.scroll((pane.scroll, 0)).block(block), area);
+        if let Some(label) = self.assessment_label() {
+            block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
+        }
+        frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
     }
 
     /// What the Preview pane shows of the Notification at the cursor, as of `now`, `width` cells wide: its Preview
@@ -2709,6 +2815,156 @@ mod tests {
             "{lines:#?}"
         );
         assert!(shows(&lines, "@alxs answered 3d ago"), "{lines:#?}");
+    }
+
+    /// [`app_previewing`] with voight on, its model loading, and the Preview of "Add polling" showing `body`
+    /// fetched.
+    fn app_assessing(body: &str) -> App {
+        let (mut app, since) = app_previewing();
+        app.assessments = Some(Assessments::default());
+        let shown = Shown::Body(Body::Markdown(body.to_owned()));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(shown)),
+        );
+        app
+    }
+
+    /// The Preview's bottom border, on the line above the status line.
+    fn preview_border(lines: &[String]) -> &str {
+        &lines[usize::from(PREVIEW_SCREEN_HEIGHT) - 2]
+    }
+
+    #[test]
+    fn assessment_shows_at_the_end_of_the_preview_border() {
+        let mut app = app_assessing("Polls the Inbox.");
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            preview_border(&lines).ends_with(" voight loading… ┘"),
+            "{lines:#?}"
+        );
+        assert!(app.assessment_to_start().is_none(), "not loaded yet");
+
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        let (key, text) = app.assessment_to_start().expect("ready");
+        assert_eq!(
+            (key.thread, text.as_str()),
+            (ThreadId(1), "Polls the Inbox.")
+        );
+        assert!(app.assessment_to_start().is_none(), "one at a time");
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            preview_border(&lines).ends_with(" voight … ┘"),
+            "{lines:#?}"
+        );
+
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            share: Ok(Some(0.734)),
+        });
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            preview_border(&lines).ends_with(" voight 73% ┘"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn too_little_prose_shows_no_assessment() {
+        let mut app = app_assessing("LGTM");
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        let (key, _) = app.assessment_to_start().expect("ready");
+
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            share: Ok(None),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(!preview_border(&lines).contains("voight"), "{lines:#?}");
+        assert!(app.assessment_to_start().is_none(), "assessed already");
+    }
+
+    #[test]
+    fn template_comments_are_not_assessed() {
+        let mut app = app_assessing("<!-- Describe your change -->\n\nIt polls.");
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+
+        let (_, text) = app.assessment_to_start().expect("ready");
+
+        assert!(!text.contains("Describe"), "{text:?}");
+        assert!(text.contains("It polls."), "{text:?}");
+    }
+
+    #[test]
+    fn voight_failing_to_load_says_why() {
+        let mut app = app_assessing("Polls the Inbox.");
+
+        app.voight_said(assessment::Event::Failed("out of memory".to_owned()));
+
+        assert!(app.assessment_to_start().is_none());
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(!preview_border(&lines).contains("voight"), "{lines:#?}");
+        assert!(
+            lines[usize::from(PREVIEW_SCREEN_HEIGHT) - 1]
+                .starts_with("voight couldn't load its model: out of memory"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn falling_back_to_the_cpu_says_so() {
+        let mut app = app_assessing("Polls the Inbox.");
+
+        app.voight_said(assessment::Event::Loaded {
+            fallback: Some("couldn't use CUDA, so voight runs on the CPU".to_owned()),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            lines[usize::from(PREVIEW_SCREEN_HEIGHT) - 1]
+                .starts_with("couldn't use CUDA, so voight runs on the CPU"),
+            "{lines:#?}"
+        );
+        assert!(app.assessment_to_start().is_some(), "assesses all the same");
+    }
+
+    #[test]
+    fn r_assesses_the_preview_again() {
+        let mut app = app_assessing("Polls the Inbox.");
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        let (key, _) = app.assessment_to_start().expect("ready");
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            share: Ok(Some(0.2)),
+        });
+
+        app.press(key_named("r"));
+        let shown = Shown::Body(Body::Markdown("Edited".to_owned()));
+        fetch_preview_at(
+            &mut app,
+            Instant::now() + PREVIEW_REST,
+            Ok(add_polling_preview(shown)),
+        );
+
+        let (_, text) = app.assessment_to_start().expect("assessed again");
+        assert_eq!(text, "Edited");
+    }
+
+    #[test]
+    fn voight_off_assesses_nothing() {
+        let (mut app, since) = app_previewing();
+        let shown = Shown::Body(Body::Markdown("Polls the Inbox.".to_owned()));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(shown)),
+        );
+
+        assert!(app.assessment_to_start().is_none());
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(!preview_border(&lines).contains("voight"), "{lines:#?}");
     }
 
     #[test]

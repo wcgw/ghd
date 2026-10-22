@@ -145,6 +145,8 @@ theme! {
     ci_failing = "ci.failing",
     /// Some haven't finished, none failed.
     ci_pending = "ci.pending",
+    /// voight's Assessment, at the end of the Preview's bottom border.
+    voight = "voight",
 }
 
 impl Theme {
