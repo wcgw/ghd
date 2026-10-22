@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
+use crate::fetched::Fetched;
 use crate::inbox::{Listing, Notification, ThreadId};
 use crate::state::SubjectState;
 
@@ -130,27 +131,17 @@ pub enum Body {
     Plain(String),
 }
 
-/// Where a Notification's Preview stands.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fetched {
-    /// Being fetched.
-    Fetching,
-    Done(Box<Preview>),
-    /// Why it couldn't be fetched.
-    Failed(String),
-}
-
 /// The Previews fetched so far, each for its Notification's activity at the time: newer activity calls for a new
 /// one. Kept for this run only.
 #[derive(Debug, Default)]
 pub struct Previews {
-    by_thread: HashMap<ThreadId, (DateTime<Utc>, Fetched)>,
+    by_thread: HashMap<ThreadId, (DateTime<Utc>, Fetched<Box<Preview>>)>,
 }
 
 impl Previews {
     /// Where the Preview of `notification`, with the activity it has now, stands; `None` if it's never been
     /// fetched, or only for older activity.
-    pub fn get(&self, notification: &Notification) -> Option<&Fetched> {
+    pub fn get(&self, notification: &Notification) -> Option<&Fetched<Box<Preview>>> {
         self.by_thread
             .get(&notification.thread)
             .filter(|(as_of, _)| *as_of == notification.updated_at)
@@ -169,11 +160,8 @@ impl Previews {
         as_of: DateTime<Utc>,
         preview: anyhow::Result<Preview>,
     ) {
-        let fetched = match preview {
-            Ok(preview) => Fetched::Done(Box::new(preview)),
-            Err(error) => Fetched::Failed(format!("{error:#}")),
-        };
-        self.by_thread.insert(thread, (as_of, fetched));
+        self.by_thread
+            .insert(thread, (as_of, Fetched::from_result(preview.map(Box::new))));
     }
 
     /// Forgets the Preview of `thread`, so that it's fetched again.

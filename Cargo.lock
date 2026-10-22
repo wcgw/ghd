@@ -1539,6 +1539,7 @@ dependencies = [
  "open",
  "pulldown-cmark",
  "ratatui",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

@@ -56,6 +56,10 @@ _Avoid_: filter, query, find
 What ghd shows of the **Subject** at the **Cursor** without opening it: a header (number, title, **State**, author, labels, and who merged or closed it), then what its **Reason** calls for: the comment that mentions the user, the description for a review request or an assignment, or else the latest comment GitHub points to, or the **Subject**'s body. Showing it never clears **Unread** nor marks **Done**.
 _Avoid_: details, peek
 
+**Changed file**:
+A file a pull request adds, changes, renames, copies or removes; ghd shows a new one whole, and any other as its diff.
+_Avoid_: diff, patch, file change
+
 **Assessment**:
 voight's estimate, as a percentage, of how much of the text a **Preview** shows was written by an LLM; made only of text with enough prose to mean something. Never evidence of authorship.
 _Avoid_: score, AI detection, verdict

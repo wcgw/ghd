@@ -52,11 +52,14 @@ impl fmt::Display for Device {
     }
 }
 
-/// What an Assessment is of: a thread's Preview, with the activity its Notification had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What an Assessment is of: the text a thread's Preview shows, or one of its Changed files, with the activity its
+/// Notification had.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     pub thread: ThreadId,
     pub as_of: DateTime<Utc>,
+    /// The Changed file's contents path; `None` for the Preview.
+    pub file: Option<String>,
 }
 
 /// voight at work on a thread of its own: it loads the model, then assesses the texts it's given, one at a time,
@@ -222,12 +225,12 @@ pub enum Readiness {
     Failed,
 }
 
-/// The Assessments made this run, by thread, each of what its Preview showed for the activity its Notification had
-/// then; and whether voight is ready to make more.
+/// The Assessments made this run, and whether voight is ready to make more.
 #[derive(Debug)]
 pub struct Assessments {
     readiness: Readiness,
-    by_thread: HashMap<ThreadId, (DateTime<Utc>, Assessed)>,
+    /// Only the latest activity's, for each thread's Preview and Changed file.
+    by_key: HashMap<Key, Assessed>,
 }
 
 impl Default for Assessments {
@@ -235,7 +238,7 @@ impl Default for Assessments {
     fn default() -> Self {
         Self {
             readiness: Readiness::Loading,
-            by_thread: HashMap::new(),
+            by_key: HashMap::new(),
         }
     }
 }
@@ -255,26 +258,25 @@ impl Assessments {
     }
 
     /// Where the Assessment under `key` stands; `None` if it's never been asked for, or only for older activity.
-    pub fn get(&self, key: Key) -> Option<&Assessed> {
-        self.by_thread
-            .get(&key.thread)
-            .filter(|(as_of, _)| *as_of == key.as_of)
-            .map(|(_, assessed)| assessed)
+    pub fn get(&self, key: &Key) -> Option<&Assessed> {
+        self.by_key.get(key)
     }
 
     /// Whether voight is ready for another text: its model loaded, and no Assessment under way.
     pub fn can_assess(&self) -> bool {
         self.readiness == Readiness::Ready
             && !self
-                .by_thread
+                .by_key
                 .values()
-                .any(|(_, assessed)| *assessed == Assessed::Assessing)
+                .any(|assessed| *assessed == Assessed::Assessing)
     }
 
-    /// Notes that the Assessment under `key` is under way.
+    /// Notes that the Assessment under `key` is under way, in place of any of the same text for older activity.
     pub fn assessing(&mut self, key: Key) {
-        self.by_thread
-            .insert(key.thread, (key.as_of, Assessed::Assessing));
+        self.by_key.retain(|kept, assessed| {
+            kept.thread != key.thread || kept.file != key.file || *assessed == Assessed::Assessing
+        });
+        self.by_key.insert(key, Assessed::Assessing);
     }
 
     /// Takes in the Assessment made under `key`.
@@ -283,22 +285,19 @@ impl Assessments {
             Ok(share) => Assessed::Done(share),
             Err(why) => Assessed::Failed(why),
         };
-        self.by_thread.insert(key.thread, (key.as_of, assessed));
+        self.by_key.insert(key, assessed);
     }
 
-    /// Forgets `thread`'s Assessment, so that it's made again. One under way still arrives, and is taken in.
+    /// Forgets `thread`'s Assessments, so that they're made again. One under way still arrives, and is taken in.
     pub fn forget(&mut self, thread: ThreadId) {
-        if let Some((_, assessed)) = self.by_thread.get(&thread)
-            && *assessed != Assessed::Assessing
-        {
-            self.by_thread.remove(&thread);
-        }
+        self.by_key
+            .retain(|key, assessed| key.thread != thread || *assessed == Assessed::Assessing);
     }
 
     /// Forgets the Assessments of threads neither of `listing`'s lists holds, but one under way.
     pub fn retain_in(&mut self, listing: &Listing) {
-        self.by_thread.retain(|&thread, (_, assessed)| {
-            listing.contains(thread) || *assessed == Assessed::Assessing
+        self.by_key.retain(|key, assessed| {
+            listing.contains(key.thread) || *assessed == Assessed::Assessing
         });
     }
 }
@@ -313,6 +312,7 @@ mod tests {
         Key {
             thread: ThreadId(thread),
             as_of: "2026-10-22T12:00:00Z".parse().expect("valid RFC 3339"),
+            file: None,
         }
     }
 
@@ -325,11 +325,11 @@ mod tests {
         assert!(assessments.can_assess());
         assessments.assessing(key(1));
         assert!(!assessments.can_assess(), "one under way");
-        assert_eq!(assessments.get(key(1)), Some(&Assessed::Assessing));
+        assert_eq!(assessments.get(&key(1)), Some(&Assessed::Assessing));
 
         assessments.assessed(key(1), Ok(Some(0.73)));
         assert!(assessments.can_assess());
-        assert_eq!(assessments.get(key(1)), Some(&Assessed::Done(Some(0.73))));
+        assert_eq!(assessments.get(&key(1)), Some(&Assessed::Done(Some(0.73))));
     }
 
     #[test]
@@ -352,7 +352,7 @@ mod tests {
             ..key(1)
         };
 
-        assert_eq!(assessments.get(newer), None);
+        assert_eq!(assessments.get(&newer), None);
     }
 
     #[test]
@@ -366,8 +366,8 @@ mod tests {
         assessments.forget(ThreadId(2));
         assessments.retain_in(&Listing::default());
 
-        assert_eq!(assessments.get(key(1)), Some(&Assessed::Assessing));
-        assert_eq!(assessments.get(key(2)), None);
+        assert_eq!(assessments.get(&key(1)), Some(&Assessed::Assessing));
+        assert_eq!(assessments.get(&key(2)), None);
     }
 
     #[cfg(feature = "voight")]

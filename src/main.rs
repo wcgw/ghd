@@ -5,6 +5,8 @@ mod cache;
 mod change;
 mod config;
 mod done;
+mod fetched;
+mod files;
 mod filter;
 mod github;
 mod inbox;

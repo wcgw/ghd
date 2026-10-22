@@ -65,6 +65,7 @@ voight = { fg = "magenta" }
 [styles.diff]
 added = { fg = "green" }
 removed = { fg = "red" }
+changed = { fg = "yellow" }
 
 [styles.ci]
 passing = { fg = "green" }

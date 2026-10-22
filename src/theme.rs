@@ -135,10 +135,12 @@ theme! {
     /// What lays out a Preview's Markdown: list markers, table borders, heading markers, images' descriptions,
     /// footnotes.
     markdown_muted = "markdown.muted",
-    /// Lines added, in a pull request's Preview.
+    /// Lines added, in a pull request's Preview and a file's diff; and on the Files screen, an added file's letter.
     diff_added = "diff.added",
-    /// Lines removed, in a pull request's Preview.
+    /// Lines removed, in a pull request's Preview; and on the Files screen, a removed file's letter.
     diff_removed = "diff.removed",
+    /// On the Files screen, a modified, renamed or copied file's letter.
+    diff_changed = "diff.changed",
     /// A pull request's checks, in its Preview: all passed.
     ci_passing = "ci.passing",
     /// Some failed.

@@ -21,8 +21,10 @@ use serde::de::DeserializeOwned;
 use crate::inbox::{ApiPaths, Listing, Notification, Reason, SubjectKind, ThreadId};
 use crate::state::SubjectState;
 
+mod files;
 mod preview;
 
+pub use files::FilesRequest;
 pub use preview::PreviewRequest;
 
 /// github.com's hostname.

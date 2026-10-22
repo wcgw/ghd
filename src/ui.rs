@@ -22,11 +22,13 @@ use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::done::DoneMarks;
-use crate::github::{GitHub, PreviewRequest};
+use crate::fetched;
+use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText};
+use crate::github::{FilesRequest, GitHub, PreviewRequest};
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
 use crate::markdown;
 use crate::preview::{
-    self, Body, Ci, Note, Preview, Previews, PullRequestSummary, ReviewDecision, Shown, Why,
+    Body, Ci, Note, Preview, Previews, PullRequestSummary, ReviewDecision, Shown, Why,
 };
 use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
@@ -89,6 +91,9 @@ pub async fn run(
     // The fetch of a Preview under way, if any; never more than one. One the cursor has left still arrives, and is
     // kept for when it comes back.
     let mut preview_fetch = None;
+    // The fetches of the Files screen's Changed files and of a whole file under way, if any; one of each at most.
+    let mut files_fetch = None;
+    let mut text_fetch = None;
 
     loop {
         if lookup.is_none() {
@@ -106,6 +111,16 @@ pub async fn run(
         }
         // When to wake up to fetch the Preview at the cursor, once it's stayed there.
         let preview_due = app.preview_due().map(|(due, _)| due);
+        if files_fetch.is_none()
+            && let Some(wanted) = app.files_to_fetch()
+        {
+            files_fetch = Some(Box::pin(fetch_files(github, wanted)));
+        }
+        if text_fetch.is_none()
+            && let Some(wanted) = app.file_text_to_fetch()
+        {
+            text_fetch = Some(Box::pin(fetch_file_text(github, wanted)));
+        }
         if let Some(assessor) = &assessor
             && let Some((key, text)) = app.assessment_to_start()
         {
@@ -136,6 +151,14 @@ pub async fn run(
             // Nothing to do but go round again, to fetch it.
             () = tokio::time::sleep_until(preview_due.unwrap_or(now)),
                 if preview_fetch.is_none() && preview_due.is_some() => {}
+            Some(fetched) = OptionFuture::from(files_fetch.as_mut()), if files_fetch.is_some() => {
+                files_fetch = None;
+                app.files_fetched(fetched);
+            }
+            Some(fetched) = OptionFuture::from(text_fetch.as_mut()), if text_fetch.is_some() => {
+                text_fetch = None;
+                app.file_text_fetched(fetched);
+            }
             Some(said) = OptionFuture::from(assessor.as_mut().map(Assessor::next)), if assessor.is_some() => {
                 match said {
                     Some(event) => app.voight_said(event),
@@ -294,6 +317,59 @@ async fn fetch_preview(github: &GitHub, wanted: WantedPreview) -> PreviewFetched
     }
 }
 
+/// A pull request's Changed files to fetch, for the activity its Notification has.
+struct WantedFiles {
+    thread: ThreadId,
+    as_of: DateTime<Utc>,
+    request: FilesRequest,
+}
+
+/// The outcome of fetching a pull request's Changed files.
+struct FilesFetched {
+    thread: ThreadId,
+    as_of: DateTime<Utc>,
+    files: anyhow::Result<Vec<ChangedFile>>,
+}
+
+/// Fetches the Changed files `wanted` from `github`.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::changed_files`] is.
+async fn fetch_files(github: &GitHub, wanted: WantedFiles) -> FilesFetched {
+    FilesFetched {
+        files: github.changed_files(&wanted.request).await,
+        thread: wanted.thread,
+        as_of: wanted.as_of,
+    }
+}
+
+/// A Changed file's whole text to fetch.
+struct WantedText {
+    thread: ThreadId,
+    contents_path: String,
+}
+
+/// The outcome of fetching a Changed file's whole text.
+struct TextFetched {
+    thread: ThreadId,
+    contents_path: String,
+    text: anyhow::Result<FileText>,
+}
+
+/// Fetches the whole text `wanted` from `github`.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::file_text`] is.
+async fn fetch_file_text(github: &GitHub, wanted: WantedText) -> TextFetched {
+    TextFetched {
+        text: github.file_text(&wanted.contents_path).await,
+        thread: wanted.thread,
+        contents_path: wanted.contents_path,
+    }
+}
+
 /// What a key press can ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -329,10 +405,14 @@ enum Command {
     ToggleUnreadOnly,
     /// Opens the Preview of the Notification at the cursor below the list, or closes it.
     TogglePreview,
-    /// Scrolls the Preview down by half its height.
+    /// Scrolls the Preview down by half its height; on the Files screen, the selected file.
     ScrollPreviewDown,
-    /// Scrolls the Preview up by half its height.
+    /// Scrolls the Preview up by half its height; on the Files screen, the selected file.
     ScrollPreviewUp,
+    /// Shows the Changed files of the pull request at the cursor in place of the list, or closes them.
+    OpenFiles,
+    /// On the Files screen, shows the selected file whole rather than its diff, or its diff again.
+    ToggleWholeFile,
     Help,
 }
 
@@ -354,17 +434,10 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
         },
     ),
     (
-        &[Command::ToggleSelected],
+        &[Command::ToggleSelected, Command::SelectAllShown],
         KeyHelp {
-            keys: "Space",
-            does: "select or unselect, and move down",
-        },
-    ),
-    (
-        &[Command::SelectAllShown],
-        KeyHelp {
-            keys: "A",
-            does: "select all shown, or unselect them",
+            keys: "Space  A",
+            does: "select or not, and move down; all shown, or none",
         },
     ),
     (
@@ -425,6 +498,13 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
         KeyHelp {
             keys: "p  J  K",
             does: "show or hide the Preview; scroll it",
+        },
+    ),
+    (
+        &[Command::OpenFiles, Command::ToggleWholeFile],
+        KeyHelp {
+            keys: "f  w",
+            does: "a pull request's files; a file whole, or its diff",
         },
     ),
     (
@@ -517,6 +597,8 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('p') => Some(Command::TogglePreview),
         KeyCode::Char('J') => Some(Command::ScrollPreviewDown),
         KeyCode::Char('K') => Some(Command::ScrollPreviewUp),
+        KeyCode::Char('f') => Some(Command::OpenFiles),
+        KeyCode::Char('w') => Some(Command::ToggleWholeFile),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
@@ -598,6 +680,34 @@ struct App {
     screen_height: u16,
     /// voight's Assessments of Previews, and whether it's ready to make more; `None` while voight is off.
     assessments: Option<Assessments>,
+    /// The Files screen, while it's open.
+    files: Option<FilesScreen>,
+    /// The Changed files fetched so far.
+    changed_files: ChangedFiles,
+}
+
+/// The Files screen: a pull request's Changed files in place of the list, the selected one below.
+#[derive(Debug)]
+struct FilesScreen {
+    /// The pull request's Notification, as it was when the screen opened.
+    notification: Notification,
+    request: FilesRequest,
+    /// The selected file's row.
+    cursor: TableState,
+    /// How many rows the list had room for at the last draw.
+    rows: u16,
+    /// The files shown whole rather than as their diff, by path.
+    whole: HashSet<String>,
+    /// The selected file's pane.
+    scroll: Scrolled,
+}
+
+/// Text on screen for voight to assess, and what it's of.
+struct Assessable<'a> {
+    key: assessment::Key,
+    text: Cow<'a, str>,
+    /// `text` is Markdown, to assess as the Preview draws it.
+    markdown: bool,
 }
 
 /// The Preview pane, and where it's at.
@@ -606,18 +716,46 @@ struct PreviewPane {
     /// The thread at the cursor, and since when: its Preview is fetched once the cursor has stayed on it for
     /// [`PREVIEW_REST`].
     at: Option<(ThreadId, Instant)>,
-    /// How many lines the Preview is scrolled down.
-    scroll: u16,
-    /// How many lines the pane had room for at the last draw.
+    scroll: Scrolled,
+}
+
+/// How far down a pane of text is scrolled, and what fit in it at the last draw.
+#[derive(Debug, Default)]
+struct Scrolled {
+    /// How many lines down.
+    by: u16,
+    /// How many lines the pane had room for.
     rows: u16,
-    /// How many lines the Preview took at the last draw, wrapped to the pane's width.
+    /// How many lines the text took, wrapped to the pane's width.
     lines: u16,
 }
 
-impl PreviewPane {
-    /// The furthest the Preview can be scrolled: until its last line is at the bottom of the pane.
-    fn max_scroll(&self) -> u16 {
+impl Scrolled {
+    /// Scrolls down by half the pane, no further than to the text's last line at the bottom of the pane.
+    fn half_down(&mut self) {
+        let half = (self.rows / 2).max(1);
+        self.by = self.by.saturating_add(half).min(self.furthest());
+    }
+
+    /// Scrolls up by half the pane, no further than the top.
+    fn half_up(&mut self) {
+        self.by = self.by.saturating_sub((self.rows / 2).max(1));
+    }
+
+    /// The furthest the text can be scrolled: until its last line is at the bottom of the pane.
+    fn furthest(&self) -> u16 {
         self.lines.saturating_sub(self.rows)
+    }
+
+    /// Draws `text` in `block` on `area` of `frame`, as far down as it's scrolled, noting what fits.
+    fn render(&mut self, frame: &mut Frame, area: Rect, text: Paragraph, block: Block) {
+        // Inside the border.
+        self.rows = area.height.saturating_sub(2);
+        self.lines =
+            u16::try_from(text.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
+        // Shorter text, or a taller pane, than at the last scroll.
+        self.by = self.by.min(self.furthest());
+        frame.render_widget(text.scroll((self.by, 0)).block(block), area);
     }
 }
 
@@ -686,6 +824,8 @@ impl App {
             previews: Previews::default(),
             screen_height: 0,
             assessments: None,
+            files: None,
+            changed_files: ChangedFiles::default(),
         }
     }
 
@@ -725,6 +865,7 @@ impl App {
         self.selection.retain(|&thread| listing.contains(thread));
         self.states.retain_in(&listing);
         self.previews.retain_in(&listing);
+        self.changed_files.retain_in(&listing);
         if let Some(assessments) = &mut self.assessments {
             assessments.retain_in(&listing);
         }
@@ -852,7 +993,7 @@ impl App {
             return;
         }
         pane.at = thread.map(|thread| (thread, now));
-        pane.scroll = 0;
+        pane.scroll.by = 0;
         if let Some(thread) = thread {
             self.previews.forget_failed(thread);
         }
@@ -862,6 +1003,9 @@ impl App {
     /// [`PREVIEW_REST`]. `None` while the Preview is closed, or the one at the cursor is fetched, being fetched, or
     /// can't be.
     fn preview_due(&self) -> Option<(Instant, WantedPreview)> {
+        if self.files.is_some() {
+            return None;
+        }
         let (thread, since) = self.preview.as_ref()?.at?;
         let notification = self.at_cursor().filter(|n| n.thread == thread)?;
         if self.previews.get(notification).is_some() {
@@ -894,39 +1038,88 @@ impl App {
             .fetched(fetched.thread, fetched.as_of, fetched.preview);
     }
 
-    /// The Preview on screen, fetched, with what it's of; `None` while it's closed, not fetched yet, or has nothing
-    /// to show.
+    /// The Preview on screen, fetched, with what it's of; `None` while it's closed, hidden by the Files screen, not
+    /// fetched yet, or has nothing to show.
     fn preview_on_screen(&self) -> Option<(assessment::Key, &Preview)> {
+        if self.files.is_some() {
+            return None;
+        }
         self.preview.as_ref()?;
         let notification = self.at_cursor()?;
-        let preview::Fetched::Done(preview) = self.previews.get(notification)? else {
+        let fetched::Fetched::Done(preview) = self.previews.get(notification)? else {
             return None;
         };
         let key = assessment::Key {
             thread: notification.thread,
             as_of: notification.updated_at,
+            file: None,
         };
         Some((key, preview))
     }
 
-    /// The text to assess now, and what it's of, noted as being assessed: what the Preview on screen shows, once
-    /// voight is ready and assessing nothing else. `None` otherwise, and when voight is off.
-    fn assessment_to_start(&mut self) -> Option<(assessment::Key, String)> {
-        if !self.assessments.as_ref()?.can_assess() {
-            return None;
+    /// What's on screen for voight to assess: on the Files screen, the selected file, if it's Markdown shown whole;
+    /// otherwise what the Preview shows. `None` when there's nothing to assess.
+    fn assessable(&self) -> Option<Assessable<'_>> {
+        if let Some(files) = &self.files {
+            let file = self.selected_file()?;
+            if !file.is_markdown() || !self.shows_whole(file) {
+                return None;
+            }
+            let text = match file.added_text() {
+                Some(text) => Cow::Owned(text),
+                None => match self
+                    .changed_files
+                    .text(files.notification.thread, &file.contents_path)?
+                {
+                    fetched::Fetched::Done(FileText::Text { text, .. }) => {
+                        Cow::Borrowed(text.as_str())
+                    }
+                    _ => return None,
+                },
+            };
+            let key = assessment::Key {
+                thread: files.notification.thread,
+                as_of: files.notification.updated_at,
+                file: Some(file.contents_path.clone()),
+            };
+            return Some(Assessable {
+                key,
+                text,
+                markdown: true,
+            });
         }
         let (key, preview) = self.preview_on_screen()?;
+        let (text, markdown) = match &preview.shown {
+            Shown::Comment(comment) => (comment.body.as_str(), true),
+            Shown::Body(Body::Markdown(body)) => (body.as_str(), true),
+            Shown::Body(Body::Plain(body)) => (body.as_str(), false),
+        };
+        Some(Assessable {
+            key,
+            text: Cow::Borrowed(text),
+            markdown,
+        })
+    }
+
+    /// The text to assess now, and what it's of, noted as being assessed: what's [assessable](Self::assessable), once
+    /// voight is ready and assessing nothing else. `None` otherwise, and when voight is off.
+    fn assessment_to_start(&mut self) -> Option<(assessment::Key, String)> {
         let assessments = self.assessments.as_ref()?;
-        if assessments.get(key).is_some() {
+        if !assessments.can_assess() {
             return None;
         }
-        // Markdown as the Preview draws it: no HTML comments left by templates, say, which the author didn't write.
-        let text = match &preview.shown {
-            Shown::Comment(comment) => markdown::as_github_shows(&comment.body),
-            Shown::Body(Body::Markdown(body)) => markdown::as_github_shows(body),
-            Shown::Body(Body::Plain(body)) => body.clone(),
+        let assessable = self.assessable()?;
+        if assessments.get(&assessable.key).is_some() {
+            return None;
+        }
+        // Markdown as ghd draws it: no HTML comments left by templates, say, which the author didn't write.
+        let text = if assessable.markdown {
+            markdown::as_github_shows(&assessable.text)
+        } else {
+            assessable.text.into_owned()
         };
-        self.assessments.as_mut()?.assessing(key);
+        let key = assessable.key;
+        self.assessments.as_mut()?.assessing(key.clone());
         Some((key, text))
     }
 
@@ -952,17 +1145,20 @@ impl App {
         }
     }
 
-    /// What the Preview's border says of voight: that it's loading, assessing, or its Assessment; `None` when there's
-    /// nothing to say, as for a text with too little prose.
+    /// What the border of the Preview, or of the file on the Files screen, says of voight: that it's loading,
+    /// assessing, or its Assessment; `None` when there's nothing to say, as for a text with too little prose.
     fn assessment_label(&self) -> Option<String> {
         let assessments = self.assessments.as_ref()?;
+        let assessable = self.assessable();
         match assessments.readiness() {
-            Readiness::Loading => return Some(" voight loading… ".to_owned()),
-            Readiness::Failed => return None,
+            // On the Files screen, only over a file it'll assess.
+            Readiness::Loading if self.files.is_none() || assessable.is_some() => {
+                return Some(" voight loading… ".to_owned());
+            }
+            Readiness::Loading | Readiness::Failed => return None,
             Readiness::Ready => {}
         }
-        let (key, _) = self.preview_on_screen()?;
-        match assessments.get(key) {
+        match assessments.get(&assessable?.key) {
             None | Some(Assessed::Assessing) => Some(" voight … ".to_owned()),
             Some(Assessed::Done(Some(share))) => Some(format!(" voight {:.0}% ", share * 100.0)),
             Some(Assessed::Done(None)) => None,
@@ -1061,7 +1257,11 @@ impl App {
             self.type_search(key);
             return None;
         }
-        match command_for(key)? {
+        let command = command_for(key)?;
+        if self.files.is_some() {
+            return self.press_in_files(command);
+        }
+        match command {
             Command::Quit => Some(Outcome::Quit),
             Command::Refresh => {
                 // The Preview on screen too: what it shows can change without notifying, like labels.
@@ -1080,6 +1280,194 @@ impl App {
                 (!changes.is_empty()).then_some(Outcome::Send(changes))
             }
         }
+    }
+
+    /// Carries out `command` on the Files screen, where only moving, scrolling, `w`, `o`, `r`, Esc or `f`, `?` and
+    /// quitting do anything: the rest act on Notifications. Returns what's left for `run` to do.
+    fn press_in_files(&mut self, command: Command) -> Option<Outcome> {
+        let togglable = self
+            .selected_file()
+            .filter(|file| !matches!(file.status, FileStatus::Added | FileStatus::Removed))
+            .map(|file| file.path.clone());
+        let files = self.files.as_mut()?;
+        match command {
+            Command::Quit => return Some(Outcome::Quit),
+            Command::Down => files.cursor.select_next(),
+            Command::Up => files.cursor.select_previous(),
+            Command::HalfPageDown => files.cursor.scroll_down_by((files.rows / 2).max(1)),
+            Command::HalfPageUp => files.cursor.scroll_up_by((files.rows / 2).max(1)),
+            Command::ScrollPreviewDown => {
+                files.scroll.half_down();
+                return None;
+            }
+            Command::ScrollPreviewUp => {
+                files.scroll.half_up();
+                return None;
+            }
+            Command::ToggleWholeFile => {
+                if let Some(path) = togglable
+                    && !files.whole.remove(&path)
+                {
+                    files.whole.insert(path);
+                }
+            }
+            Command::Refresh => {
+                let thread = files.notification.thread;
+                self.changed_files.forget(thread);
+                if let Some(assessments) = &mut self.assessments {
+                    assessments.forget(thread);
+                }
+                return None;
+            }
+            Command::Open => return self.open_file(),
+            Command::Clear | Command::OpenFiles => {
+                self.files = None;
+                return None;
+            }
+            Command::Help => {
+                self.help_shown = true;
+                return None;
+            }
+            // What acts on Notifications.
+            Command::ToggleSelected
+            | Command::SelectAllShown
+            | Command::NextView
+            | Command::PreviousView
+            | Command::ShowView(_)
+            | Command::Search
+            | Command::MarkRead
+            | Command::MarkDone
+            | Command::ToggleDone
+            | Command::ToggleUnreadOnly
+            | Command::TogglePreview => return None,
+        }
+        // Another file, or another way to show it: from its top.
+        files.scroll.by = 0;
+        None
+    }
+
+    /// Opens the Files screen for the pull request at the cursor; says why not if it isn't one, or the terminal is
+    /// too short.
+    fn open_files(&mut self) {
+        let Some(notification) = self.at_cursor() else {
+            return;
+        };
+        let Some(request) = FilesRequest::for_notification(notification) else {
+            self.status = Some(StatusMessage::Info(
+                "Only pull requests have files".to_owned(),
+            ));
+            return;
+        };
+        if self.screen_height < PREVIEW_MIN_HEIGHT {
+            self.status = Some(StatusMessage::Info(format!(
+                "Files need a terminal at least {PREVIEW_MIN_HEIGHT} lines tall"
+            )));
+            return;
+        }
+        self.files = Some(FilesScreen {
+            notification: notification.clone(),
+            request,
+            cursor: TableState::new().with_selected(Some(0)),
+            rows: 0,
+            whole: HashSet::new(),
+            scroll: Scrolled::default(),
+        });
+    }
+
+    /// The Changed file selected on the Files screen; `None` while it's closed, or its files aren't fetched yet.
+    fn selected_file(&self) -> Option<&ChangedFile> {
+        let files = self.files.as_ref()?;
+        let fetched::Fetched::Done(list) = self
+            .changed_files
+            .list(files.notification.thread, files.notification.updated_at)?
+        else {
+            return None;
+        };
+        list.get(files.cursor.selected()?)
+    }
+
+    /// Whether `file` shows whole rather than as its diff: a new one, or one `w` asked for, but never a removed one.
+    fn shows_whole(&self, file: &ChangedFile) -> bool {
+        match file.status {
+            FileStatus::Added => true,
+            FileStatus::Removed => false,
+            FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => self
+                .files
+                .as_ref()
+                .is_some_and(|files| files.whole.contains(&file.path)),
+        }
+    }
+
+    /// Where GitHub shows the selected Changed file: in the pull request's "Files changed" tab, at the file; or the
+    /// tab itself while the files aren't fetched.
+    fn selected_file_url(&self) -> Option<String> {
+        let page = &self.files.as_ref()?.notification.subject_url;
+        Some(match self.selected_file() {
+            Some(file) => format!("{page}/files#{}", file.anchor()),
+            None => format!("{page}/files"),
+        })
+    }
+
+    /// Opens the selected Changed file on GitHub, which marks the pull request's Notification read, as opening it
+    /// does.
+    fn open_file(&mut self) -> Option<Outcome> {
+        let url = self.selected_file_url()?;
+        if let Err(error) = open::that_detached(&url) {
+            self.status = Some(StatusMessage::Error(format!(
+                "Couldn't open a browser: {error}"
+            )));
+            return None;
+        }
+        let thread = self.files.as_ref()?.notification.thread;
+        let changes = self.mark_read(vec![thread]);
+        (!changes.is_empty()).then_some(Outcome::Send(changes))
+    }
+
+    /// The Changed files to fetch now, noted as being fetched: the Files screen's, unless they're fetched already.
+    fn files_to_fetch(&mut self) -> Option<WantedFiles> {
+        let files = self.files.as_ref()?;
+        let (thread, as_of) = (files.notification.thread, files.notification.updated_at);
+        if self.changed_files.list(thread, as_of).is_some() {
+            return None;
+        }
+        let request = files.request.clone();
+        self.changed_files.fetching_list(thread, as_of);
+        Some(WantedFiles {
+            thread,
+            as_of,
+            request,
+        })
+    }
+
+    /// Takes in a pull request's Changed files, or why they couldn't be fetched.
+    fn files_fetched(&mut self, fetched: FilesFetched) {
+        self.changed_files
+            .fetched_list(fetched.thread, fetched.as_of, fetched.files);
+    }
+
+    /// The whole file to fetch now, noted as being fetched: the selected one, when it's shown whole and there's no
+    /// patch to show it from.
+    fn file_text_to_fetch(&mut self) -> Option<WantedText> {
+        let file = self.selected_file()?;
+        if !self.shows_whole(file) || file.added_text().is_some() {
+            return None;
+        }
+        let thread = self.files.as_ref()?.notification.thread;
+        let contents_path = file.contents_path.clone();
+        if self.changed_files.text(thread, &contents_path).is_some() {
+            return None;
+        }
+        self.changed_files.fetching_text(thread, &contents_path);
+        Some(WantedText {
+            thread,
+            contents_path,
+        })
+    }
+
+    /// Takes in a whole file, or why it couldn't be fetched.
+    fn file_text_fetched(&mut self, fetched: TextFetched) {
+        self.changed_files
+            .fetched_text(fetched.thread, &fetched.contents_path, fetched.text);
     }
 
     /// Carries out `command` on screen. Returns the changes to send to GitHub, if the command makes any.
@@ -1164,15 +1552,17 @@ impl App {
                 )));
             }
             Command::TogglePreview => self.preview = Some(PreviewPane::default()),
+            Command::OpenFiles => self.open_files(),
+            // Only on the Files screen, which `press` hands its keys to.
+            Command::ToggleWholeFile => {}
             Command::ScrollPreviewDown => {
                 if let Some(pane) = &mut self.preview {
-                    let half = (pane.rows / 2).max(1);
-                    pane.scroll = pane.scroll.saturating_add(half).min(pane.max_scroll());
+                    pane.scroll.half_down();
                 }
             }
             Command::ScrollPreviewUp => {
                 if let Some(pane) = &mut self.preview {
-                    pane.scroll = pane.scroll.saturating_sub((pane.rows / 2).max(1));
+                    pane.scroll.half_up();
                 }
             }
             Command::Open => return self.open(),
@@ -1392,8 +1782,19 @@ impl App {
         let [view_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
-        // On a terminal made too short while it's open, the Preview waits for it to grow again.
-        if self.preview.is_some() && self.screen_height >= PREVIEW_MIN_HEIGHT {
+        let tall_enough = self.screen_height >= PREVIEW_MIN_HEIGHT;
+        // On a terminal made too short while they're open, the Preview and a file wait for it to grow again.
+        if self.files.is_some() {
+            if tall_enough {
+                let [list_area, file_area] =
+                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .areas(view_area);
+                self.render_files(frame, list_area);
+                self.render_file(frame, file_area);
+            } else {
+                self.render_files(frame, view_area);
+            }
+        } else if self.preview.is_some() && tall_enough {
             let [list_area, preview_area] =
                 Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(view_area);
@@ -1490,28 +1891,232 @@ impl App {
         frame.render_widget(message.block(block), area);
     }
 
+    /// Draws the Files screen's list in `area`: the pull request in its border, and its Changed files.
+    fn render_files(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme;
+        let Some(files) = &mut self.files else {
+            return;
+        };
+        // Inside the border.
+        files.rows = area.height.saturating_sub(2);
+        let notification = &files.notification;
+        let fetched = self
+            .changed_files
+            .list(notification.thread, notification.updated_at);
+        let number = notification
+            .subject_url
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        let mut title = vec![
+            Span::raw(" "),
+            Span::styled(format!("#{number} "), theme.age),
+            Span::styled(notification.subject_title.clone(), theme.title.bold()),
+        ];
+        if let Some(fetched::Fetched::Done(list)) = fetched {
+            let added: u64 = list.iter().map(|file| file.additions).sum();
+            let removed: u64 = list.iter().map(|file| file.deletions).sum();
+            title.extend([
+                Span::raw(format!(" · {} · ", counted(list.len() as u64, "file"))),
+                Span::styled(format!("+{added}"), theme.diff_added),
+                Span::raw(" "),
+                Span::styled(format!("\u{2212}{removed}"), theme.diff_removed),
+            ]);
+        }
+        title.push(Span::raw(" "));
+        let block = Block::bordered()
+            .border_style(theme.border)
+            .title(Line::from(title))
+            .title_bottom(
+                Line::styled(" Esc back · w whole file or diff · ? keys ", theme.hint)
+                    .right_aligned(),
+            );
+        let list = match fetched {
+            None | Some(fetched::Fetched::Fetching) => {
+                frame.render_widget(
+                    Paragraph::new("Fetching files…")
+                        .style(theme.message)
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            Some(fetched::Fetched::Failed(why)) => {
+                frame.render_widget(
+                    Paragraph::new(format!("Couldn't fetch the files: {why}"))
+                        .style(theme.error)
+                        .wrap(Wrap { trim: false })
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            Some(fetched::Fetched::Done(list)) if list.is_empty() => {
+                frame.render_widget(
+                    Paragraph::new("No files.")
+                        .style(theme.message)
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            Some(fetched::Fetched::Done(list)) => list,
+        };
+        let counts = |file: &ChangedFile| format!("+{} \u{2212}{}", file.additions, file.deletions);
+        let counts_width = list
+            .iter()
+            .map(|file| counts(file).chars().count())
+            .max()
+            .unwrap_or(0);
+        let rows = list.iter().map(|file| {
+            let letter_style = match file.status {
+                FileStatus::Added => theme.diff_added,
+                FileStatus::Removed => theme.diff_removed,
+                FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => {
+                    theme.diff_changed
+                }
+            };
+            let path = match &file.previous_path {
+                Some(previous) => format!("{previous} \u{2192} {}", file.path),
+                None => file.path.clone(),
+            };
+            Row::new([
+                Cell::from(file.status.letter().to_string()).style(letter_style),
+                Cell::from(path).style(theme.title),
+                Cell::from(Line::from(counts(file)).right_aligned()).style(theme.age),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(u16::try_from(counts_width).unwrap_or(u16::MAX)),
+            ],
+        )
+        .row_highlight_style(theme.cursor)
+        .block(block);
+        frame.render_stateful_widget(table, area, &mut files.cursor);
+    }
+
+    /// Draws the Changed file selected on the Files screen in `area`, as far down as it's scrolled.
+    fn render_file(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme;
+        // Inside the border.
+        let width = area.width.saturating_sub(2);
+        let (path, lines) = match self.selected_file() {
+            Some(file) => (format!(" {} ", file.path), self.file_lines(file, width)),
+            None => (String::new(), Vec::new()),
+        };
+        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let mut block = Block::bordered()
+            .border_style(theme.border)
+            .title(Line::styled(path, theme.tab));
+        if let Some(label) = self.assessment_label() {
+            block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
+        }
+        if let Some(files) = &mut self.files {
+            files.scroll.render(frame, area, text, block);
+        }
+    }
+
+    /// What the file pane shows of `file`, `width` cells wide: where it was renamed or copied from, then the file
+    /// whole or its diff, or why there's neither.
+    fn file_lines(&self, file: &ChangedFile, width: u16) -> Vec<Line<'static>> {
+        let theme = &self.theme;
+        let mut lines = Vec::new();
+        match (file.status, &file.previous_path) {
+            (FileStatus::Renamed, Some(previous)) => lines.push(Line::styled(
+                format!("Renamed from {previous}"),
+                theme.markdown_muted,
+            )),
+            (FileStatus::Copied, Some(previous)) => lines.push(Line::styled(
+                format!("Copied from {previous}"),
+                theme.markdown_muted,
+            )),
+            _ => {}
+        }
+        let what = match &file.patch {
+            _ if file.status == FileStatus::Removed => vec![Line::styled(
+                format!("Deleted: {}", counted(file.deletions, "line")),
+                theme.markdown_muted,
+            )],
+            _ if self.shows_whole(file) => self.whole_file_lines(file, width),
+            Some(patch) => diff_lines(patch, theme),
+            // Renamed or copied as it was: that's all there is to say.
+            None if file.additions + file.deletions == 0 && !lines.is_empty() => Vec::new(),
+            None => vec![Line::styled(
+                "No diff from GitHub (binary, or too large): o opens it.",
+                theme.message,
+            )],
+        };
+        if !lines.is_empty() && !what.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(what);
+        lines
+    }
+
+    /// `file`, whole, `width` cells wide: rendered if it's Markdown; or why it can't be shown yet, or at all.
+    fn whole_file_lines(&self, file: &ChangedFile, width: u16) -> Vec<Line<'static>> {
+        let theme = &self.theme;
+        let (text, truncated) = match file.added_text() {
+            Some(text) => (Cow::Owned(text), false),
+            None => {
+                let thread = self.files.as_ref().map(|files| files.notification.thread);
+                match thread.and_then(|thread| self.changed_files.text(thread, &file.contents_path))
+                {
+                    None | Some(fetched::Fetched::Fetching) => {
+                        return vec![Line::styled("Fetching…", theme.message)];
+                    }
+                    Some(fetched::Fetched::Failed(why)) => {
+                        return vec![Line::styled(
+                            format!("Couldn't fetch the file: {why}"),
+                            theme.error,
+                        )];
+                    }
+                    Some(fetched::Fetched::Done(FileText::Binary)) => {
+                        return vec![Line::styled("Binary: o opens it.", theme.message)];
+                    }
+                    Some(fetched::Fetched::Done(FileText::Text { text, truncated })) => {
+                        (Cow::Borrowed(text.as_str()), *truncated)
+                    }
+                }
+            }
+        };
+        if text.trim().is_empty() {
+            return vec![Line::styled("Empty file.", theme.message)];
+        }
+        let mut lines = if file.is_markdown() {
+            markdown::lines(&text, theme, width)
+        } else {
+            text.lines().map(|line| Line::raw(untabbed(line))).collect()
+        };
+        if truncated {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                "Only its first 1 MB is shown: o opens the rest.",
+                theme.message,
+            ));
+        }
+        lines
+    }
+
     /// Draws the Preview of the Notification at the cursor in `area`, as far down as it's scrolled.
     fn render_preview(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         // Inside the border.
         let width = area.width.saturating_sub(2);
-        let paragraph =
-            Paragraph::new(self.preview_lines(Utc::now(), width)).wrap(Wrap { trim: false });
-        let Some(pane) = &mut self.preview else {
-            return;
-        };
-        pane.rows = area.height.saturating_sub(2);
-        pane.lines = u16::try_from(paragraph.line_count(width)).unwrap_or(u16::MAX);
-        // A shorter Preview, or a taller pane, than at the last scroll.
-        pane.scroll = pane.scroll.min(pane.max_scroll());
-        let scroll = pane.scroll;
+        let text = Paragraph::new(self.preview_lines(Utc::now(), width)).wrap(Wrap { trim: false });
         let mut block = Block::bordered()
             .border_style(theme.border)
             .title(Line::styled(" Preview ", theme.tab));
         if let Some(label) = self.assessment_label() {
             block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
         }
-        frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
+        if let Some(pane) = &mut self.preview {
+            pane.scroll.render(frame, area, text, block);
+        }
     }
 
     /// What the Preview pane shows of the Notification at the cursor, as of `now`, `width` cells wide: its Preview
@@ -1529,13 +2134,13 @@ impl App {
                 "No Preview for this kind of Notification yet: o opens it.".to_owned(),
                 theme.message,
             ),
-            (Some(_), Some(preview::Fetched::Done(preview))) => {
+            (Some(_), Some(fetched::Fetched::Done(preview))) => {
                 return preview_lines(preview, &notification.repository, theme, now, width);
             }
-            (Some(_), Some(preview::Fetched::Failed(why))) => {
+            (Some(_), Some(fetched::Fetched::Failed(why))) => {
                 (format!("Couldn't fetch the Preview: {why}"), theme.error)
             }
-            (Some(_), None | Some(preview::Fetched::Fetching)) => {
+            (Some(_), None | Some(fetched::Fetched::Fetching)) => {
                 ("Fetching…".to_owned(), theme.message)
             }
         };
@@ -1751,12 +2356,38 @@ fn preview_lines(
     lines
 }
 
-/// A pull request's line in its Preview: its changes, then its checks and review decision, when known.
-fn pull_request_line(summary: &PullRequestSummary, theme: &Theme) -> Line<'static> {
-    let counted = |count: u64, what: &str| match count {
+/// `count` of `what`: `1 file`, `3 files`.
+fn counted(count: u64, what: &str) -> String {
+    match count {
         1 => format!("1 {what}"),
         count => format!("{count} {what}s"),
-    };
+    }
+}
+
+/// `line` with its tabs as four spaces, which a terminal cell can't hold.
+fn untabbed(line: &str) -> String {
+    line.replace('\t', "    ")
+}
+
+/// The lines of a unified diff, `patch`, in `theme`: added and removed lines in their colors, hunk headers muted.
+fn diff_lines(patch: &str, theme: &Theme) -> Vec<Line<'static>> {
+    patch
+        .lines()
+        .map(|line| {
+            let style = match line.chars().next() {
+                Some('+') => theme.diff_added,
+                Some('-') => theme.diff_removed,
+                // `@@ -1,3 +1,4 @@` and "\ No newline at end of file".
+                Some('@' | '\\') => theme.markdown_muted,
+                _ => Style::new(),
+            };
+            Line::styled(untabbed(line), style)
+        })
+        .collect()
+}
+
+/// A pull request's line in its Preview: its changes, then its checks and review decision, when known.
+fn pull_request_line(summary: &PullRequestSummary, theme: &Theme) -> Line<'static> {
     let mut line = Line::from(vec![
         Span::styled(format!("+{}", summary.additions), theme.diff_added),
         Span::raw(" "),
@@ -2291,6 +2922,11 @@ mod tests {
             press(KeyCode::Char('p'), none),
             Some(Command::TogglePreview)
         );
+        assert_eq!(press(KeyCode::Char('f'), none), Some(Command::OpenFiles));
+        assert_eq!(
+            press(KeyCode::Char('w'), none),
+            Some(Command::ToggleWholeFile)
+        );
         assert_eq!(
             press(KeyCode::Char('J'), KeyModifiers::SHIFT),
             Some(Command::ScrollPreviewDown)
@@ -2653,7 +3289,7 @@ mod tests {
         screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
         let pane = |app: &App| {
             let pane = app.preview.as_ref().expect("open");
-            (pane.scroll, pane.rows, pane.lines)
+            (pane.scroll.by, pane.scroll.rows, pane.scroll.lines)
         };
         let (_, rows, lines) = pane(&app);
         // The header's three lines, then the body's forty.
@@ -2965,6 +3601,277 @@ mod tests {
         assert!(app.assessment_to_start().is_none());
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
         assert!(!preview_border(&lines).contains("voight"), "{lines:#?}");
+    }
+
+    /// [`app`] with "Add polling" a pull request whose Changed files the REST API has, drawn on a screen tall
+    /// enough for the Files screen.
+    fn app_with_a_pull_request() -> App {
+        let mut app = app();
+        let mut held = notifications();
+        held[0].api_paths = ApiPaths {
+            subject: Some("/repos/wcgw/ghd/pulls/1".to_owned()),
+            latest_comment: None,
+        };
+        app.fetched(fetched(held));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app
+    }
+
+    fn changed(path: &str, status: FileStatus, patch: Option<&str>) -> ChangedFile {
+        ChangedFile {
+            path: path.to_owned(),
+            status,
+            previous_path: None,
+            additions: 3,
+            deletions: 1,
+            patch: patch.map(str::to_owned),
+            contents_path: format!("/repos/wcgw/ghd/contents/{path}?ref=abc"),
+        }
+    }
+
+    /// A new Markdown file, a modified Rust one, a removed text file, and a Rust one renamed as it was.
+    fn changed_files() -> Vec<ChangedFile> {
+        vec![
+            changed(
+                "docs/guide.md",
+                FileStatus::Added,
+                Some("@@ -0,0 +1,3 @@\n+# Guide\n+\n+Read me."),
+            ),
+            changed(
+                "src/ui.rs",
+                FileStatus::Modified,
+                Some("@@ -1,2 +1,2 @@\n fn a() {}\n-old\n+new"),
+            ),
+            ChangedFile {
+                deletions: 5,
+                ..changed("old.txt", FileStatus::Removed, None)
+            },
+            ChangedFile {
+                previous_path: Some("src/old.rs".to_owned()),
+                additions: 0,
+                deletions: 0,
+                ..changed("src/new.rs", FileStatus::Renamed, None)
+            },
+        ]
+    }
+
+    /// [`app_with_a_pull_request`] with its Files screen open, its Changed files fetched as `files`.
+    fn app_with_files(files: Vec<ChangedFile>) -> App {
+        let mut app = app_with_a_pull_request();
+        app.press(key_named("f"));
+        let wanted = app.files_to_fetch().expect("fetches the files");
+        app.files_fetched(FilesFetched {
+            thread: wanted.thread,
+            as_of: wanted.as_of,
+            files: Ok(files),
+        });
+        app
+    }
+
+    #[test]
+    fn f_shows_a_pull_requests_files_and_a_new_one_whole() {
+        let mut app = app_with_files(changed_files());
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert!(
+            shows(&lines, "#1 Add polling · 4 files · +9 \u{2212}7"),
+            "{lines:#?}"
+        );
+        assert!(shows(&lines, "A docs/guide.md"), "{lines:#?}");
+        assert!(shows(&lines, "M src/ui.rs"), "{lines:#?}");
+        assert!(shows(&lines, "D old.txt"), "{lines:#?}");
+        assert!(
+            shows(&lines, "R src/old.rs \u{2192} src/new.rs"),
+            "{lines:#?}"
+        );
+        assert!(shows(&lines, " docs/guide.md "), "the file's pane");
+        assert!(shows(&lines, "Read me."), "{lines:#?}");
+        assert!(!shows(&lines, "+Read me."), "not as a diff");
+        assert!(app.files_to_fetch().is_none(), "fetched already");
+        assert!(app.file_text_to_fetch().is_none(), "whole from its patch");
+    }
+
+    #[test]
+    fn changed_file_shows_its_diff_and_w_shows_it_whole() {
+        let mut app = app_with_files(changed_files());
+        app.press(key_named("j"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "-old"), "{lines:#?}");
+        assert!(shows(&lines, "+new"), "{lines:#?}");
+        assert!(
+            app.file_text_to_fetch().is_none(),
+            "the diff needs nothing more"
+        );
+
+        app.press(key_named("w"));
+        let wanted = app.file_text_to_fetch().expect("fetches it whole");
+        assert_eq!(
+            wanted.contents_path,
+            "/repos/wcgw/ghd/contents/src/ui.rs?ref=abc"
+        );
+        assert!(shows(
+            &screen_of(&mut app, PREVIEW_SCREEN_HEIGHT),
+            "Fetching…"
+        ));
+        app.file_text_fetched(TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn a() {}\nnew\n".to_owned())),
+        });
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "fn a() {}"), "{lines:#?}");
+        assert!(!shows(&lines, "-old"), "{lines:#?}");
+
+        app.press(key_named("w"));
+        assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
+    }
+
+    #[test]
+    fn another_file_shows_from_its_top() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
+        let mut app = app_with_files(vec![
+            changed("long.txt", FileStatus::Added, Some(&patch)),
+            changed(
+                "short.txt",
+                FileStatus::Added,
+                Some("@@ -0,0 +1 @@\n+Short"),
+            ),
+        ]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        assert!(app.files.as_ref().expect("open").scroll.by > 0);
+
+        app.press(key_named("j"));
+
+        assert_eq!(app.files.as_ref().expect("open").scroll.by, 0);
+    }
+
+    #[test]
+    fn removed_and_renamed_files_say_so() {
+        let mut app = app_with_files(changed_files());
+        app.press(key_named("j"));
+        app.press(key_named("j"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "Deleted: 5 lines"), "{lines:#?}");
+        app.press(key_named("w"));
+        assert!(app.file_text_to_fetch().is_none(), "nothing whole to show");
+
+        app.press(key_named("j"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "Renamed from src/old.rs"), "{lines:#?}");
+        assert!(!shows(&lines, "No diff"), "{lines:#?}");
+    }
+
+    #[test]
+    fn new_file_without_a_patch_is_fetched_whole() {
+        let mut app = app_with_files(vec![changed("logo.png", FileStatus::Added, None)]);
+
+        let wanted = app.file_text_to_fetch().expect("fetches it whole");
+        app.file_text_fetched(TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::Binary),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "Binary: o opens it."), "{lines:#?}");
+        assert!(app.file_text_to_fetch().is_none(), "fetched already");
+    }
+
+    #[test]
+    fn only_pull_requests_have_files() {
+        let mut app = app();
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        app.press(key_named("f"));
+
+        assert!(app.files.is_none());
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(shows(&lines, "Only pull requests have files"), "{lines:#?}");
+    }
+
+    #[test]
+    fn notification_keys_do_nothing_in_files_and_esc_goes_back() {
+        let mut app = app_with_files(changed_files());
+
+        assert!(app.press(key_named("e")).is_none(), "not marked Done");
+        assert!(app.press(key_named("I")).is_none(), "not marked read");
+        assert_eq!(inbox_titles(&app), ["Add polling", "Old news"]);
+
+        app.press(key_named("Esc"));
+        assert!(app.files.is_none());
+        assert_eq!(titles(&screen(&mut app)), ["Add polling", "Old news"]);
+    }
+
+    #[test]
+    fn r_in_files_fetches_them_again() {
+        let mut app = app_with_files(changed_files());
+
+        assert!(app.press(key_named("r")).is_none(), "not the Inbox");
+
+        assert!(app.files_to_fetch().is_some());
+    }
+
+    #[test]
+    fn o_goes_to_the_file_on_github() {
+        let mut app = app_with_files(changed_files());
+        app.press(key_named("j"));
+
+        assert_eq!(
+            app.selected_file_url().as_deref(),
+            Some(
+                format!(
+                    "https://github.com/wcgw/ghd/pull/1/files#{}",
+                    changed("src/ui.rs", FileStatus::Modified, None).anchor()
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn voight_assesses_new_markdown_files_only() {
+        let mut app = app_with_files(changed_files());
+        app.assessments = Some(Assessments::default());
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+
+        let (key, text) = app.assessment_to_start().expect("a new Markdown file");
+        assert_eq!(
+            key.file.as_deref(),
+            Some("/repos/wcgw/ghd/contents/docs/guide.md?ref=abc")
+        );
+        assert_eq!(text, "# Guide\n\nRead me.\n");
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            share: Ok(Some(0.4)),
+        });
+        assert!(
+            preview_border(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT)).ends_with(" voight 40% ┘")
+        );
+
+        app.press(key_named("j"));
+        assert!(app.assessment_to_start().is_none(), "a diff, of code");
+
+        let mut app = app_with_files(vec![changed(
+            "notes.txt",
+            FileStatus::Added,
+            Some("@@ -0,0 +1 @@\n+Plain prose, not Markdown."),
+        )]);
+        app.assessments = Some(Assessments::default());
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        assert!(app.assessment_to_start().is_none(), "not Markdown");
+    }
+
+    #[test]
+    fn files_need_a_tall_enough_terminal() {
+        let mut app = app_with_a_pull_request();
+        screen_of(&mut app, PREVIEW_MIN_HEIGHT - 1);
+
+        app.press(key_named("f"));
+
+        assert!(app.files.is_none());
     }
 
     #[test]
@@ -3793,6 +4700,8 @@ mod tests {
             "p",
             "J",
             "K",
+            "f",
+            "w",
             "Space",
             "A",
             "j",
