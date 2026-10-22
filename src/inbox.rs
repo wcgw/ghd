@@ -356,7 +356,7 @@ mod tests {
         assert!(!inbox.mark_read(ThreadId(1)), "already read");
         assert!(!inbox.mark_read(ThreadId(2)), "already read");
         assert!(!inbox.mark_read(ThreadId(99)), "not in the Inbox");
-        assert!(unread_threads(&inbox).is_empty());
+        assert_eq!(unread_threads(&inbox), [] as [u64; 0]);
 
         inbox.mark_unread(ThreadId(1));
         inbox.mark_unread(ThreadId(99));
