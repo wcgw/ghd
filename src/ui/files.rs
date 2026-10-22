@@ -1,7 +1,8 @@
 //! The Files screen: a pull request's Changed files in place of the list, the selected one below.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
@@ -17,6 +18,7 @@ use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText};
 use crate::github::{FilesRequest, GitHub};
 use crate::inbox::{Listing, Notification, ThreadId};
 use crate::markdown;
+use crate::syntax::{self, Highlighting};
 use crate::theme::Theme;
 
 /// The Files screen, and the Changed files fetched for it this run, which outlast it being closed and reopened.
@@ -41,6 +43,10 @@ struct Screen {
     whole: HashSet<String>,
     /// The selected file's pane.
     scroll: Scrolled,
+    /// Each whole file's highlighting so far, by its contents path; `None` for one in a language ghd doesn't know.
+    /// Drawing highlights a file as far down as it shows, which only drawing knows, and otherwise only reads the
+    /// screen.
+    highlighting: RefCell<HashMap<String, Option<Highlighting>>>,
 }
 
 /// What a key press on the Files screen leaves for the app around it to do.
@@ -87,6 +93,7 @@ impl Files {
             rows: 0,
             whole: HashSet::new(),
             scroll: Scrolled::default(),
+            highlighting: RefCell::default(),
         });
         None
     }
@@ -410,10 +417,13 @@ impl Files {
     ) {
         // Inside the border.
         let width = area.width.saturating_sub(2);
+        // As far down as it's scrolled, and the pane's height more: each line takes at least a line of the pane.
+        let scrolled_by = self.screen.as_ref().map_or(0, |screen| screen.scroll.by);
+        let down_to = usize::from(scrolled_by.saturating_add(area.height));
         let (path, lines) = match self.selected() {
             Some(file) => (
                 format!(" {} ", file.path),
-                self.lines_of(file, theme, width, heat),
+                self.lines_of(file, theme, width, heat, down_to),
             ),
             None => (String::new(), Vec::new()),
         };
@@ -430,13 +440,15 @@ impl Files {
     }
 
     /// What the file pane shows of `file`, `width` cells wide: where it was renamed or copied from, then the file
-    /// whole, as the Heatmap of `heat`, or its diff, or why there's neither.
+    /// whole, as the Heatmap of `heat` and highlighted down to line `down_to` at least, or its diff, or why there's
+    /// neither.
     fn lines_of(
         &self,
         file: &ChangedFile,
         theme: &Theme,
         width: u16,
         heat: &[Window],
+        down_to: usize,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         match (file.status, &file.previous_path) {
@@ -455,7 +467,7 @@ impl Files {
                 format!("Deleted: {}", counted(file.deletions, "line")),
                 theme.markdown_muted,
             )],
-            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width, heat),
+            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width, heat, down_to),
             Some(patch) => diff_lines(patch, theme),
             // Renamed or copied as it was: that's all there is to say.
             None if file.additions + file.deletions == 0 && !lines.is_empty() => Vec::new(),
@@ -479,6 +491,7 @@ impl Files {
         theme: &Theme,
         width: u16,
         heat: &[Window],
+        down_to: usize,
     ) -> Vec<Line<'static>> {
         let (text, truncated) = if let Some(text) = file.added_text() {
             (Cow::Owned(text), false)
@@ -511,7 +524,7 @@ impl Files {
         let mut lines = if file.is_markdown() {
             markdown::lines(&text, theme, width, heat)
         } else {
-            text.lines().map(|line| Line::raw(untabbed(line))).collect()
+            self.code_lines(file, &text, theme, down_to)
         };
         if truncated {
             lines.push(Line::default());
@@ -521,6 +534,56 @@ impl Files {
             ));
         }
         lines
+    }
+
+    /// The lines of `text`, `file` whole, highlighted down to line `down_to` at least if ghd knows its language.
+    fn code_lines(
+        &self,
+        file: &ChangedFile,
+        text: &str,
+        theme: &Theme,
+        down_to: usize,
+    ) -> Vec<Line<'static>> {
+        let mut highlighting = self
+            .screen
+            .as_ref()
+            .map(|screen| screen.highlighting.borrow_mut());
+        let highlighted = highlighting
+            .as_mut()
+            .and_then(|highlighting| {
+                highlighting
+                    .entry(file.contents_path.clone())
+                    .or_insert_with(|| Highlighting::of_file(&file.path, text))
+                    .as_mut()
+            })
+            .map_or(&[][..], |highlighting| highlighting.down_to(down_to));
+        text.lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let spans = match highlighted.get(index) {
+                    Some(classes) => syntax::spans(line, classes, Style::new(), theme),
+                    None => vec![Span::raw(line.to_owned())],
+                };
+                spans
+                    .into_iter()
+                    .map(|span| Span::styled(untabbed(&span.content), span.style))
+                    .collect::<Line>()
+            })
+            .collect()
+    }
+
+    /// How many lines of the selected file are highlighted so far; 0 while the screen is closed.
+    #[cfg(test)]
+    pub(super) fn lines_highlighted(&self) -> usize {
+        let (Some(screen), Some(file)) = (&self.screen, self.selected()) else {
+            return 0;
+        };
+        screen
+            .highlighting
+            .borrow()
+            .get(&file.contents_path)
+            .and_then(Option::as_ref)
+            .map_or(0, |highlighting| highlighting.done().len())
     }
 }
 

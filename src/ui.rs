@@ -3113,6 +3113,11 @@ mod tests {
 
     /// The background of the cell `text` starts at, on the screen `app` draws for the Preview tests.
     fn background_of(app: &mut App, text: &str) -> Color {
+        cell_of(app, text).bg
+    }
+
+    /// The cell `text` starts at, on the screen `app` draws for the Preview tests.
+    fn cell_of(app: &mut App, text: &str) -> ratatui::buffer::Cell {
         let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, PREVIEW_SCREEN_HEIGHT))
             .expect("test backend never fails");
         terminal
@@ -3127,7 +3132,7 @@ mod tests {
                     .contains(text)
             })
             .unwrap_or_else(|| panic!("{text:?} isn't on screen"));
-        cell_at(buffer, y, text).bg
+        cell_at(buffer, y, text).clone()
     }
 
     #[test]
@@ -3476,6 +3481,45 @@ mod tests {
 
         app.press(key_named("w"));
         assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
+    }
+
+    #[test]
+    fn whole_files_are_highlighted_as_far_down_as_they_show() {
+        let comments = "+    // a comment\n".repeat(200);
+        let patch = format!("@@ -0,0 +1,202 @@\n+fn main() {{\n+\tlet x = 1;\n{comments}");
+        let mut app = app_with_files(vec![changed(
+            "src/main.rs",
+            FileStatus::Added,
+            Some(&patch),
+        )]);
+        app.theme = Theme {
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            ..Theme::default()
+        };
+
+        assert_eq!(cell_of(&mut app, "fn main").fg, Color::Magenta);
+        assert_eq!(
+            cell_of(&mut app, "    let x").fg,
+            Color::Reset,
+            "a tab, as spaces"
+        );
+        assert_eq!(cell_of(&mut app, "let x").fg, Color::Magenta);
+        let first = app.files.lines_highlighted();
+        assert!(
+            (1..usize::from(PREVIEW_SCREEN_HEIGHT)).contains(&first),
+            "the pane's lines only: {first}"
+        );
+
+        app.press(key_named("J"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        let further = app.files.lines_highlighted();
+        assert!(further > first, "further down");
+
+        app.press(key_named("K"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert_eq!(app.files.lines_highlighted(), further, "kept");
     }
 
     #[test]

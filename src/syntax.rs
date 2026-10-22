@@ -6,14 +6,21 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, StyleModifier, Theme, ThemeItem, ThemeSettings};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+use crate::theme;
+
 /// The most code highlighted at once. Highlighting takes about a millisecond for every 6 lines, and is done before the
 /// code is drawn.
 const MAX_CODE_BYTES: usize = 32 * 1024;
+
+/// The longest line highlighted: past one longer, like a minified script's, a file is left as it is.
+const MAX_LINE_BYTES: usize = 4 * 1024;
 
 /// How many pieces of code are kept highlighted, to be drawn again without highlighting them again; past that, they're
 /// all forgotten.
@@ -83,9 +90,12 @@ impl Class {
     }
 }
 
-/// Each line of some code, as the byte ranges in it of the pieces of each [`Class`], in order; what's of none is left
-/// out.
-pub type Highlighted = Rc<[Vec<(Range<usize>, Class)>]>;
+/// The classes of the pieces of a line of code: the byte ranges in it of those of each [`Class`], in order; what's of
+/// none is left out.
+pub type Classes = Vec<(Range<usize>, Class)>;
+
+/// Some code highlighted: the [`Classes`] of each of its lines.
+pub type Highlighted = Rc<[Classes]>;
 
 /// The syntaxes ghd knows: bat's.
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
@@ -148,29 +158,127 @@ pub fn highlight(language: &str, code: &str) -> Option<Highlighted> {
 fn classes(syntax: &SyntaxReference, code: &str) -> Option<Highlighted> {
     let mut highlighter = HighlightLines::new(syntax, &CLASSES);
     LinesWithEndings::from(code)
-        .map(|line| {
-            let pieces = highlighter.highlight_line(line, &SYNTAXES).ok()?;
-            let end = line.trim_end_matches(['\n', '\r']).len();
-            let mut at = 0;
-            let mut classes: Vec<(Range<usize>, Class)> = Vec::new();
-            for (style, piece) in pieces {
-                let range = at..(at + piece.len()).min(end);
-                at += piece.len();
-                let Some(class) = Class::marked(style.foreground) else {
-                    continue;
-                };
-                match classes.last_mut() {
-                    _ if range.is_empty() => {}
-                    // Of the same class as the piece just before it: one piece.
-                    Some((last, of)) if *of == class && last.end == range.start => {
-                        last.end = range.end;
-                    }
-                    _ => classes.push((range, class)),
-                }
-            }
-            Some(classes)
-        })
+        .map(|line| line_classes(&mut highlighter, line))
         .collect()
+}
+
+/// The classes of the pieces of `line`, the next of the code `highlighter` is at; `None` if it can't be highlighted.
+fn line_classes(highlighter: &mut HighlightLines, line: &str) -> Option<Classes> {
+    let pieces = highlighter.highlight_line(line, &SYNTAXES).ok()?;
+    let end = line.trim_end_matches(['\n', '\r']).len();
+    let mut at = 0;
+    let mut classes: Classes = Vec::new();
+    for (style, piece) in pieces {
+        let range = at..(at + piece.len()).min(end);
+        at += piece.len();
+        let Some(class) = Class::marked(style.foreground) else {
+            continue;
+        };
+        match classes.last_mut() {
+            _ if range.is_empty() => {}
+            // Of the same class as the piece just before it: one piece.
+            Some((last, of)) if *of == class && last.end == range.start => {
+                last.end = range.end;
+            }
+            _ => classes.push((range, class)),
+        }
+    }
+    Some(classes)
+}
+
+/// A file's text, highlighted as far down as it's been wanted: highlighting a long file whole would keep the screen
+/// waiting.
+pub struct Highlighting {
+    text: String,
+    highlighter: HighlightLines<'static>,
+    /// The classes of each line highlighted so far.
+    done: Vec<Classes>,
+    /// Where the next line to highlight starts in `text`, in bytes.
+    at: usize,
+    /// No more lines are highlighted: one was too long, or couldn't be.
+    stopped: bool,
+}
+
+impl Highlighting {
+    /// For `text`, the file at `path`, in the language its name says (`Dockerfile`, `main.rs`), or else its first line
+    /// (`#!/bin/sh`); `None` if ghd doesn't know it, or it's plain text.
+    pub fn of_file(path: &str, text: &str) -> Option<Self> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let syntax = SYNTAXES
+            .find_syntax_by_extension(name)
+            .or_else(|| {
+                let (_, extension) = name.rsplit_once('.')?;
+                SYNTAXES.find_syntax_by_extension(extension)
+            })
+            .or_else(|| SYNTAXES.find_syntax_by_first_line(text.lines().next()?))
+            .filter(|syntax| !std::ptr::eq(*syntax, SYNTAXES.find_syntax_plain_text()))?;
+        Some(Self {
+            text: text.to_owned(),
+            highlighter: HighlightLines::new(syntax, &CLASSES),
+            done: Vec::new(),
+            at: 0,
+            stopped: false,
+        })
+    }
+
+    /// The classes of the pieces of the text's lines, highlighted down to line `count` first, or as far as they can
+    /// be.
+    pub fn down_to(&mut self, count: usize) -> &[Classes] {
+        while !self.stopped && self.done.len() < count && self.at < self.text.len() {
+            let rest = &self.text[self.at..];
+            let line = &rest[..rest.find('\n').map_or(rest.len(), |end| end + 1)];
+            let classes = (line.len() <= MAX_LINE_BYTES)
+                .then(|| line_classes(&mut self.highlighter, line))
+                .flatten();
+            match classes {
+                Some(classes) => self.done.push(classes),
+                None => self.stopped = true,
+            }
+            self.at += line.len();
+        }
+        &self.done
+    }
+
+    /// The classes of the pieces of the lines highlighted so far.
+    #[cfg(test)]
+    pub fn done(&self) -> &[Classes] {
+        &self.done
+    }
+}
+
+/// Not the highlighter, which says nothing useful.
+impl std::fmt::Debug for Highlighting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Highlighting")
+            .field("lines_done", &self.done.len())
+            .field("stopped", &self.stopped)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `line` as spans in `style`, those of its pieces of a class in that class's `theme` style over it.
+pub fn spans(
+    line: &str,
+    classes: &[(Range<usize>, Class)],
+    style: Style,
+    theme: &theme::Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(classes.len() * 2 + 1);
+    let mut from = 0;
+    for (range, class) in classes {
+        if from < range.start {
+            spans.push(Span::styled(line[from..range.start].to_owned(), style));
+        }
+        spans.push(Span::styled(
+            line[range.clone()].to_owned(),
+            style.patch(theme.syntax(*class)),
+        ));
+        from = range.end;
+    }
+    if from < line.len() {
+        spans.push(Span::styled(line[from..].to_owned(), style));
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -269,6 +377,70 @@ mod tests {
 
         assert!(highlight("rust", &code).is_none());
         assert!(highlight("rust", &code[..MAX_CODE_BYTES / 13 * 13]).is_some());
+    }
+
+    #[test]
+    fn files_go_by_their_name_extension_or_first_line() {
+        for (path, text) in [
+            ("src/main.rs", "fn main() {}\n"),
+            ("Dockerfile", "FROM scratch\n"),
+            ("deploy/Cargo.lock", "version = 4\n"),
+            ("bin/run", "#!/bin/sh\nexit 0\n"),
+        ] {
+            assert!(Highlighting::of_file(path, text).is_some(), "{path}");
+        }
+        assert!(
+            Highlighting::of_file("LICENSE", "MIT\n").is_none(),
+            "unknown"
+        );
+        assert!(
+            Highlighting::of_file("notes.txt", "Plain.\n").is_none(),
+            "plain text"
+        );
+    }
+
+    #[test]
+    fn files_are_highlighted_as_far_down_as_wanted() {
+        let text = "/* a\n   b */\nfn f() {}\n";
+        let mut highlighting = Highlighting::of_file("a.rs", text).expect("Rust");
+
+        assert_eq!(highlighting.down_to(1), [vec![(0..4, Class::Comment)]]);
+        assert_eq!(highlighting.done().len(), 1, "no further");
+
+        let done = highlighting.down_to(10);
+        assert_eq!(done.len(), 3, "as far as there are lines");
+        assert_eq!(done[1], [(0..7, Class::Comment)], "still in the comment");
+        assert_eq!(done[2][0], (0..2, Class::Keyword));
+    }
+
+    #[test]
+    fn files_stop_at_a_line_too_long() {
+        let text = format!(
+            "let a = 1;\nlet b = \"{}\";\nlet c = 3;\n",
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        let mut highlighting = Highlighting::of_file("a.rs", &text).expect("Rust");
+
+        assert_eq!(highlighting.down_to(3).len(), 1);
+    }
+
+    #[test]
+    fn spans_take_their_class_style_over_the_line_style() {
+        let theme = theme::Theme {
+            syntax_keyword: Style::new().fg(ratatui::style::Color::Magenta),
+            ..theme::Theme::default()
+        };
+        let base = Style::new().italic();
+
+        let spans = spans("let a", &[(0..3, Class::Keyword)], base, &theme);
+
+        assert_eq!(
+            spans,
+            [
+                Span::styled("let", base.fg(ratatui::style::Color::Magenta)),
+                Span::styled(" a", base),
+            ]
+        );
     }
 
     #[test]

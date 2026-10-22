@@ -73,24 +73,8 @@ fn highlight_code(lines: &mut [Line<'static>], markdown: &str, theme: &Theme) {
         }
         for (line, classes) in drawn.iter_mut().zip(highlighted.iter()) {
             let code = line.spans.pop().expect("the code drawn");
-            let mut from = 0;
-            for (range, class) in classes {
-                if from < range.start {
-                    line.spans.push(Span::styled(
-                        code.content[from..range.start].to_owned(),
-                        code.style,
-                    ));
-                }
-                line.spans.push(Span::styled(
-                    code.content[range.clone()].to_owned(),
-                    code.style.patch(theme.syntax(*class)),
-                ));
-                from = range.end;
-            }
-            if from < code.content.len() {
-                line.spans
-                    .push(Span::styled(code.content[from..].to_owned(), code.style));
-            }
+            line.spans
+                .extend(syntax::spans(&code.content, classes, code.style, theme));
         }
     }
 }
