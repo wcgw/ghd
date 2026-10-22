@@ -41,3 +41,12 @@ not_planned = { dim = true }
 human = { fg = "black", bg = "green" }
 even = { fg = "black", bg = "yellow" }
 llm = { fg = "black", bg = "red" }
+
+# Code in Markdown: the terminal's colors.
+[styles.syntax]
+comment = { dim = true, italic = true }
+keyword = { fg = "magenta" }
+string = { fg = "green" }
+constant = { fg = "yellow" }
+function = { fg = "blue" }
+type = { fg = "cyan" }

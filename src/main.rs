@@ -15,6 +15,7 @@ mod markdown;
 mod preview;
 mod search;
 mod state;
+mod syntax;
 mod theme;
 mod ui;
 mod xdg;

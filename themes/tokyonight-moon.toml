@@ -102,3 +102,13 @@ not_planned = { fg = "dark5" }
 human = { fg = "bg", bg = "green" }
 even = { fg = "bg", bg = "yellow" }
 llm = { fg = "bg", bg = "red" }
+
+# Code in Markdown, as Tokyo Night colors it.
+[styles.syntax]
+comment = { fg = "comment", italic = true }
+keyword = { fg = "magenta" }
+string = { fg = "green" }
+constant = { fg = "orange" }
+function = { fg = "blue" }
+type = { fg = "blue1" }
+operator = { fg = "blue5" }

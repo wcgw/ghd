@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::inbox::SubjectKind;
 use crate::state::SubjectState;
+use crate::syntax::Class;
 
 /// The theme used unless the configuration names another.
 pub const DEFAULT: &str = "tokyonight-moon";
@@ -135,9 +136,22 @@ theme! {
     /// What lays out a Preview's Markdown: list markers, table borders, heading markers, images' descriptions,
     /// footnotes.
     markdown_muted = "markdown.muted",
-    /// Lines added, in a pull request's Preview and a file's diff; and on the Files screen, an added file's letter.
+    /// Highlighted code in a Preview's Markdown, over `markdown.code`: comments.
+    syntax_comment = "syntax.comment",
+    /// … keywords, `self` and such.
+    syntax_keyword = "syntax.keyword",
+    syntax_string = "syntax.string",
+    /// … numbers, `true`, escapes in strings, and such.
+    syntax_constant = "syntax.constant",
+    syntax_function = "syntax.function",
+    /// … types, and keys in JSON, YAML and such.
+    syntax_type = "syntax.type",
+    syntax_operator = "syntax.operator",
+    /// Lines added, in a pull request's Preview, a file's diff and a diff in Markdown; and on the Files screen, an
+    /// added file's letter.
     diff_added = "diff.added",
-    /// Lines removed, in a pull request's Preview; and on the Files screen, a removed file's letter.
+    /// Lines removed, in a pull request's Preview, a file's diff and a diff in Markdown; and on the Files screen, a
+    /// removed file's letter.
     diff_removed = "diff.removed",
     /// On the Files screen, a modified, renamed or copied file's letter.
     diff_changed = "diff.changed",
@@ -222,6 +236,21 @@ impl Theme {
             SubjectState::Closed => self.state_closed,
             SubjectState::Completed => self.state_completed,
             SubjectState::NotPlanned => self.state_not_planned,
+        }
+    }
+
+    /// The style for highlighted code of `class`, over `markdown.code`.
+    pub fn syntax(&self, class: Class) -> Style {
+        match class {
+            Class::Comment => self.syntax_comment,
+            Class::Keyword => self.syntax_keyword,
+            Class::String => self.syntax_string,
+            Class::Constant => self.syntax_constant,
+            Class::Function => self.syntax_function,
+            Class::Type => self.syntax_type,
+            Class::Operator => self.syntax_operator,
+            Class::Inserted => self.diff_added,
+            Class::Deleted => self.diff_removed,
         }
     }
 

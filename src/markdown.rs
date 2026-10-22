@@ -2,17 +2,19 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Options as ParseOptions, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options as ParseOptions, Parser, Tag, TagEnd};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use tui_markdown::{AlertKind, Options, StyleSheet};
 
 use crate::assessment::Window;
 use crate::heatmap;
+use crate::syntax;
 use crate::theme::Theme;
 
 /// The lines `markdown` draws in `theme`, its tables fitted to `width` cells, as the Heatmap of `heat`: the windows of
-/// an Assessment of the text [`as_github_shows`] makes of it; none for no Heatmap.
+/// an Assessment of the text [`as_github_shows`] makes of it; none for no Heatmap. Code blocks in a language ghd knows
+/// are highlighted.
 ///
 /// As github.com shows issues, pull requests and comments, a new line within a paragraph breaks the line. HTML outside
 /// code is rewritten, as a terminal can't draw it: comments are dropped, `<br>` breaks the line, `<img>` shows its
@@ -33,8 +35,100 @@ pub fn lines(markdown: &str, theme: &Theme, width: u16, heat: &[Window]) -> Vec<
             ..line
         })
         .collect();
+    highlight_code(&mut lines, &markdown, theme);
     heatmap::shade(&mut lines, &markdown, heat, theme);
     lines
+}
+
+/// Highlights the code blocks of `markdown` in a language ghd knows, in `lines`, which draw it.
+///
+/// `tui-markdown` draws a code block as its fence, ```` ``` ```` and the block's info string, on a line of its own,
+/// then each line of its code as the last span of a line, whatever comes before it in a quote; that's where the
+/// highlighted code goes. A block not drawn so is left as it is.
+fn highlight_code(lines: &mut [Line<'static>], markdown: &str, theme: &Theme) {
+    let mut at = 0;
+    for block in code_blocks(markdown) {
+        let fence = format!("```{}", block.info);
+        let Some(fence_at) =
+            (at..lines.len()).find(|&index| last_text(&lines[index]) == Some(&fence))
+        else {
+            return;
+        };
+        let code_at = fence_at + 1;
+        // The next block's fence is looked for past this one's code, where a line can look like a fence.
+        at = code_at + block.code.lines().count();
+        let language = block.info.split_whitespace().next().unwrap_or_default();
+        let Some(highlighted) = syntax::highlight(language, &block.code) else {
+            continue;
+        };
+        let Some(drawn) = lines.get_mut(code_at..at) else {
+            continue;
+        };
+        if !drawn
+            .iter()
+            .zip(block.code.lines())
+            .all(|(line, code)| last_text(line) == Some(code.trim_end_matches('\r')))
+        {
+            continue;
+        }
+        for (line, classes) in drawn.iter_mut().zip(highlighted.iter()) {
+            let code = line.spans.pop().expect("the code drawn");
+            let mut from = 0;
+            for (range, class) in classes {
+                if from < range.start {
+                    line.spans.push(Span::styled(
+                        code.content[from..range.start].to_owned(),
+                        code.style,
+                    ));
+                }
+                line.spans.push(Span::styled(
+                    code.content[range.clone()].to_owned(),
+                    code.style.patch(theme.syntax(*class)),
+                ));
+                from = range.end;
+            }
+            if from < code.content.len() {
+                line.spans
+                    .push(Span::styled(code.content[from..].to_owned(), code.style));
+            }
+        }
+    }
+}
+
+/// A fenced code block.
+struct CodeBlock {
+    /// What follows its opening fence: its language, and maybe more.
+    info: String,
+    code: String,
+}
+
+/// The fenced code blocks of `markdown`, in order.
+fn code_blocks(markdown: &str) -> Vec<CodeBlock> {
+    let mut blocks = Vec::new();
+    let mut open: Option<CodeBlock> = None;
+    for event in Parser::new_ext(markdown, parse_options()) {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+                open = Some(CodeBlock {
+                    info: info.into_string(),
+                    code: String::new(),
+                });
+            }
+            Event::Text(text) => {
+                if let Some(block) = &mut open {
+                    block.code.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => blocks.extend(open.take()),
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// The text of the last span of `line`; `None` if it has none.
+fn last_text<'l>(line: &'l Line) -> Option<&'l str> {
+    line.spans.last().map(|span| span.content.as_ref())
 }
 
 /// Whether `markdown` mentions `handle`, a login (`octocat`) or a team (`github/docs`), as GitHub notifies for:
@@ -395,6 +489,113 @@ mod tests {
         };
         assert_eq!(style_of("Title"), Some(Some(Color::Red)));
         assert_eq!(style_of("ghd"), Some(Some(Color::Green)));
+    }
+
+    #[test]
+    fn code_in_a_known_language_is_highlighted() {
+        let theme = Theme {
+            markdown_code: Style::new().fg(Color::White),
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            syntax_comment: Style::new().fg(Color::Gray),
+            ..Theme::default()
+        };
+        let markdown = "Code:\n\n```rust title=x\nlet a = 1; // one\n```\n\n> ```rust\n> fn f() {}\n> ```\n\n```nope\nlet b\n```\n";
+
+        let drawn = lines(markdown, &theme, 60, &[]);
+
+        // Each line's text, and the color of each span on it that isn't the code's own, as drawn.
+        let colored: Vec<(String, Vec<(String, Color)>)> = drawn
+            .iter()
+            .map(|line| {
+                let colors = line
+                    .spans
+                    .iter()
+                    .filter_map(|span| {
+                        let fg = line.style.patch(span.style).fg?;
+                        (fg != Color::White).then(|| (span.content.to_string(), fg))
+                    })
+                    .collect();
+                (line.to_string(), colors)
+            })
+            .collect();
+        let keyword = |text: &str| (text.to_owned(), Color::Magenta);
+        assert_eq!(
+            colored,
+            [
+                ("Code:".to_owned(), vec![]),
+                (String::new(), vec![]),
+                ("```rust title=x".to_owned(), vec![]),
+                (
+                    "let a = 1; // one".to_owned(),
+                    vec![keyword("let"), ("// one".to_owned(), Color::Gray)]
+                ),
+                ("```".to_owned(), vec![]),
+                (String::new(), vec![]),
+                ("> ".to_owned(), vec![]),
+                ("> ```rust".to_owned(), vec![]),
+                ("> fn f() {}".to_owned(), vec![keyword("fn")]),
+                ("> ```".to_owned(), vec![]),
+                (String::new(), vec![]),
+                ("```nope".to_owned(), vec![]),
+                ("let b".to_owned(), vec![]),
+                ("```".to_owned(), vec![]),
+            ]
+        );
+    }
+
+    /// The color of each span of `lines` that isn't white, as drawn.
+    fn colored(lines: &[Line]) -> Vec<(String, Color)> {
+        lines
+            .iter()
+            .flat_map(|line| {
+                line.spans.iter().filter_map(move |span| {
+                    let fg = line.style.patch(span.style).fg?;
+                    (fg != Color::White).then(|| (span.content.to_string(), fg))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_block_is_highlighted_and_diffs_as_diffs() {
+        let theme = Theme {
+            markdown_code: Style::new().fg(Color::White),
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            diff_added: Style::new().fg(Color::Green),
+            diff_removed: Style::new().fg(Color::Red),
+            ..Theme::default()
+        };
+        // The first block's code looks like the next's fence.
+        let markdown = "````text\n```rust\n````\n\n```rust\nlet a\n```\n\n```rust\nlet b\n```\n\n```diff\n-old\n+new\n```\n";
+
+        let drawn = lines(markdown, &theme, 60, &[]);
+
+        assert_eq!(
+            colored(&drawn),
+            [
+                ("let".to_owned(), Color::Magenta),
+                ("let".to_owned(), Color::Magenta),
+                ("-old".to_owned(), Color::Red),
+                ("+new".to_owned(), Color::Green),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_drawn_otherwise_is_left_as_it_is() {
+        let theme = Theme {
+            markdown_code: Style::new().fg(Color::White),
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            ..Theme::default()
+        };
+        let mut drawn = vec![Line::from("```rust"), Line::from("let a, drawn otherwise")];
+
+        highlight_code(&mut drawn, "```rust\nlet a\n```\n", &theme);
+
+        assert_eq!(
+            drawn,
+            [Line::from("```rust"), Line::from("let a, drawn otherwise")]
+        );
     }
 
     #[test]
