@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::inbox::SubjectKind;
 use crate::state::SubjectState;
+use crate::syntax::Class;
 
 /// The theme used unless the configuration names another.
 pub const DEFAULT: &str = "tokyonight-moon";
@@ -135,11 +136,30 @@ theme! {
     /// What lays out a Preview's Markdown: list markers, table borders, heading markers, images' descriptions,
     /// footnotes.
     markdown_muted = "markdown.muted",
-    /// Lines added, in a pull request's Preview and a file's diff; and on the Files screen, an added file's letter.
+    /// Highlighted code in a Preview's Markdown, over `markdown.code`: comments.
+    syntax_comment = "syntax.comment",
+    /// … keywords, `self` and such.
+    syntax_keyword = "syntax.keyword",
+    syntax_string = "syntax.string",
+    /// … numbers, `true`, escapes in strings, and such.
+    syntax_constant = "syntax.constant",
+    syntax_function = "syntax.function",
+    /// … types, and keys in JSON, YAML and such.
+    syntax_type = "syntax.type",
+    syntax_operator = "syntax.operator",
+    /// Lines added: how many, in a pull request's Preview; the `+` of each in a file's diff, and the `▎` in the gutter
+    /// of a file shown whole; in a diff in Markdown. And on the Files screen, an added file's letter.
     diff_added = "diff.added",
-    /// Lines removed, in a pull request's Preview; and on the Files screen, a removed file's letter.
+    /// Lines removed: how many, in a pull request's Preview; the `-` of each in a file's diff, and the `▁` or `▔` next to
+    /// them in the gutter of a file shown whole; in a diff in Markdown. And on the Files screen, a removed file's
+    /// letter.
     diff_removed = "diff.removed",
-    /// On the Files screen, a modified, renamed or copied file's letter.
+    /// A line added, in a file's diff, under its highlighted code: a background, say.
+    diff_added_line = "diff.added_line",
+    /// A line removed, in a file's diff, under its highlighted code.
+    diff_removed_line = "diff.removed_line",
+    /// On the Files screen, a modified, renamed or copied file's letter; and the `▎` in the gutter of a file shown
+    /// whole for a line that took the place of one removed.
     diff_changed = "diff.changed",
     /// A pull request's checks, in its Preview: all passed.
     ci_passing = "ci.passing",
@@ -149,6 +169,12 @@ theme! {
     ci_pending = "ci.pending",
     /// voight's Assessment, at the end of the Preview's bottom border.
     voight = "voight",
+    /// In the Heatmap, text in a window voight scored 0%; see [`Theme::heat`].
+    heatmap_human = "heatmap.human",
+    /// … scored 50%.
+    heatmap_even = "heatmap.even",
+    /// … scored 100%.
+    heatmap_llm = "heatmap.llm",
 }
 
 impl Theme {
@@ -217,6 +243,45 @@ impl Theme {
             SubjectState::Completed => self.state_completed,
             SubjectState::NotPlanned => self.state_not_planned,
         }
+    }
+
+    /// The style for highlighted code of `class`, over `markdown.code`.
+    pub fn syntax(&self, class: Class) -> Style {
+        match class {
+            Class::Comment => self.syntax_comment,
+            Class::Keyword => self.syntax_keyword,
+            Class::String => self.syntax_string,
+            Class::Constant => self.syntax_constant,
+            Class::Function => self.syntax_function,
+            Class::Type => self.syntax_type,
+            Class::Operator => self.syntax_operator,
+            Class::Inserted => self.diff_added,
+            Class::Deleted => self.diff_removed,
+        }
+    }
+
+    /// The style of text in the Heatmap that voight scored `share`, between 0 and 1: `heatmap.human` at 0,
+    /// `heatmap.even` at 0.5 and `heatmap.llm` at 1. In between, the nearer one's, with a background blended from
+    /// both's when they're RGB colors.
+    pub fn heat(&self, share: f64) -> Style {
+        let share = share.clamp(0.0, 1.0);
+        let (from, to, toward) = if share < 0.5 {
+            (self.heatmap_human, self.heatmap_even, share * 2.0)
+        } else {
+            (self.heatmap_even, self.heatmap_llm, share * 2.0 - 1.0)
+        };
+        let nearer = if toward < 0.5 { from } else { to };
+        let (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) = (from.bg, to.bg) else {
+            return nearer;
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rounded, between two `u8`s"
+        )]
+        let blend =
+            |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * toward).round() as u8;
+        nearer.bg(Color::Rgb(blend(r0, r1), blend(g0, g1), blend(b0, b1)))
     }
 
     /// The theme that the TOML `text` describes.
@@ -470,6 +535,49 @@ mod tests {
             unstyled.is_empty(),
             "tokyonight-moon leaves out {unstyled:?}"
         );
+    }
+
+    #[test]
+    fn heat_blends_rgb_backgrounds_and_steps_between_others() {
+        let blended = parse(
+            r##"
+            [styles.heatmap]
+            human = { fg = "black", bg = "#0ac80a" }
+            even = { fg = "black", bg = "#c8c80a" }
+            llm = { fg = "white", bg = "#c80a0a", bold = true }
+            "##,
+        );
+        assert_eq!(blended.heat(0.0), blended.heatmap_human);
+        assert_eq!(blended.heat(0.5), blended.heatmap_even);
+        assert_eq!(blended.heat(1.0), blended.heatmap_llm);
+        assert_eq!(blended.heat(-1.0), blended.heatmap_human, "clamped");
+        assert_eq!(blended.heat(2.0), blended.heatmap_llm, "clamped");
+        assert_eq!(
+            blended.heat(0.2),
+            Style::new().fg(Color::Black).bg(Color::Rgb(86, 200, 10)),
+            "40% of the way to yellow"
+        );
+        assert_eq!(
+            blended.heat(0.8),
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Rgb(200, 86, 10))
+                .add_modifier(Modifier::BOLD),
+            "nearer red: its foreground"
+        );
+
+        let stepped = parse(
+            r#"
+            [styles.heatmap]
+            human = { bg = "green" }
+            even = { bg = "yellow" }
+            llm = { bg = "red" }
+            "#,
+        );
+        assert_eq!(stepped.heat(0.24), Style::new().bg(Color::Green));
+        assert_eq!(stepped.heat(0.26), Style::new().bg(Color::Yellow));
+        assert_eq!(stepped.heat(0.74), Style::new().bg(Color::Yellow));
+        assert_eq!(stepped.heat(0.76), Style::new().bg(Color::Red));
     }
 
     #[test]

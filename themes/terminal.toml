@@ -16,6 +16,8 @@ help_heading = { dim = true }
 added = { fg = "green" }
 removed = { fg = "red" }
 changed = { fg = "yellow" }
+# No background for lines a diff adds or removes, `added_line` and `removed_line`: the terminal's green and red behind
+# highlighted code read badly. Their `+` and `-` say which they are.
 
 [styles.ci]
 passing = { fg = "green" }
@@ -35,3 +37,18 @@ merged = { fg = "magenta" }
 closed = { fg = "red" }
 completed = { fg = "magenta" }
 not_planned = { dim = true }
+
+# voight's Heatmap (`H`): the terminal's green, yellow and red, stepped between rather than blended.
+[styles.heatmap]
+human = { fg = "black", bg = "green" }
+even = { fg = "black", bg = "yellow" }
+llm = { fg = "black", bg = "red" }
+
+# Code in Markdown: the terminal's colors.
+[styles.syntax]
+comment = { dim = true, italic = true }
+keyword = { fg = "magenta" }
+string = { fg = "green" }
+constant = { fg = "yellow" }
+function = { fg = "blue" }
+type = { fg = "cyan" }

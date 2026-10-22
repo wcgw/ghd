@@ -1,7 +1,8 @@
 //! The Files screen: a pull request's Changed files in place of the list, the selected one below.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::cell::{Ref, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
@@ -11,12 +12,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
 use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, counted};
-use crate::assessment;
+use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
-use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText};
+use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText, LineChange};
 use crate::github::{FilesRequest, GitHub};
 use crate::inbox::{Listing, Notification, ThreadId};
 use crate::markdown;
+use crate::syntax::{self, Classes, Highlighting};
 use crate::theme::Theme;
 
 /// The Files screen, and the Changed files fetched for it this run, which outlast it being closed and reopened.
@@ -41,6 +43,17 @@ struct Screen {
     whole: HashSet<String>,
     /// The selected file's pane.
     scroll: Scrolled,
+    /// Each file's highlighting so far, whole or as its diff, by its contents path; `None` for one in a language ghd
+    /// doesn't know. Drawing highlights a file as far down as it shows, which only drawing knows, and otherwise only
+    /// reads the screen.
+    highlighting: RefCell<HashMap<(Showing, String), Option<Highlighting>>>,
+}
+
+/// How a Changed file shows: whole, or as its diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Showing {
+    Whole,
+    Diff,
 }
 
 /// What a key press on the Files screen leaves for the app around it to do.
@@ -87,6 +100,7 @@ impl Files {
             rows: 0,
             whole: HashSet::new(),
             scroll: Scrolled::default(),
+            highlighting: RefCell::default(),
         });
         None
     }
@@ -132,8 +146,10 @@ impl Files {
                 self.screen = None;
                 return Pressed::Nothing;
             }
-            // What acts on Notifications; `?` never reaches here, the app around it showing the help itself.
+            // What acts on Notifications; `?` and `H` never reach here, the app around it showing the help and the
+            // Heatmap itself.
             Command::Help
+            | Command::ToggleHeatmap
             | Command::ToggleSelected
             | Command::SelectAllShown
             | Command::NextView
@@ -395,21 +411,26 @@ impl Files {
         frame.render_stateful_widget(table, area, &mut screen.cursor);
     }
 
-    /// Draws the selected Changed file in `area`, as far down as it's scrolled, with what voight says of it in the
-    /// bottom border, if `label` says anything.
+    /// Draws the selected Changed file in `area`, as far down as it's scrolled, as the Heatmap of `heat`, the windows
+    /// of its Assessment, if there are any; with what voight says of it in the bottom border, if `label` says
+    /// anything.
     pub(super) fn render_selected(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
-        label: Option<String>,
+        label: Option<Span<'static>>,
+        heat: &[Window],
     ) {
         // Inside the border.
         let width = area.width.saturating_sub(2);
+        // As far down as it's scrolled, and the pane's height more: each line takes at least a line of the pane.
+        let scrolled_by = self.screen.as_ref().map_or(0, |screen| screen.scroll.by);
+        let down_to = usize::from(scrolled_by.saturating_add(area.height));
         let (path, lines) = match self.selected() {
             Some(file) => (
                 format!(" {} ", file.path),
-                self.lines_of(file, theme, width),
+                self.lines_of(file, theme, width, heat, down_to),
             ),
             None => (String::new(), Vec::new()),
         };
@@ -418,7 +439,7 @@ impl Files {
             .border_style(theme.border)
             .title(Line::styled(path, theme.tab));
         if let Some(label) = label {
-            block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
+            block = block.title_bottom(Line::from(label).right_aligned());
         }
         if let Some(screen) = &mut self.screen {
             screen.scroll.render(frame, area, text, block);
@@ -426,8 +447,16 @@ impl Files {
     }
 
     /// What the file pane shows of `file`, `width` cells wide: where it was renamed or copied from, then the file
-    /// whole or its diff, or why there's neither.
-    fn lines_of(&self, file: &ChangedFile, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    /// whole, as the Heatmap of `heat` and highlighted down to line `down_to` at least, or its diff, or why there's
+    /// neither.
+    fn lines_of(
+        &self,
+        file: &ChangedFile,
+        theme: &Theme,
+        width: u16,
+        heat: &[Window],
+        down_to: usize,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         match (file.status, &file.previous_path) {
             (FileStatus::Renamed, Some(previous)) => lines.push(Line::styled(
@@ -445,8 +474,8 @@ impl Files {
                 format!("Deleted: {}", counted(file.deletions, "line")),
                 theme.markdown_muted,
             )],
-            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width),
-            Some(patch) => diff_lines(patch, theme),
+            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width, heat, down_to),
+            Some(patch) => self.diff_lines(file, patch, theme, width, down_to),
             // Renamed or copied as it was: that's all there is to say.
             None if file.additions + file.deletions == 0 && !lines.is_empty() => Vec::new(),
             None => vec![Line::styled(
@@ -461,8 +490,17 @@ impl Files {
         lines
     }
 
-    /// `file`, whole, `width` cells wide: rendered if it's Markdown; or why it can't be shown yet, or at all.
-    fn whole_lines_of(&self, file: &ChangedFile, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    /// `file`, whole, `width` cells wide: rendered if it's Markdown, as the Heatmap of `heat`, or else highlighted down
+    /// to line `down_to` at least; with a gutter showing what the pull request did to its lines, when its patch says.
+    /// Or why it can't be shown yet, or at all.
+    fn whole_lines_of(
+        &self,
+        file: &ChangedFile,
+        theme: &Theme,
+        width: u16,
+        heat: &[Window],
+        down_to: usize,
+    ) -> Vec<Line<'static>> {
         let (text, truncated) = if let Some(text) = file.added_text() {
             (Cow::Owned(text), false)
         } else {
@@ -491,10 +529,27 @@ impl Files {
         if text.trim().is_empty() {
             return vec![Line::styled("Empty file.", theme.message)];
         }
-        let mut lines = if file.is_markdown() {
-            markdown::lines(&text, theme, width)
+        let changes = file.line_changes();
+        // No gutter without a patch to say what changed.
+        let gutter = !changes.is_empty();
+        let drawn = if file.is_markdown() {
+            let width = if gutter {
+                width.saturating_sub(GUTTER_WIDTH)
+            } else {
+                width
+            };
+            markdown::lines_with_sources(&text, theme, width, heat)
         } else {
-            text.lines().map(|line| Line::raw(untabbed(line))).collect()
+            self.code_lines(file, &text, theme, down_to)
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| (line, Some(index)))
+                .collect()
+        };
+        let mut lines = if gutter {
+            with_gutter(drawn, &changes, theme)
+        } else {
+            drawn.into_iter().map(|(line, _)| line).collect()
         };
         if truncated {
             lines.push(Line::default());
@@ -504,6 +559,121 @@ impl Files {
             ));
         }
         lines
+    }
+
+    /// The lines of `text`, `file` whole, highlighted down to line `down_to` at least if ghd knows its language.
+    fn code_lines(
+        &self,
+        file: &ChangedFile,
+        text: &str,
+        theme: &Theme,
+        down_to: usize,
+    ) -> Vec<Line<'static>> {
+        let highlighted = self.highlighted(file, Showing::Whole, down_to, || {
+            Highlighting::of_file(&file.path, text)
+        });
+        text.lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let classes = highlighted.as_deref().and_then(|lines| lines.get(index));
+                Line::from(code_spans(line, classes, theme))
+            })
+            .collect()
+    }
+
+    /// The lines of `patch`, `file`'s diff, highlighted down to line `down_to` at least if ghd knows its language.
+    /// Lines added and removed are on their own background, across the pane's `width` if they fit in it, their `+`
+    /// and `-` in their own color; hunks' `@@` lines are muted.
+    fn diff_lines(
+        &self,
+        file: &ChangedFile,
+        patch: &str,
+        theme: &Theme,
+        width: u16,
+        down_to: usize,
+    ) -> Vec<Line<'static>> {
+        let highlighted = self.highlighted(file, Showing::Diff, down_to, || {
+            Highlighting::of_diff(&file.path, patch)
+        });
+        patch
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let (side, background) = match line.as_bytes().first() {
+                    Some(b'+') => (theme.diff_added, Some(theme.diff_added_line)),
+                    Some(b'-') => (theme.diff_removed, Some(theme.diff_removed_line)),
+                    // `@@ -1,3 +1,4 @@` and "\ No newline at end of file".
+                    Some(b'@' | b'\\') => {
+                        return Line::styled(untabbed(line), theme.markdown_muted);
+                    }
+                    _ => (Style::new(), None),
+                };
+                // The `+`, `-` or space that says which side it's on, and its code.
+                let (start, code) = if line.is_char_boundary(1) {
+                    line.split_at(1)
+                } else {
+                    ("", line)
+                };
+                let classes = highlighted.as_deref().and_then(|lines| lines.get(index));
+                let mut spans = vec![Span::styled(start.to_owned(), side)];
+                spans.extend(code_spans(code, classes, theme));
+                let mut line = Line::from(spans);
+                if let Some(background) = background {
+                    // A line's style is only under its text: spaces take it across the pane. Not for a line that
+                    // wraps, as where it wraps isn't known here.
+                    let room = usize::from(width).saturating_sub(line.width());
+                    if room > 0 {
+                        line.push_span(" ".repeat(room));
+                    }
+                    line = line.style(background);
+                }
+                line
+            })
+            .collect()
+    }
+
+    /// The classes of the pieces of the lines of `file` as it's `showing`, highlighted down to line `down_to` at
+    /// least, by the highlighting `make` makes the first time; `None` if ghd doesn't know its language.
+    fn highlighted(
+        &self,
+        file: &ChangedFile,
+        showing: Showing,
+        down_to: usize,
+        make: impl FnOnce() -> Option<Highlighting>,
+    ) -> Option<Ref<'_, [Classes]>> {
+        let screen = self.screen.as_ref()?;
+        let key = (showing, file.contents_path.clone());
+        if let Some(highlighting) = screen
+            .highlighting
+            .borrow_mut()
+            .entry(key.clone())
+            .or_insert_with(make)
+        {
+            highlighting.down_to(down_to);
+        }
+        Ref::filter_map(screen.highlighting.borrow(), |kept| {
+            Some(kept.get(&key)?.as_ref()?.lines())
+        })
+        .ok()
+    }
+
+    /// How many lines of the selected file, as it shows, are highlighted so far; 0 while the screen is closed.
+    #[cfg(test)]
+    pub(super) fn lines_highlighted(&self) -> usize {
+        let (Some(screen), Some(file)) = (&self.screen, self.selected()) else {
+            return 0;
+        };
+        let showing = if self.shows_whole(file) {
+            Showing::Whole
+        } else {
+            Showing::Diff
+        };
+        screen
+            .highlighting
+            .borrow()
+            .get(&(showing, file.contents_path.clone()))
+            .and_then(Option::as_ref)
+            .map_or(0, |highlighting| highlighting.lines().len())
     }
 }
 
@@ -565,19 +735,81 @@ fn untabbed(line: &str) -> String {
     line.replace('\t', "    ")
 }
 
-/// The lines of a unified diff, `patch`, in `theme`: added and removed lines in their colors, hunk headers muted.
-fn diff_lines(patch: &str, theme: &Theme) -> Vec<Line<'static>> {
-    patch
-        .lines()
-        .map(|line| {
-            let style = match line.chars().next() {
-                Some('+') => theme.diff_added,
-                Some('-') => theme.diff_removed,
-                // `@@ -1,3 +1,4 @@` and "\ No newline at end of file".
-                Some('@' | '\\') => theme.markdown_muted,
-                _ => Style::new(),
-            };
-            Line::styled(untabbed(line), style)
+/// How many cells wide the gutter of a file shown whole is: its sign, and a space.
+const GUTTER_WIDTH: u16 = 2;
+
+/// The lines `drawn`, each with a gutter in front: see [`gutter_changes`]. Each comes with the index of the line of the
+/// file it draws, if it draws one, and `changes` are those of the file's lines.
+fn with_gutter(
+    drawn: Vec<(Line<'static>, Option<usize>)>,
+    changes: &[Option<LineChange>],
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let sources: Vec<Option<usize>> = drawn.iter().map(|(_, source)| *source).collect();
+    drawn
+        .into_iter()
+        .zip(gutter_changes(changes, &sources))
+        .map(|((mut line, _), change)| {
+            line.spans.insert(0, gutter(change, theme));
+            line
         })
+        .collect()
+}
+
+/// What the gutter shows next to each line drawn, the line of the file each draws given by `sources`: what the pull
+/// request did to that line, its `changes`. Lines removed next to a line not drawn, like a blank one between
+/// paragraphs, show next to the last line drawn before it, or else the first.
+pub(super) fn gutter_changes(
+    changes: &[Option<LineChange>],
+    sources: &[Option<usize>],
+) -> Vec<Option<LineChange>> {
+    let mut shown: Vec<Option<LineChange>> = sources
+        .iter()
+        .map(|source| source.and_then(|line| changes.get(line).copied().flatten()))
+        .collect();
+    let drawn: HashSet<usize> = sources.iter().flatten().copied().collect();
+    for (line, change) in changes.iter().enumerate() {
+        if !matches!(
+            change,
+            Some(LineChange::RemovedBelow | LineChange::RemovedAbove)
+        ) || drawn.contains(&line)
+        {
+            continue;
+        }
+        let before = sources
+            .iter()
+            .rposition(|source| source.is_some_and(|source| source < line));
+        let (at, change) = match before {
+            Some(at) => (at, LineChange::RemovedBelow),
+            None => match sources.iter().position(Option::is_some) {
+                Some(at) => (at, LineChange::RemovedAbove),
+                None => continue,
+            },
+        };
+        shown[at].get_or_insert(change);
+    }
+    shown
+}
+
+/// What the gutter shows of a line the pull request did `change` to, and the space after it.
+fn gutter(change: Option<LineChange>, theme: &Theme) -> Span<'static> {
+    match change {
+        Some(LineChange::Added) => Span::styled("\u{258e} ", theme.diff_added),
+        Some(LineChange::Modified) => Span::styled("\u{258e} ", theme.diff_changed),
+        Some(LineChange::RemovedBelow) => Span::styled("\u{2581} ", theme.diff_removed),
+        Some(LineChange::RemovedAbove) => Span::styled("\u{2594} ", theme.diff_removed),
+        None => Span::raw("  "),
+    }
+}
+
+/// `line` as spans, highlighted by `classes` if there are any, its tabs as spaces.
+fn code_spans(line: &str, classes: Option<&Classes>, theme: &Theme) -> Vec<Span<'static>> {
+    let spans = match classes {
+        Some(classes) => syntax::spans(line, classes, Style::new(), theme),
+        None => vec![Span::raw(line.to_owned())],
+    };
+    spans
+        .into_iter()
+        .map(|span| Span::styled(untabbed(&span.content), span.style))
         .collect()
 }

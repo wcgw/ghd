@@ -19,13 +19,14 @@ use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, Table
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 
-use crate::assessment::{self, Assessed, Assessments, Assessor, Readiness};
+use crate::assessment::{self, Assessed, Assessment, Assessments, Assessor, Readiness, Window};
 use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::done::DoneMarks;
 use crate::fetched;
 use crate::github::{GitHub, PreviewRequest};
+use crate::heatmap;
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
 use crate::markdown;
 use crate::preview::{
@@ -362,6 +363,8 @@ enum Command {
     OpenFiles,
     /// On the Files screen, shows the selected file whole rather than its diff, or its diff again.
     ToggleWholeFile,
+    /// Shows the Heatmap of the text voight assessed, on the Preview or the Files screen, or stops.
+    ToggleHeatmap,
     Help,
 }
 
@@ -443,10 +446,11 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
             Command::TogglePreview,
             Command::ScrollPreviewDown,
             Command::ScrollPreviewUp,
+            Command::ToggleHeatmap,
         ],
         KeyHelp {
-            keys: "p  J  K",
-            does: "show or hide the Preview; scroll it",
+            keys: "p  J  K  H",
+            does: "show or hide the Preview; scroll it; voight's Heatmap",
         },
     ),
     (
@@ -548,6 +552,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('K') => Some(Command::ScrollPreviewUp),
         KeyCode::Char('f') => Some(Command::OpenFiles),
         KeyCode::Char('w') => Some(Command::ToggleWholeFile),
+        KeyCode::Char('H') => Some(Command::ToggleHeatmap),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
@@ -589,6 +594,11 @@ struct ShownView {
 }
 
 /// Everything on screen.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the help, the Done list, States wanted and the Heatmap are independent of each other: they are not a \
+              state to model as an enum"
+)]
 struct App {
     inbox: InboxState,
     /// The Views in tab order; never empty, the built-in Inbox View first.
@@ -629,6 +639,8 @@ struct App {
     screen_height: u16,
     /// voight's Assessments of Previews, and whether it's ready to make more; `None` while voight is off.
     assessments: Option<Assessments>,
+    /// The text voight assessed on screen shows as its Heatmap, on whichever Preview or file it is.
+    heatmap: bool,
     /// The Files screen, open or not, and the Changed files fetched for it.
     files: Files,
 }
@@ -755,6 +767,7 @@ impl App {
             previews: Previews::default(),
             screen_height: 0,
             assessments: None,
+            heatmap: false,
             files: Files::default(),
         }
     }
@@ -1043,28 +1056,73 @@ impl App {
                     "voight couldn't load its model: {why}"
                 )));
             }
-            assessment::Event::Assessed { key, share } => assessments.assessed(key, share),
+            assessment::Event::Assessed { key, assessment } => {
+                assessments.assessed(key, assessment);
+            }
         }
     }
 
     /// What the border of the Preview, or of the file on the Files screen, says of voight: that it's loading,
-    /// assessing, or its Assessment; `None` when there's nothing to say, as for a text with too little prose.
-    fn assessment_label(&self) -> Option<String> {
+    /// assessing, or its Assessment, in the Heatmap's color for it while that shows; `None` when there's nothing to
+    /// say, as for a text with too little prose.
+    fn assessment_label(&self) -> Option<Span<'static>> {
         let assessments = self.assessments.as_ref()?;
         let assessable = self.assessable();
+        let said = |label: &str| Some(Span::styled(label.to_owned(), self.theme.voight));
         match assessments.readiness() {
             // On the Files screen, only over a file it'll assess.
             Readiness::Loading if !self.files.is_open() || assessable.is_some() => {
-                return Some(" voight loading… ".to_owned());
+                return said(" voight loading… ");
             }
             Readiness::Loading | Readiness::Failed => return None,
             Readiness::Ready => {}
         }
         match assessments.get(&assessable?.key) {
-            None | Some(Assessed::Assessing) => Some(" voight … ".to_owned()),
-            Some(Assessed::Done(Some(share))) => Some(format!(" voight {:.0}% ", share * 100.0)),
+            None | Some(Assessed::Assessing) => said(" voight … "),
+            Some(Assessed::Done(Some(assessment))) => {
+                let style = if self.heatmap {
+                    self.theme.voight.patch(self.theme.heat(assessment.share))
+                } else {
+                    self.theme.voight
+                };
+                let label = format!(" voight {:.0}% ", assessment.share * 100.0);
+                Some(Span::styled(label, style))
+            }
             Some(Assessed::Done(None)) => None,
-            Some(Assessed::Failed(_)) => Some(" voight failed ".to_owned()),
+            Some(Assessed::Failed(_)) => said(" voight failed "),
+        }
+    }
+
+    /// The Assessment of the text on screen, once made; `None` while there's none, or voight is off.
+    fn assessment_on_screen(&self) -> Option<&Assessment> {
+        let key = self.assessable()?.key;
+        match self.assessments.as_ref()?.get(&key)? {
+            Assessed::Done(Some(assessment)) => Some(assessment),
+            Assessed::Done(None) | Assessed::Assessing | Assessed::Failed(_) => None,
+        }
+    }
+
+    /// The windows the text on screen is shaded by, while the Heatmap shows: its Assessment's, once made; none
+    /// otherwise.
+    fn heat(&self) -> &[Window] {
+        if !self.heatmap {
+            return &[];
+        }
+        self.assessment_on_screen()
+            .map_or(&[], |assessment| assessment.windows.as_slice())
+    }
+
+    /// Shows the Heatmap, or stops; says why when it can't show now.
+    fn toggle_heatmap(&mut self) {
+        if self.assessments.is_none() {
+            self.status = Some(StatusMessage::Info("No Heatmap: voight is off".to_owned()));
+            return;
+        }
+        self.heatmap = !self.heatmap;
+        if self.heatmap && self.assessment_on_screen().is_none() {
+            self.status = Some(StatusMessage::Info(
+                "The Heatmap shows on text voight has assessed".to_owned(),
+            ));
         }
     }
 
@@ -1161,10 +1219,18 @@ impl App {
         }
         let command = command_for(key)?;
         if self.files.is_open() {
-            // The help goes over the Files screen, as over anything else.
-            if command == Command::Help {
-                self.help_shown = true;
-                return None;
+            // The help goes over the Files screen, as over anything else; the Heatmap shades a file as it does a
+            // Preview.
+            match command {
+                Command::Help => {
+                    self.help_shown = true;
+                    return None;
+                }
+                Command::ToggleHeatmap => {
+                    self.toggle_heatmap();
+                    return None;
+                }
+                _ => {}
             }
             let pressed = self.files.press(command);
             return self.pressed_in_files(pressed);
@@ -1289,6 +1355,7 @@ impl App {
                 }
             }
             Command::Help => self.help_shown = true,
+            Command::ToggleHeatmap => self.toggle_heatmap(),
             Command::ToggleDone => {
                 // The Selection is of the list that was on screen.
                 self.selection.clear();
@@ -1543,15 +1610,18 @@ impl App {
         let tall_enough = self.screen_height >= PREVIEW_MIN_HEIGHT;
         // On a terminal made too short while they're open, the Preview and a file wait for it to grow again.
         if self.files.is_open() {
-            // Borrowed before the Files screen is, which it would otherwise borrow twice over.
+            // Taken before the Files screen is borrowed, which it would otherwise be twice over.
             let label = self.assessment_label();
+            let heat = self.heat().to_vec();
             let theme = self.theme;
             if tall_enough {
+                // The file is what's read: a quarter is plenty for the list.
                 let [list_area, file_area] =
-                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    Layout::vertical([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
                         .areas(view_area);
                 self.files.render_list(frame, list_area, &theme);
-                self.files.render_selected(frame, file_area, &theme, label);
+                self.files
+                    .render_selected(frame, file_area, &theme, label, &heat);
             } else {
                 self.files.render_list(frame, view_area, &theme);
             }
@@ -1662,7 +1732,7 @@ impl App {
             .border_style(theme.border)
             .title(Line::styled(" Preview ", theme.tab));
         if let Some(label) = self.assessment_label() {
-            block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
+            block = block.title_bottom(Line::from(label).right_aligned());
         }
         if let Some(pane) = &mut self.preview {
             pane.scroll.render(frame, area, text, block);
@@ -1685,7 +1755,14 @@ impl App {
                 theme.message,
             ),
             (Some(_), Some(fetched::Fetched::Done(preview))) => {
-                return preview_lines(preview, &notification.repository, theme, now, width);
+                return preview_lines(
+                    preview,
+                    &notification.repository,
+                    theme,
+                    now,
+                    width,
+                    self.heat(),
+                );
             }
             (Some(_), Some(fetched::Fetched::Failed(why))) => {
                 (format!("Couldn't fetch the Preview: {why}"), theme.error)
@@ -1793,13 +1870,14 @@ impl App {
 }
 
 /// The lines of `preview`, of a Subject in `repository`, as of `now`, `width` cells wide: its header, then the
-/// latest comment or the Subject's body.
+/// latest comment or the Subject's body, as the Heatmap of `heat`, the windows of its Assessment, if there are any.
 fn preview_lines(
     preview: &Preview,
     repository: &str,
     theme: &Theme,
     now: DateTime<Utc>,
     width: u16,
+    heat: &[Window],
 ) -> Vec<Line<'static>> {
     let ago = |then| match age(then, now).as_str() {
         "now" => "just now".to_owned(),
@@ -1893,14 +1971,21 @@ fn preview_lines(
                 theme.age,
             ));
             lines.push(Line::default());
-            lines.extend(markdown::lines(&comment.body, theme, width));
+            lines.extend(markdown::lines(&comment.body, theme, width, heat));
         }
         Shown::Body(Body::Markdown(body) | Body::Plain(body)) if body.trim().is_empty() => {
             lines.push(Line::styled("No description.", theme.message));
         }
-        Shown::Body(Body::Markdown(body)) => lines.extend(markdown::lines(body, theme, width)),
+        Shown::Body(Body::Markdown(body)) => {
+            lines.extend(markdown::lines(body, theme, width, heat));
+        }
         Shown::Body(Body::Plain(body)) => {
-            lines.extend(body.lines().map(|line| Line::raw(line.to_owned())));
+            let mut body_lines: Vec<Line<'static>> = body
+                .lines()
+                .map(|line| Line::raw(line.to_owned()))
+                .collect();
+            heatmap::shade(&mut body_lines, body, heat, theme);
+            lines.extend(body_lines);
         }
     }
     lines
@@ -3001,6 +3086,168 @@ mod tests {
         &lines[usize::from(PREVIEW_SCREEN_HEIGHT) - 2]
     }
 
+    /// An Assessment of `share`, its windows left out.
+    fn assessed_at(share: f64) -> Assessment {
+        Assessment {
+            share,
+            windows: Vec::new(),
+        }
+    }
+
+    /// The window over `part` of `text`, which an LLM wrote `share` of.
+    fn window_over(text: &str, part: &str, share: f64) -> Window {
+        let start = text.find(part).expect("part of the text");
+        Window {
+            range: start..start + part.len(),
+            share,
+        }
+    }
+
+    /// A theme whose Heatmap is green for text an LLM wrote none of, red for all, and has no color between.
+    fn heatmap_theme() -> Theme {
+        Theme {
+            heatmap_human: Style::new().bg(Color::Green),
+            heatmap_llm: Style::new().bg(Color::Red),
+            ..Theme::default()
+        }
+    }
+
+    /// The background of the cell `text` starts at, on the screen `app` draws for the Preview tests.
+    fn background_of(app: &mut App, text: &str) -> Color {
+        cell_of(app, text).bg
+    }
+
+    /// The last cell inside the border on the line `text` is on, on the screen `app` draws for the Preview tests.
+    fn line_end_of(app: &mut App, text: &str) -> ratatui::buffer::Cell {
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, PREVIEW_SCREEN_HEIGHT))
+            .expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+        let buffer = terminal.backend().buffer();
+        let y = (0..PREVIEW_SCREEN_HEIGHT)
+            .find(|&y| {
+                (0..SCREEN_WIDTH)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap_or_else(|| panic!("{text:?} isn't on screen"));
+        buffer[(SCREEN_WIDTH - 2, y)].clone()
+    }
+
+    /// The cell `text` starts at, on the screen `app` draws for the Preview tests.
+    fn cell_of(app: &mut App, text: &str) -> ratatui::buffer::Cell {
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, PREVIEW_SCREEN_HEIGHT))
+            .expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+        let buffer = terminal.backend().buffer();
+        let y = (0..PREVIEW_SCREEN_HEIGHT)
+            .find(|&y| {
+                (0..SCREEN_WIDTH)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap_or_else(|| panic!("{text:?} isn't on screen"));
+        cell_at(buffer, y, text).clone()
+    }
+
+    #[test]
+    fn h_shows_the_heatmap_of_the_preview_once_assessed() {
+        let body = "Polls the Inbox.\n\nAnd says so.";
+        let mut app = app_assessing(body);
+        app.theme = heatmap_theme();
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        let (key, text) = app.assessment_to_start().expect("ready");
+
+        assert!(app.press(key_named("H")).is_none());
+        assert!(
+            matches!(&app.status, Some(StatusMessage::Info(said)) if said == "The Heatmap shows on text voight has assessed"),
+            "{:?}",
+            app.status
+        );
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            assessment: Ok(Some(Assessment {
+                share: 0.9,
+                windows: vec![
+                    window_over(&text, "Polls the Inbox.", 1.0),
+                    window_over(&text, "And says so.", 0.0),
+                ],
+            })),
+        });
+
+        assert_eq!(background_of(&mut app, "Polls the Inbox."), Color::Red);
+        assert_eq!(background_of(&mut app, "And says so."), Color::Green);
+        assert_eq!(
+            background_of(&mut app, "voight 90%"),
+            Color::Red,
+            "the whole's color"
+        );
+        assert_eq!(
+            background_of(&mut app, "Add polling"),
+            Color::Reset,
+            "the header isn't assessed"
+        );
+
+        app.press(key_named("H"));
+
+        assert_eq!(background_of(&mut app, "Polls the Inbox."), Color::Reset);
+        assert_eq!(background_of(&mut app, "voight 90%"), Color::Reset);
+    }
+
+    #[test]
+    fn heatmap_shades_comments_and_plain_bodies() {
+        let comment = Shown::Comment(crate::preview::Comment {
+            author: Some("hubot".to_owned()),
+            created_at: Utc::now(),
+            path: None,
+            body: "Polls the Inbox.".to_owned(),
+            why: Why::Latest,
+        });
+        let plain = Shown::Body(Body::Plain("Polls the Inbox.".to_owned()));
+        for shown in [comment, plain] {
+            let (mut app, since) = app_previewing();
+            app.theme = heatmap_theme();
+            app.assessments = Some(Assessments::default());
+            fetch_preview_at(
+                &mut app,
+                since + PREVIEW_REST,
+                Ok(add_polling_preview(shown)),
+            );
+            app.voight_said(assessment::Event::Loaded { fallback: None });
+            let (key, text) = app.assessment_to_start().expect("ready");
+            app.voight_said(assessment::Event::Assessed {
+                key,
+                assessment: Ok(Some(Assessment {
+                    share: 1.0,
+                    windows: vec![window_over(&text, "Polls the Inbox.", 1.0)],
+                })),
+            });
+
+            app.press(key_named("H"));
+
+            assert_eq!(background_of(&mut app, "Polls the Inbox."), Color::Red);
+        }
+    }
+
+    #[test]
+    fn heatmap_needs_voight() {
+        let (mut app, _) = app_previewing();
+
+        app.press(key_named("H"));
+
+        assert!(!app.heatmap);
+        assert!(
+            matches!(&app.status, Some(StatusMessage::Info(said)) if said == "No Heatmap: voight is off"),
+            "{:?}",
+            app.status
+        );
+    }
+
     #[test]
     fn assessment_shows_at_the_end_of_the_preview_border() {
         let mut app = app_assessing("Polls the Inbox.");
@@ -3026,7 +3273,7 @@ mod tests {
 
         app.voight_said(assessment::Event::Assessed {
             key,
-            share: Ok(Some(0.734)),
+            assessment: Ok(Some(assessed_at(0.734))),
         });
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
         assert!(
@@ -3043,7 +3290,7 @@ mod tests {
 
         app.voight_said(assessment::Event::Assessed {
             key,
-            share: Ok(None),
+            assessment: Ok(None),
         });
 
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
@@ -3102,7 +3349,7 @@ mod tests {
         let (key, _) = app.assessment_to_start().expect("ready");
         app.voight_said(assessment::Event::Assessed {
             key,
-            share: Ok(Some(0.2)),
+            assessment: Ok(Some(assessed_at(0.2))),
         });
 
         app.press(key_named("r"));
@@ -3201,7 +3448,8 @@ mod tests {
     fn f_shows_a_pull_requests_files_and_a_new_one_whole() {
         let mut app = app_with_files(changed_files());
 
-        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        // Tall enough for the four files, in the list's quarter of it.
+        let lines = screen_of(&mut app, 24);
 
         assert!(
             shows(&lines, "#1 Add polling · 4 files · +9 \u{2212}7"),
@@ -3254,6 +3502,226 @@ mod tests {
 
         app.press(key_named("w"));
         assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
+    }
+
+    #[test]
+    fn diffs_are_highlighted_on_their_lines_background() {
+        let mut app = app_with_files(changed_files());
+        app.theme = Theme {
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            diff_added: Style::new().fg(Color::Green),
+            diff_removed: Style::new().fg(Color::Red),
+            diff_added_line: Style::new().bg(Color::Rgb(1, 1, 1)),
+            diff_removed_line: Style::new().bg(Color::Rgb(2, 2, 2)),
+            markdown_muted: Style::new().fg(Color::Gray),
+            ..Theme::default()
+        };
+        app.press(key_named("j"));
+
+        assert_eq!(cell_of(&mut app, "@@ -1,2").fg, Color::Gray);
+        assert_eq!(cell_of(&mut app, "fn a()").fg, Color::Magenta, "context");
+        let added = cell_of(&mut app, "+new");
+        assert_eq!((added.fg, added.bg), (Color::Green, Color::Rgb(1, 1, 1)));
+        assert_eq!(cell_of(&mut app, "new ").bg, Color::Rgb(1, 1, 1));
+        let removed = cell_of(&mut app, "-old");
+        assert_eq!((removed.fg, removed.bg), (Color::Red, Color::Rgb(2, 2, 2)));
+        assert_eq!(
+            line_end_of(&mut app, "-old").bg,
+            Color::Rgb(2, 2, 2),
+            "past the text, across the pane"
+        );
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let removed_at = lines.iter().position(|line| line.contains("-old"));
+        let added_at = lines.iter().position(|line| line.contains("+new"));
+        assert_eq!(
+            added_at,
+            removed_at.map(|at| at + 1),
+            "no line of its own: {lines:#?}"
+        );
+
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn a() {}\nnew\n".to_owned())),
+        });
+
+        assert_eq!(
+            cell_of(&mut app, "fn a()").fg,
+            Color::Magenta,
+            "whole, highlighted apart from its diff"
+        );
+    }
+
+    #[test]
+    fn whole_files_show_what_changed_in_their_gutter() {
+        let modified = changed(
+            "src/ui.rs",
+            FileStatus::Modified,
+            Some("@@ -1,5 +1,4 @@\n-first\n fn a() {}\n-old\n+new\n+added\n kept\n-gone"),
+        );
+        let mut app = app_with_files(vec![modified]);
+        app.theme = Theme {
+            diff_added: Style::new().fg(Color::Green),
+            diff_removed: Style::new().fg(Color::Red),
+            diff_changed: Style::new().fg(Color::Yellow),
+            ..Theme::default()
+        };
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn a() {}\nnew\nadded\nkept\n".to_owned())),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        for line in [
+            "│\u{2594} fn a() {}",
+            "│\u{258e} new",
+            "│\u{258e} added",
+            "│\u{2581} kept",
+        ] {
+            assert!(shows(&lines, line), "{line:?} in {lines:#?}");
+        }
+        assert_eq!(cell_of(&mut app, "\u{2594} fn").fg, Color::Red);
+        assert_eq!(cell_of(&mut app, "\u{258e} new").fg, Color::Yellow);
+        assert_eq!(cell_of(&mut app, "\u{258e} added").fg, Color::Green);
+        assert_eq!(cell_of(&mut app, "\u{2581} kept").fg, Color::Red);
+    }
+
+    #[test]
+    fn markdown_shown_whole_shows_what_changed_in_its_gutter() {
+        // "Gone." is removed below a blank line, which isn't drawn.
+        let patch = "@@ -1,7 +1,6 @@\n # Guide\n \n-Old words.\n+New words.\n \n Kept.\n \n-Gone.";
+        let table = format!("| {} |\n|---|\n| cell |\n", "wide ".repeat(30));
+        let mut app = app_with_files(vec![changed(
+            "docs/guide.md",
+            FileStatus::Modified,
+            Some(patch),
+        )]);
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of(format!(
+                "# Guide\n\nNew words.\n\nKept.\n\n{table}"
+            ))),
+        });
+
+        let lines = screen_of(&mut app, 30);
+
+        for line in ["│  # Guide", "│\u{258e} New words.", "│\u{2581} Kept."] {
+            assert!(shows(&lines, line), "{line:?} in {lines:#?}");
+        }
+        assert!(
+            shows(&lines, "\u{2510}│"),
+            "the table fits beside the gutter: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn the_file_takes_three_quarters_of_the_files_screen() {
+        let mut app = app_with_files(changed_files());
+
+        // A line for the status, 20 for the screen.
+        let lines = screen_of(&mut app, 21);
+
+        let file_pane = lines
+            .iter()
+            .position(|line| line.starts_with("┌ docs/guide.md"))
+            .expect("the file's pane");
+        assert_eq!(file_pane, 5, "{lines:#?}");
+    }
+
+    #[test]
+    fn no_gutter_without_a_patch() {
+        let mut app = app_with_files(vec![changed("src/big.rs", FileStatus::Modified, None)]);
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn big() {}\n".to_owned())),
+        });
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert!(shows(&lines, "│fn big() {}"), "{lines:#?}");
+    }
+
+    #[test]
+    fn gutter_shows_lines_removed_next_to_lines_drawn() {
+        use crate::files::LineChange::{Added, Modified, RemovedAbove, RemovedBelow};
+
+        assert_eq!(
+            files::gutter_changes(&[None, Some(RemovedBelow)], &[Some(0), Some(1)]),
+            [None, Some(RemovedBelow)],
+            "drawn, where they are"
+        );
+        // Lines 0 and 2 aren't drawn: blank lines, say. Lines removed below line 2 show below line 1.
+        assert_eq!(
+            files::gutter_changes(&[None, None, Some(RemovedBelow)], &[None, Some(1), Some(3)]),
+            [None, Some(RemovedBelow), None],
+        );
+        assert_eq!(
+            files::gutter_changes(
+                &[None, Some(Added), Some(RemovedBelow), Some(Modified)],
+                &[Some(1), None, Some(3)]
+            ),
+            [Some(Added), None, Some(Modified)],
+            "already showing a change"
+        );
+        // With nothing drawn above, lines removed below line 0 are above the first line drawn.
+        for change in [RemovedAbove, RemovedBelow] {
+            assert_eq!(
+                files::gutter_changes(&[Some(change), None], &[None, Some(1)]),
+                [None, Some(RemovedAbove)],
+                "{change:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_files_are_highlighted_as_far_down_as_they_show() {
+        let comments = "+    // a comment\n".repeat(200);
+        let patch = format!("@@ -0,0 +1,202 @@\n+fn main() {{\n+\tlet x = 1;\n{comments}");
+        let mut app = app_with_files(vec![changed(
+            "src/main.rs",
+            FileStatus::Added,
+            Some(&patch),
+        )]);
+        app.theme = Theme {
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            ..Theme::default()
+        };
+
+        assert_eq!(cell_of(&mut app, "fn main").fg, Color::Magenta);
+        assert_eq!(
+            cell_of(&mut app, "    let x").fg,
+            Color::Reset,
+            "a tab, as spaces"
+        );
+        assert_eq!(cell_of(&mut app, "let x").fg, Color::Magenta);
+        let first = app.files.lines_highlighted();
+        assert!(
+            (1..usize::from(PREVIEW_SCREEN_HEIGHT)).contains(&first),
+            "the pane's lines only: {first}"
+        );
+
+        app.press(key_named("J"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        let further = app.files.lines_highlighted();
+        assert!(further > first, "further down");
+
+        app.press(key_named("K"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        assert_eq!(app.files.lines_highlighted(), further, "kept");
     }
 
     #[test]
@@ -3387,10 +3855,18 @@ mod tests {
         assert_eq!(text, "# Guide\n\nRead me.\n");
         app.voight_said(assessment::Event::Assessed {
             key,
-            share: Ok(Some(0.4)),
+            assessment: Ok(Some(assessed_at(0.4))),
         });
         assert!(
             preview_border(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT)).ends_with(" voight 40% ┘")
+        );
+
+        app.theme = heatmap_theme();
+        app.press(key_named("H"));
+        assert_eq!(
+            background_of(&mut app, "Read me."),
+            Color::Reset,
+            "no windows to shade by"
         );
 
         app.press(key_named("j"));
@@ -3404,6 +3880,27 @@ mod tests {
         app.assessments = Some(Assessments::default());
         app.voight_said(assessment::Event::Loaded { fallback: None });
         assert!(app.assessment_to_start().is_none(), "not Markdown");
+    }
+
+    #[test]
+    fn h_shows_the_heatmap_of_a_file_shown_whole() {
+        let mut app = app_with_files(changed_files());
+        app.theme = heatmap_theme();
+        app.assessments = Some(Assessments::default());
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        let (key, text) = app.assessment_to_start().expect("a new Markdown file");
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            assessment: Ok(Some(Assessment {
+                share: 1.0,
+                windows: vec![window_over(&text, "Read me.", 1.0)],
+            })),
+        });
+
+        app.press(key_named("H"));
+
+        assert!(app.files.is_open(), "still on the Files screen");
+        assert_eq!(background_of(&mut app, "Read me."), Color::Red);
     }
 
     #[test]
@@ -4242,6 +4739,7 @@ mod tests {
             "p",
             "J",
             "K",
+            "H",
             "f",
             "w",
             "Space",

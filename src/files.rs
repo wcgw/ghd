@@ -102,6 +102,40 @@ impl ChangedFile {
         Some(text)
     }
 
+    /// What the pull request did to each line of the file as it leaves it, or next to it, by the line's index; `None`
+    /// for one it left as it was. Lines past the end are left as they were too. Empty without a patch.
+    pub fn line_changes(&self) -> Vec<Option<LineChange>> {
+        let mut changes = Vec::new();
+        let Some(patch) = &self.patch else {
+            return changes;
+        };
+        let mut run = Run::default();
+        // The index of the next line in the file as the pull request leaves it.
+        let mut at = 0;
+        for line in patch.lines() {
+            match line.as_bytes().first() {
+                Some(b'@') => {
+                    run.end(at, &mut changes);
+                    at = hunk_start(line).unwrap_or(at);
+                }
+                Some(b'-') => run.removed += 1,
+                Some(b'+') => {
+                    run.added.push(at);
+                    at += 1;
+                }
+                // "\ No newline at end of file".
+                Some(b'\\') => {}
+                // Left as it was.
+                _ => {
+                    run.end(at, &mut changes);
+                    at += 1;
+                }
+            }
+        }
+        run.end(at, &mut changes);
+        changes
+    }
+
     /// Its anchor in GitHub's "Files changed" tab: `diff-`, then the SHA-256 of its path in hex.
     pub fn anchor(&self) -> String {
         let digest = ring::digest::digest(&ring::digest::SHA256, self.path.as_bytes());
@@ -113,6 +147,68 @@ impl ChangedFile {
         }
         anchor
     }
+}
+
+/// What a pull request did to a line of a file, or next to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineChange {
+    Added,
+    /// It took the place of a line removed.
+    Modified,
+    /// Lines were removed just below it.
+    RemovedBelow,
+    /// Lines were removed just above it, at the top of the file.
+    RemovedAbove,
+}
+
+/// A run of lines a hunk removes and adds, between two it leaves as they were.
+#[derive(Default)]
+struct Run {
+    removed: usize,
+    /// The indexes of the lines added, in the file as the pull request leaves it.
+    added: Vec<usize>,
+}
+
+impl Run {
+    /// Notes in `changes` what the run did, `at` being the index of the line after it in the file as the pull request
+    /// leaves it; and starts it again.
+    fn end(&mut self, at: usize, changes: &mut Vec<Option<LineChange>>) {
+        let mut note = |index: usize, change| {
+            if changes.len() <= index {
+                changes.resize(index + 1, None);
+            }
+            changes[index] = Some(change);
+        };
+        if self.added.is_empty() && self.removed > 0 {
+            match at.checked_sub(1) {
+                Some(above) => note(above, LineChange::RemovedBelow),
+                None => note(0, LineChange::RemovedAbove),
+            }
+        }
+        // As many lines as were removed are taken for modified, the rest for added.
+        for (count, &index) in self.added.iter().enumerate() {
+            let change = if count < self.removed {
+                LineChange::Modified
+            } else {
+                LineChange::Added
+            };
+            note(index, change);
+        }
+        *self = Self::default();
+    }
+}
+
+/// The index of the first line of the hunk `header` starts, in the file as the pull request leaves it:
+/// `@@ -1,3 +4,5 @@` starts at line 4, of index 3. `None` if it isn't a hunk's header.
+fn hunk_start(header: &str) -> Option<usize> {
+    let after = header
+        .strip_prefix("@@ ")?
+        .split_whitespace()
+        .nth(1)?
+        .strip_prefix('+')?;
+    let start: usize = after.split(',').next()?.parse().ok()?;
+    // A hunk adding nothing starts at 0, the line before the first.
+    Some(start.saturating_sub(1))
 }
 
 /// A file's text, as a pull request leaves it.
@@ -296,6 +392,66 @@ mod tests {
             None,
             "not added"
         );
+    }
+
+    /// The changes `patch` makes to the lines of the file it's of, modified.
+    fn changes(patch: &str) -> Vec<Option<LineChange>> {
+        file("a.rs", FileStatus::Modified, Some(patch)).line_changes()
+    }
+
+    #[test]
+    fn lines_added_or_taking_the_place_of_removed_ones() {
+        use LineChange::{Added, Modified, RemovedBelow};
+
+        assert_eq!(
+            changes("@@ -1,5 +1,6 @@\n a\n-b\n+B\n+new\n c\n-d\n e"),
+            [None, Some(Modified), Some(Added), Some(RemovedBelow)],
+        );
+        assert_eq!(
+            changes("@@ -1,3 +1,2 @@\n-a\n-b\n+A\n c"),
+            [Some(Modified)],
+            "fewer added than removed"
+        );
+    }
+
+    #[test]
+    fn hunks_start_where_their_header_says() {
+        let changes = changes(
+            "@@ -10,2 +10,3 @@ fn f() {\n x\n+y\n z\n@@ -40 +41,2 @@\n w\n+v\n\\ No newline at end of file",
+        );
+
+        assert_eq!(changes.len(), 42);
+        assert_eq!(changes[10], Some(LineChange::Added));
+        assert_eq!(changes[41], Some(LineChange::Added));
+        assert_eq!(changes.iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn no_newline_at_the_end_is_no_line() {
+        assert_eq!(
+            changes("@@ -1,2 +1,3 @@\n a\n-b\n\\ No newline at end of file\n+b\n+c"),
+            [None, Some(LineChange::Modified), Some(LineChange::Added)],
+        );
+    }
+
+    #[test]
+    fn lines_removed_at_the_top_or_the_end() {
+        assert_eq!(
+            changes("@@ -1,2 +1 @@\n-gone\n kept"),
+            [Some(LineChange::RemovedAbove)]
+        );
+        assert_eq!(
+            changes("@@ -1,2 +1 @@\n kept\n-gone"),
+            [Some(LineChange::RemovedBelow)]
+        );
+    }
+
+    #[test]
+    fn a_new_file_is_all_added_and_no_patch_says_nothing() {
+        let added = file("a.md", FileStatus::Added, Some("@@ -0,0 +1,2 @@\n+a\n+b"));
+        assert_eq!(added.line_changes(), [Some(LineChange::Added); 2]);
+
+        assert_eq!(file("a.png", FileStatus::Modified, None).line_changes(), []);
     }
 
     #[test]

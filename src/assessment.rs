@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -79,12 +80,30 @@ pub enum Event {
     Loaded { fallback: Option<String> },
     /// The model couldn't be loaded: there'll be no Assessments this run.
     Failed(String),
-    /// The Assessment asked for under `key`: the share of the text an LLM wrote, between 0 and 1; `None` for a text
-    /// with too little prose to tell.
+    /// The Assessment asked for under `key`; `None` for a text with too little prose to tell.
     Assessed {
         key: Key,
-        share: Result<Option<f64>, String>,
+        assessment: Result<Option<Assessment>, String>,
     },
+}
+
+/// An Assessment of a text: the share of it an LLM wrote, overall and in each window voight scored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assessment {
+    /// Between 0 and 1: the windows' shares, weighted by their words.
+    pub share: f64,
+    /// In the order they come in the text.
+    pub windows: Vec<Window>,
+}
+
+/// A window of prose voight scored on its own: paragraphs of about 100 to 400 words together, or part of a longer
+/// one, cut where a sentence ends.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    /// Where it is in the text voight was given, in bytes.
+    pub range: Range<usize>,
+    /// The share of it an LLM wrote, between 0 and 1.
+    pub share: f64,
 }
 
 impl Assessor {
@@ -163,8 +182,8 @@ fn work(
         return;
     }
     for (key, text) in queued {
-        let share = assess(&detector, &text).map_err(|error| format!("{error:#}"));
-        if events.send(Event::Assessed { key, share }).is_err() {
+        let assessment = assess(&detector, &text).map_err(|error| format!("{error:#}"));
+        if events.send(Event::Assessed { key, assessment }).is_err() {
             return;
         }
     }
@@ -187,13 +206,23 @@ fn opened(
     }
 }
 
-/// The share of `text` an LLM wrote, by `detector`; `None` if it has fewer than [`MIN_WORDS`] words of prose.
+/// The Assessment of `text` by `detector`; `None` if it has fewer than [`MIN_WORDS`] words of prose.
 #[cfg(feature = "voight")]
-fn assess(detector: &voight::Detector, text: &str) -> anyhow::Result<Option<f64>> {
+fn assess(detector: &voight::Detector, text: &str) -> anyhow::Result<Option<Assessment>> {
     if !worth_assessing(text) {
         return Ok(None);
     }
-    Ok(Some(detector.report(text)?.overall().value()))
+    let report = detector.report(text)?;
+    Ok(Some(Assessment {
+        share: report.overall().value(),
+        windows: report
+            .windows()
+            .map(|(window, llm)| Window {
+                range: window.range.clone(),
+                share: llm.value(),
+            })
+            .collect(),
+    }))
 }
 
 /// Whether `text` has at least [`MIN_WORDS`] words of prose, as voight counts them: code doesn't count.
@@ -210,8 +239,8 @@ fn worth_assessing(text: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Assessed {
     Assessing,
-    /// The share of the text an LLM wrote, between 0 and 1; `None` for a text with too little prose.
-    Done(Option<f64>),
+    /// `None` for a text with too little prose.
+    Done(Option<Assessment>),
     /// Why it couldn't be made.
     Failed(String),
 }
@@ -280,9 +309,9 @@ impl Assessments {
     }
 
     /// Takes in the Assessment made under `key`.
-    pub fn assessed(&mut self, key: Key, share: Result<Option<f64>, String>) {
-        let assessed = match share {
-            Ok(share) => Assessed::Done(share),
+    pub fn assessed(&mut self, key: Key, assessment: Result<Option<Assessment>, String>) {
+        let assessed = match assessment {
+            Ok(assessment) => Assessed::Done(assessment),
             Err(why) => Assessed::Failed(why),
         };
         self.by_key.insert(key, assessed);
@@ -327,9 +356,16 @@ mod tests {
         assert!(!assessments.can_assess(), "one under way");
         assert_eq!(assessments.get(&key(1)), Some(&Assessed::Assessing));
 
-        assessments.assessed(key(1), Ok(Some(0.73)));
+        let made = Assessment {
+            share: 0.73,
+            windows: vec![Window {
+                range: 0..120,
+                share: 0.73,
+            }],
+        };
+        assessments.assessed(key(1), Ok(Some(made.clone())));
         assert!(assessments.can_assess());
-        assert_eq!(assessments.get(&key(1)), Some(&Assessed::Done(Some(0.73))));
+        assert_eq!(assessments.get(&key(1)), Some(&Assessed::Done(Some(made))));
     }
 
     #[test]
