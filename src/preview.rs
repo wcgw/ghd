@@ -188,7 +188,7 @@ mod tests {
     use chrono::TimeDelta;
 
     use super::*;
-    use crate::inbox::{ApiPaths, Reason, SubjectKind};
+    use crate::inbox::{ApiPaths, Inbox, Reason, SubjectKind};
 
     fn notification(thread: u64, updated_at: DateTime<Utc>) -> Notification {
         Notification {
@@ -279,7 +279,7 @@ mod tests {
 
         previews.retain_in(&Listing {
             inbox: [kept.clone()].into_iter().collect(),
-            done: Default::default(),
+            done: Inbox::default(),
         });
 
         assert!(previews.get(&kept).is_some());

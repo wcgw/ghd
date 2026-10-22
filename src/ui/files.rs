@@ -1,0 +1,583 @@
+//! The Files screen: a pull request's Changed files in place of the list, the selected one below.
+
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+use chrono::{DateTime, Utc};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
+
+use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, counted};
+use crate::assessment;
+use crate::fetched::Fetched;
+use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText};
+use crate::github::{FilesRequest, GitHub};
+use crate::inbox::{Listing, Notification, ThreadId};
+use crate::markdown;
+use crate::theme::Theme;
+
+/// The Files screen, and the Changed files fetched for it this run, which outlast it being closed and reopened.
+#[derive(Debug, Default)]
+pub(super) struct Files {
+    /// The screen, while it's open.
+    screen: Option<Screen>,
+    fetched: ChangedFiles,
+}
+
+/// The Files screen while it's open: which pull request it is of, and where it's at.
+#[derive(Debug)]
+struct Screen {
+    /// The pull request's Notification, as it was when the screen opened.
+    notification: Notification,
+    request: FilesRequest,
+    /// The selected file's row.
+    cursor: TableState,
+    /// How many rows the list had room for at the last draw.
+    rows: u16,
+    /// The files shown whole rather than as their diff, by path.
+    whole: HashSet<String>,
+    /// The selected file's pane.
+    scroll: Scrolled,
+}
+
+/// What a key press on the Files screen leaves for the app around it to do.
+#[derive(Debug)]
+pub(super) enum Pressed {
+    /// The screen dealt with it.
+    Nothing,
+    Quit,
+    /// Something to say in the status line.
+    Said(StatusMessage),
+    /// `r`: the Changed files are forgotten, and so are the thread's Assessments of them.
+    Forgot(ThreadId),
+    /// `o` opened the selected file in the browser, which marks the pull request's Notification read.
+    Opened(ThreadId),
+}
+
+impl Files {
+    /// Whether the screen is open.
+    pub(super) fn is_open(&self) -> bool {
+        self.screen.is_some()
+    }
+
+    /// Opens the screen for `notification`, on a screen `screen_height` lines tall; says why not if it isn't a pull
+    /// request, or the terminal is too short.
+    pub(super) fn open(
+        &mut self,
+        notification: &Notification,
+        screen_height: u16,
+    ) -> Option<StatusMessage> {
+        let Some(request) = FilesRequest::for_notification(notification) else {
+            return Some(StatusMessage::Info(
+                "Only pull requests have files".to_owned(),
+            ));
+        };
+        if screen_height < PREVIEW_MIN_HEIGHT {
+            return Some(StatusMessage::Info(format!(
+                "Files need a terminal at least {PREVIEW_MIN_HEIGHT} lines tall"
+            )));
+        }
+        self.screen = Some(Screen {
+            notification: notification.clone(),
+            request,
+            cursor: TableState::new().with_selected(Some(0)),
+            rows: 0,
+            whole: HashSet::new(),
+            scroll: Scrolled::default(),
+        });
+        None
+    }
+
+    /// Carries out `command` on the screen, where only moving, scrolling, `w`, `o`, `r`, Esc or `f`, `?` and
+    /// quitting do anything: the rest act on Notifications. Returns what's left for the app around it to do.
+    pub(super) fn press(&mut self, command: Command) -> Pressed {
+        let togglable = self
+            .selected()
+            .filter(|file| !matches!(file.status, FileStatus::Added | FileStatus::Removed))
+            .map(|file| file.path.clone());
+        let Some(screen) = &mut self.screen else {
+            return Pressed::Nothing;
+        };
+        match command {
+            Command::Quit => return Pressed::Quit,
+            Command::Down => screen.cursor.select_next(),
+            Command::Up => screen.cursor.select_previous(),
+            Command::HalfPageDown => screen.cursor.scroll_down_by((screen.rows / 2).max(1)),
+            Command::HalfPageUp => screen.cursor.scroll_up_by((screen.rows / 2).max(1)),
+            Command::ScrollPreviewDown => {
+                screen.scroll.half_down();
+                return Pressed::Nothing;
+            }
+            Command::ScrollPreviewUp => {
+                screen.scroll.half_up();
+                return Pressed::Nothing;
+            }
+            Command::ToggleWholeFile => {
+                if let Some(path) = togglable
+                    && !screen.whole.remove(&path)
+                {
+                    screen.whole.insert(path);
+                }
+            }
+            Command::Refresh => {
+                let thread = screen.notification.thread;
+                self.fetched.forget(thread);
+                return Pressed::Forgot(thread);
+            }
+            Command::Open => return self.open_selected(),
+            Command::Clear | Command::OpenFiles => {
+                self.screen = None;
+                return Pressed::Nothing;
+            }
+            // What acts on Notifications; `?` never reaches here, the app around it showing the help itself.
+            Command::Help
+            | Command::ToggleSelected
+            | Command::SelectAllShown
+            | Command::NextView
+            | Command::PreviousView
+            | Command::ShowView(_)
+            | Command::Search
+            | Command::MarkRead
+            | Command::MarkDone
+            | Command::ToggleDone
+            | Command::ToggleUnreadOnly
+            | Command::TogglePreview => return Pressed::Nothing,
+        }
+        // Another file, or another way to show it: from its top.
+        screen.scroll.by = 0;
+        Pressed::Nothing
+    }
+
+    /// Opens the selected Changed file on GitHub, which marks the pull request's Notification read, as opening the
+    /// pull request does.
+    fn open_selected(&mut self) -> Pressed {
+        let Some(url) = self.selected_url() else {
+            return Pressed::Nothing;
+        };
+        if let Err(error) = open::that_detached(&url) {
+            return Pressed::Said(StatusMessage::Error(format!(
+                "Couldn't open a browser: {error}"
+            )));
+        }
+        match &self.screen {
+            Some(screen) => Pressed::Opened(screen.notification.thread),
+            None => Pressed::Nothing,
+        }
+    }
+
+    /// The Changed file selected; `None` while the screen is closed, or its files aren't fetched yet.
+    fn selected(&self) -> Option<&ChangedFile> {
+        let screen = self.screen.as_ref()?;
+        let Fetched::Done(list) = self
+            .fetched
+            .list(screen.notification.thread, screen.notification.updated_at)?
+        else {
+            return None;
+        };
+        list.get(screen.cursor.selected()?)
+    }
+
+    /// Whether `file` shows whole rather than as its diff: a new one, or one `w` asked for, but never a removed one.
+    fn shows_whole(&self, file: &ChangedFile) -> bool {
+        match file.status {
+            FileStatus::Added => true,
+            FileStatus::Removed => false,
+            FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => self
+                .screen
+                .as_ref()
+                .is_some_and(|screen| screen.whole.contains(&file.path)),
+        }
+    }
+
+    /// Where GitHub shows the selected Changed file: in the pull request's "Files changed" tab, at the file; or the
+    /// tab itself while the files aren't fetched.
+    pub(super) fn selected_url(&self) -> Option<String> {
+        let page = &self.screen.as_ref()?.notification.subject_url;
+        Some(match self.selected() {
+            Some(file) => format!("{page}/files#{}", file.anchor()),
+            None => format!("{page}/files"),
+        })
+    }
+
+    /// The Changed files to fetch now, noted as being fetched: the screen's, unless they're fetched already.
+    pub(super) fn list_to_fetch(&mut self) -> Option<Wanted> {
+        let screen = self.screen.as_ref()?;
+        let (thread, as_of) = (screen.notification.thread, screen.notification.updated_at);
+        if self.fetched.list(thread, as_of).is_some() {
+            return None;
+        }
+        let request = screen.request.clone();
+        self.fetched.fetching_list(thread, as_of);
+        Some(Wanted {
+            thread,
+            as_of,
+            request,
+        })
+    }
+
+    /// Takes in a pull request's Changed files, or why they couldn't be fetched.
+    pub(super) fn took_list(&mut self, fetched: WasFetched) {
+        self.fetched
+            .fetched_list(fetched.thread, fetched.as_of, fetched.files);
+    }
+
+    /// The whole file to fetch now, noted as being fetched: the selected one, when it's shown whole and there's no
+    /// patch to show it from.
+    pub(super) fn text_to_fetch(&mut self) -> Option<WantedText> {
+        let file = self.selected()?;
+        if !self.shows_whole(file) || file.added_text().is_some() {
+            return None;
+        }
+        let thread = self.screen.as_ref()?.notification.thread;
+        let contents_path = file.contents_path.clone();
+        if self.fetched.text(thread, &contents_path).is_some() {
+            return None;
+        }
+        self.fetched.fetching_text(thread, &contents_path);
+        Some(WantedText {
+            thread,
+            contents_path,
+        })
+    }
+
+    /// Takes in a whole file, or why it couldn't be fetched.
+    pub(super) fn took_text(&mut self, fetched: TextFetched) {
+        self.fetched
+            .fetched_text(fetched.thread, &fetched.contents_path, fetched.text);
+    }
+
+    /// Forgets the Changed files of threads neither of `listing`'s lists holds.
+    pub(super) fn retain_in(&mut self, listing: &Listing) {
+        self.fetched.retain_in(listing);
+    }
+
+    /// How many lines down the selected file's pane is scrolled; 0 while the screen is closed.
+    #[cfg(test)]
+    pub(super) fn scrolled_by(&self) -> u16 {
+        self.screen.as_ref().map_or(0, |screen| screen.scroll.by)
+    }
+
+    /// What's on the screen for voight to assess: the selected file, if it's Markdown shown whole. `None` when
+    /// there's nothing to assess, and while the screen is closed.
+    pub(super) fn assessable(&self) -> Option<Assessable<'_>> {
+        let screen = self.screen.as_ref()?;
+        let file = self.selected()?;
+        if !file.is_markdown() || !self.shows_whole(file) {
+            return None;
+        }
+        let text = match file.added_text() {
+            Some(text) => Cow::Owned(text),
+            None => match self
+                .fetched
+                .text(screen.notification.thread, &file.contents_path)?
+            {
+                Fetched::Done(FileText::Text { text, .. }) => Cow::Borrowed(text.as_str()),
+                _ => return None,
+            },
+        };
+        Some(Assessable {
+            key: assessment::Key {
+                thread: screen.notification.thread,
+                as_of: screen.notification.updated_at,
+                file: Some(file.contents_path.clone()),
+            },
+            text,
+            markdown: true,
+        })
+    }
+
+    /// Draws the list in `area`: the pull request in its border, and its Changed files.
+    pub(super) fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let Some(screen) = &mut self.screen else {
+            return;
+        };
+        // Inside the border.
+        screen.rows = area.height.saturating_sub(2);
+        let notification = &screen.notification;
+        let fetched = self
+            .fetched
+            .list(notification.thread, notification.updated_at);
+        let number = notification
+            .subject_url
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        let mut title = vec![
+            Span::raw(" "),
+            Span::styled(format!("#{number} "), theme.age),
+            Span::styled(notification.subject_title.clone(), theme.title.bold()),
+        ];
+        if let Some(Fetched::Done(list)) = fetched {
+            let added: u64 = list.iter().map(|file| file.additions).sum();
+            let removed: u64 = list.iter().map(|file| file.deletions).sum();
+            title.extend([
+                Span::raw(format!(" · {} · ", counted(list.len() as u64, "file"))),
+                Span::styled(format!("+{added}"), theme.diff_added),
+                Span::raw(" "),
+                Span::styled(format!("\u{2212}{removed}"), theme.diff_removed),
+            ]);
+        }
+        title.push(Span::raw(" "));
+        let block = Block::bordered()
+            .border_style(theme.border)
+            .title(Line::from(title))
+            .title_bottom(
+                Line::styled(" Esc back · w whole file or diff · ? keys ", theme.hint)
+                    .right_aligned(),
+            );
+        let list = match fetched {
+            None | Some(Fetched::Fetching) => {
+                frame.render_widget(
+                    Paragraph::new("Fetching files…")
+                        .style(theme.message)
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            Some(Fetched::Failed(why)) => {
+                frame.render_widget(
+                    Paragraph::new(format!("Couldn't fetch the files: {why}"))
+                        .style(theme.error)
+                        .wrap(Wrap { trim: false })
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            Some(Fetched::Done(list)) if list.is_empty() => {
+                frame.render_widget(
+                    Paragraph::new("No files.")
+                        .style(theme.message)
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            Some(Fetched::Done(list)) => list,
+        };
+        let counts: Vec<String> = list
+            .iter()
+            .map(|file| format!("+{} \u{2212}{}", file.additions, file.deletions))
+            .collect();
+        let counts_width = counts.iter().map(|c| c.chars().count()).max().unwrap_or(0);
+        let rows = list.iter().zip(counts).map(|(file, counts)| {
+            let letter_style = match file.status {
+                FileStatus::Added => theme.diff_added,
+                FileStatus::Removed => theme.diff_removed,
+                FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => {
+                    theme.diff_changed
+                }
+            };
+            let path = match &file.previous_path {
+                Some(previous) => format!("{previous} \u{2192} {}", file.path),
+                None => file.path.clone(),
+            };
+            Row::new([
+                Cell::from(file.status.letter().to_string()).style(letter_style),
+                Cell::from(path).style(theme.title),
+                Cell::from(Line::from(counts).right_aligned()).style(theme.age),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(u16::try_from(counts_width).unwrap_or(u16::MAX)),
+            ],
+        )
+        .row_highlight_style(theme.cursor)
+        .block(block);
+        frame.render_stateful_widget(table, area, &mut screen.cursor);
+    }
+
+    /// Draws the selected Changed file in `area`, as far down as it's scrolled, with what voight says of it in the
+    /// bottom border, if `label` says anything.
+    pub(super) fn render_selected(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        label: Option<String>,
+    ) {
+        // Inside the border.
+        let width = area.width.saturating_sub(2);
+        let (path, lines) = match self.selected() {
+            Some(file) => (
+                format!(" {} ", file.path),
+                self.lines_of(file, theme, width),
+            ),
+            None => (String::new(), Vec::new()),
+        };
+        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let mut block = Block::bordered()
+            .border_style(theme.border)
+            .title(Line::styled(path, theme.tab));
+        if let Some(label) = label {
+            block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.scroll.render(frame, area, text, block);
+        }
+    }
+
+    /// What the file pane shows of `file`, `width` cells wide: where it was renamed or copied from, then the file
+    /// whole or its diff, or why there's neither.
+    fn lines_of(&self, file: &ChangedFile, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        match (file.status, &file.previous_path) {
+            (FileStatus::Renamed, Some(previous)) => lines.push(Line::styled(
+                format!("Renamed from {previous}"),
+                theme.markdown_muted,
+            )),
+            (FileStatus::Copied, Some(previous)) => lines.push(Line::styled(
+                format!("Copied from {previous}"),
+                theme.markdown_muted,
+            )),
+            _ => {}
+        }
+        let what = match &file.patch {
+            _ if file.status == FileStatus::Removed => vec![Line::styled(
+                format!("Deleted: {}", counted(file.deletions, "line")),
+                theme.markdown_muted,
+            )],
+            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width),
+            Some(patch) => diff_lines(patch, theme),
+            // Renamed or copied as it was: that's all there is to say.
+            None if file.additions + file.deletions == 0 && !lines.is_empty() => Vec::new(),
+            None => vec![Line::styled(
+                "No diff from GitHub (binary, or too large): o opens it.",
+                theme.message,
+            )],
+        };
+        if !lines.is_empty() && !what.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(what);
+        lines
+    }
+
+    /// `file`, whole, `width` cells wide: rendered if it's Markdown; or why it can't be shown yet, or at all.
+    fn whole_lines_of(&self, file: &ChangedFile, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+        let (text, truncated) = if let Some(text) = file.added_text() {
+            (Cow::Owned(text), false)
+        } else {
+            let thread = self
+                .screen
+                .as_ref()
+                .map(|screen| screen.notification.thread);
+            match thread.and_then(|thread| self.fetched.text(thread, &file.contents_path)) {
+                None | Some(Fetched::Fetching) => {
+                    return vec![Line::styled("Fetching…", theme.message)];
+                }
+                Some(Fetched::Failed(why)) => {
+                    return vec![Line::styled(
+                        format!("Couldn't fetch the file: {why}"),
+                        theme.error,
+                    )];
+                }
+                Some(Fetched::Done(FileText::Binary)) => {
+                    return vec![Line::styled("Binary: o opens it.", theme.message)];
+                }
+                Some(Fetched::Done(FileText::Text { text, truncated })) => {
+                    (Cow::Borrowed(text.as_str()), *truncated)
+                }
+            }
+        };
+        if text.trim().is_empty() {
+            return vec![Line::styled("Empty file.", theme.message)];
+        }
+        let mut lines = if file.is_markdown() {
+            markdown::lines(&text, theme, width)
+        } else {
+            text.lines().map(|line| Line::raw(untabbed(line))).collect()
+        };
+        if truncated {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                "Only its first 1 MB is shown: o opens the rest.",
+                theme.message,
+            ));
+        }
+        lines
+    }
+}
+
+/// A pull request's Changed files to fetch, for the activity its Notification has.
+pub(super) struct Wanted {
+    pub(super) thread: ThreadId,
+    pub(super) as_of: DateTime<Utc>,
+    request: FilesRequest,
+}
+
+/// The outcome of fetching a pull request's Changed files.
+pub(super) struct WasFetched {
+    pub(super) thread: ThreadId,
+    pub(super) as_of: DateTime<Utc>,
+    pub(super) files: anyhow::Result<Vec<ChangedFile>>,
+}
+
+/// Fetches the Changed files `wanted` from `github`.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::changed_files`] is.
+pub(super) async fn fetch(github: &GitHub, wanted: Wanted) -> WasFetched {
+    WasFetched {
+        files: github.changed_files(&wanted.request).await,
+        thread: wanted.thread,
+        as_of: wanted.as_of,
+    }
+}
+
+/// A Changed file's whole text to fetch.
+pub(super) struct WantedText {
+    pub(super) thread: ThreadId,
+    pub(super) contents_path: String,
+}
+
+/// The outcome of fetching a Changed file's whole text.
+pub(super) struct TextFetched {
+    pub(super) thread: ThreadId,
+    pub(super) contents_path: String,
+    pub(super) text: anyhow::Result<FileText>,
+}
+
+/// Fetches the whole text `wanted` from `github`.
+///
+/// # Cancel Safety
+///
+/// Cancel safe, as [`GitHub::file_text`] is.
+pub(super) async fn fetch_text(github: &GitHub, wanted: WantedText) -> TextFetched {
+    TextFetched {
+        text: github.file_text(&wanted.contents_path).await,
+        thread: wanted.thread,
+        contents_path: wanted.contents_path,
+    }
+}
+
+/// `line` with its tabs as four spaces, which a terminal cell can't hold.
+fn untabbed(line: &str) -> String {
+    line.replace('\t', "    ")
+}
+
+/// The lines of a unified diff, `patch`, in `theme`: added and removed lines in their colors, hunk headers muted.
+fn diff_lines(patch: &str, theme: &Theme) -> Vec<Line<'static>> {
+    patch
+        .lines()
+        .map(|line| {
+            let style = match line.chars().next() {
+                Some('+') => theme.diff_added,
+                Some('-') => theme.diff_removed,
+                // `@@ -1,3 +1,4 @@` and "\ No newline at end of file".
+                Some('@' | '\\') => theme.markdown_muted,
+                _ => Style::new(),
+            };
+            Line::styled(untabbed(line), style)
+        })
+        .collect()
+}

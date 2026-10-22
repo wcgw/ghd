@@ -68,6 +68,10 @@ impl FileStatus {
 
 impl ChangedFile {
     /// Whether it's Markdown, by its extension: `.md` or `.markdown`, ignoring case.
+    #[expect(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "the path is lowercased on the line above, so the comparison isn't case-sensitive"
+    )]
     pub fn is_markdown(&self) -> bool {
         let path = self.path.to_ascii_lowercase();
         path.ends_with(".md") || path.ends_with(".markdown")

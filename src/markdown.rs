@@ -182,17 +182,14 @@ fn attribute<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
         }
         let value = lower[from..].trim_start().strip_prefix('=')?.trim_start();
         let value_start = tag.len() - value.len();
-        return Some(match value.chars().next() {
-            Some(quote @ ('"' | '\'')) => {
-                let inside = &tag[value_start + 1..];
-                &inside[..inside.find(quote).unwrap_or(inside.len())]
-            }
-            _ => {
-                let unquoted = &tag[value_start..];
-                &unquoted[..unquoted
-                    .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                    .unwrap_or(unquoted.len())]
-            }
+        return Some(if let Some(quote @ ('"' | '\'')) = value.chars().next() {
+            let inside = &tag[value_start + 1..];
+            &inside[..inside.find(quote).unwrap_or(inside.len())]
+        } else {
+            let unquoted = &tag[value_start..];
+            &unquoted[..unquoted
+                .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                .unwrap_or(unquoted.len())]
         });
     }
     None
@@ -261,7 +258,7 @@ impl StyleSheet for Styles {
     }
 
     /// None: the emoji `tui-markdown` has are two cells wide in some terminals, one in others.
-    fn alert_icon(&self, _kind: AlertKind) -> &str {
+    fn alert_icon(&self, _kind: AlertKind) -> &'static str {
         ""
     }
 

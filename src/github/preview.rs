@@ -183,7 +183,7 @@ impl GitHub {
             OptionFuture::from(self.handles_for(request.wanted)),
         );
         let mut preview = subject?;
-        let latest = latest.transpose()?.map(|comment| comment.into_comment());
+        let latest = latest.transpose()?.map(ApiComment::into_comment);
         let extras = extras.map(|extras| extras.map_err(|error| format!("{error:#}")));
         if let (Some(summary), Some(Ok(extras))) = (&mut preview.pull_request, &extras) {
             summary.ci = extras.ci;

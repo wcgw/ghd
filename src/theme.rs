@@ -180,20 +180,17 @@ impl Theme {
                 }
             }
         }
-        match BUILT_IN.iter().find(|(built_in, _)| *built_in == name) {
-            Some((_, text)) => {
-                Self::parse(text).with_context(|| format!("invalid built-in theme {name}"))
-            }
-            None => {
-                let built_in: Vec<&str> = BUILT_IN.iter().map(|(name, _)| *name).collect();
-                let file = path.map_or_else(String::new, |path| {
-                    format!("there's no {}, and ", path.display())
-                });
-                bail!(
-                    "no theme named \"{name}\": {file}ghd has no such built-in theme (it has {})",
-                    built_in.join(", ")
-                )
-            }
+        if let Some((_, text)) = BUILT_IN.iter().find(|(built_in, _)| *built_in == name) {
+            Self::parse(text).with_context(|| format!("invalid built-in theme {name}"))
+        } else {
+            let built_in: Vec<&str> = BUILT_IN.iter().map(|(name, _)| *name).collect();
+            let file = path.map_or_else(String::new, |path| {
+                format!("there's no {}, and ", path.display())
+            });
+            bail!(
+                "no theme named \"{name}\": {file}ghd has no such built-in theme (it has {})",
+                built_in.join(", ")
+            )
         }
     }
 
@@ -285,6 +282,11 @@ struct File {
 /// A style, as written.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one field per key a theme file can write, and the modifiers are independent of each other: they are \
+              not a state to model as an enum"
+)]
 struct StyleEntry {
     fg: Option<String>,
     bg: Option<String>,

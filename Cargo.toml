@@ -25,6 +25,18 @@ voight = { git = "https://github.com/wcgw/voight", rev = "5f219e54eb124e7f74035e
 [dev-dependencies]
 wiremock = "0.6.5"
 
+[lints.rust]
+# ghd has none, and needs none: keep it that way.
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# `Theme` is 800 bytes of `Style`, and `Copy`. Passing it by value is what the UI does throughout; narrowing that to
+# `&Theme` is worth doing, but as one change rather than lint by lint.
+large_types_passed_by_value = "allow"
+# It reads the Notification a test is about as too close to the one it was fetched from, and such.
+similar_names = "allow"
+
 [features]
 default = ["voight"]
 # Assessments of Previews' text, by voight's model (about 1.7 GB, loaded at startup unless `voight = "off"`).

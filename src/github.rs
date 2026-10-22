@@ -493,6 +493,10 @@ impl GitHub {
     }
 
     /// Maps the API's representation of a Notification onto ghd's.
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "`Url::path` can't be named: `url` reaches ghd only through octocrab, which doesn't re-export it"
+    )]
     fn notification_from_api(&self, api: ApiNotification) -> Notification {
         let repository = api.repository.full_name.unwrap_or(api.repository.name);
         Notification {
@@ -1062,6 +1066,8 @@ mod tests {
 
     #[tokio::test]
     async fn states_come_from_graphql() {
+        use SubjectState::*;
+
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -1099,7 +1105,6 @@ mod tests {
             .await
             .expect("GitHub answers");
 
-        use SubjectState::*;
         let expected = [
             Merged, Draft, Open, Closed, Completed, NotPlanned, NotPlanned, Open, Completed,
         ];
