@@ -32,6 +32,9 @@ red1 = "#c53b53"
 teal = "#4fd6be"
 terminal_black = "#444a73"
 yellow = "#ffc777"
+# Not Tokyo Night's own: green2 and red1 at a quarter over bg, for lines a diff adds and removes.
+diff_add = "#2a4556"
+diff_delete = "#4b2a3d"
 
 [styles]
 # No `bg`: the terminal's own background shows through.
@@ -66,6 +69,8 @@ voight = { fg = "magenta" }
 added = { fg = "green" }
 removed = { fg = "red" }
 changed = { fg = "yellow" }
+added_line = { bg = "diff_add" }
+removed_line = { bg = "diff_delete" }
 
 [styles.ci]
 passing = { fg = "green" }

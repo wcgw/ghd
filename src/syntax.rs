@@ -186,11 +186,11 @@ fn line_classes(highlighter: &mut HighlightLines, line: &str) -> Option<Classes>
     Some(classes)
 }
 
-/// A file's text, highlighted as far down as it's been wanted: highlighting a long file whole would keep the screen
-/// waiting.
+/// A file's text or diff, highlighted as far down as it's been wanted: highlighting a long one whole would keep the
+/// screen waiting.
 pub struct Highlighting {
     text: String,
-    highlighter: HighlightLines<'static>,
+    parsing: Parsing,
     /// The classes of each line highlighted so far.
     done: Vec<Classes>,
     /// Where the next line to highlight starts in `text`, in bytes.
@@ -199,36 +199,63 @@ pub struct Highlighting {
     stopped: bool,
 }
 
+/// Where highlighting is at in some code.
+enum Parsing {
+    /// A file, whole.
+    File(HighlightLines<'static>),
+    /// A diff.
+    Diff(Box<Sides>),
+}
+
+/// A diff's file before and after, as far as the hunk at hand shows them. Each hunk starts both again, as it shows
+/// nothing of what comes before it.
+struct Sides {
+    syntax: &'static SyntaxReference,
+    before: HighlightLines<'static>,
+    after: HighlightLines<'static>,
+}
+
 impl Highlighting {
     /// For `text`, the file at `path`, in the language its name says (`Dockerfile`, `main.rs`), or else its first line
     /// (`#!/bin/sh`); `None` if ghd doesn't know it, or it's plain text.
     pub fn of_file(path: &str, text: &str) -> Option<Self> {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let syntax = SYNTAXES
-            .find_syntax_by_extension(name)
-            .or_else(|| {
-                let (_, extension) = name.rsplit_once('.')?;
-                SYNTAXES.find_syntax_by_extension(extension)
-            })
-            .or_else(|| SYNTAXES.find_syntax_by_first_line(text.lines().next()?))
-            .filter(|syntax| !std::ptr::eq(*syntax, SYNTAXES.find_syntax_plain_text()))?;
-        Some(Self {
+        let syntax = syntax_of(path, text.lines().next())?;
+        Some(Self::new(
+            text,
+            Parsing::File(HighlightLines::new(syntax, &CLASSES)),
+        ))
+    }
+
+    /// For `patch`, the unified diff of the file at `path`, in the language its name says; `None` if ghd doesn't know
+    /// it, or it's plain text. Each line's classes are those of its code, past the `+`, `-` or space that starts it;
+    /// a hunk's `@@` line has none.
+    pub fn of_diff(path: &str, patch: &str) -> Option<Self> {
+        let syntax = syntax_of(path, None)?;
+        let parsing = Parsing::Diff(Box::new(Sides {
+            syntax,
+            before: HighlightLines::new(syntax, &CLASSES),
+            after: HighlightLines::new(syntax, &CLASSES),
+        }));
+        Some(Self::new(patch, parsing))
+    }
+
+    fn new(text: &str, parsing: Parsing) -> Self {
+        Self {
             text: text.to_owned(),
-            highlighter: HighlightLines::new(syntax, &CLASSES),
+            parsing,
             done: Vec::new(),
             at: 0,
             stopped: false,
-        })
+        }
     }
 
-    /// The classes of the pieces of the text's lines, highlighted down to line `count` first, or as far as they can
-    /// be.
-    pub fn down_to(&mut self, count: usize) -> &[Classes] {
+    /// Highlights the text down to line `count`, or as far as it can be.
+    pub fn down_to(&mut self, count: usize) {
         while !self.stopped && self.done.len() < count && self.at < self.text.len() {
             let rest = &self.text[self.at..];
             let line = &rest[..rest.find('\n').map_or(rest.len(), |end| end + 1)];
             let classes = (line.len() <= MAX_LINE_BYTES)
-                .then(|| line_classes(&mut self.highlighter, line))
+                .then(|| self.parsing.next(line))
                 .flatten();
             match classes {
                 Some(classes) => self.done.push(classes),
@@ -236,14 +263,61 @@ impl Highlighting {
             }
             self.at += line.len();
         }
-        &self.done
     }
 
-    /// The classes of the pieces of the lines highlighted so far.
-    #[cfg(test)]
-    pub fn done(&self) -> &[Classes] {
+    /// The classes of the pieces of each line highlighted so far.
+    pub fn lines(&self) -> &[Classes] {
         &self.done
     }
+}
+
+impl Parsing {
+    /// The classes of the pieces of `line`, the next one; `None` if it can't be highlighted.
+    fn next(&mut self, line: &str) -> Option<Classes> {
+        match self {
+            Self::File(highlighter) => line_classes(highlighter, line),
+            Self::Diff(sides) => {
+                let Sides {
+                    syntax,
+                    before,
+                    after,
+                } = &mut **sides;
+                // Past the `+`, `-` or space that says which side it's on.
+                let code = line.get(1..).unwrap_or_default();
+                match line.as_bytes().first() {
+                    Some(b'+') => line_classes(after, code),
+                    Some(b'-') => line_classes(before, code),
+                    // `@@ -1,3 +1,4 @@`: another hunk.
+                    Some(b'@') => {
+                        *before = HighlightLines::new(syntax, &CLASSES);
+                        *after = HighlightLines::new(syntax, &CLASSES);
+                        Some(Vec::new())
+                    }
+                    // "\ No newline at end of file".
+                    Some(b'\\') => Some(Vec::new()),
+                    // On both sides.
+                    _ => {
+                        line_classes(before, code)?;
+                        line_classes(after, code)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The syntax of the file at `path`, by its name (`Dockerfile`) or extension (`main.rs`), or else by its
+/// `first_line` (`#!/bin/sh`); `None` if ghd doesn't know it, or it's plain text.
+fn syntax_of(path: &str, first_line: Option<&str>) -> Option<&'static SyntaxReference> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    SYNTAXES
+        .find_syntax_by_extension(name)
+        .or_else(|| {
+            let (_, extension) = name.rsplit_once('.')?;
+            SYNTAXES.find_syntax_by_extension(extension)
+        })
+        .or_else(|| SYNTAXES.find_syntax_by_first_line(first_line?))
+        .filter(|syntax| !std::ptr::eq(*syntax, SYNTAXES.find_syntax_plain_text()))
 }
 
 /// Not the highlighter, which says nothing useful.
@@ -404,10 +478,15 @@ mod tests {
         let text = "/* a\n   b */\nfn f() {}\n";
         let mut highlighting = Highlighting::of_file("a.rs", text).expect("Rust");
 
-        assert_eq!(highlighting.down_to(1), [vec![(0..4, Class::Comment)]]);
-        assert_eq!(highlighting.done().len(), 1, "no further");
+        highlighting.down_to(1);
+        assert_eq!(
+            highlighting.lines(),
+            [vec![(0..4, Class::Comment)]],
+            "no further"
+        );
 
-        let done = highlighting.down_to(10);
+        highlighting.down_to(10);
+        let done = highlighting.lines();
         assert_eq!(done.len(), 3, "as far as there are lines");
         assert_eq!(done[1], [(0..7, Class::Comment)], "still in the comment");
         assert_eq!(done[2][0], (0..2, Class::Keyword));
@@ -421,7 +500,68 @@ mod tests {
         );
         let mut highlighting = Highlighting::of_file("a.rs", &text).expect("Rust");
 
-        assert_eq!(highlighting.down_to(3).len(), 1);
+        highlighting.down_to(3);
+
+        assert_eq!(highlighting.lines().len(), 1);
+    }
+
+    /// The pieces of the code of each line of `patch`, past its first character, highlighted as a diff of a Rust
+    /// file, with their classes.
+    fn diff_pieces(patch: &str) -> Vec<Vec<(&str, Class)>> {
+        let mut highlighting = Highlighting::of_diff("src/a.rs", patch).expect("Rust");
+        highlighting.down_to(usize::MAX);
+        patch
+            .lines()
+            .zip(highlighting.lines())
+            .map(|(line, classes)| {
+                classes
+                    .iter()
+                    .map(|(range, class)| (&line[1..][range.clone()], *class))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diffs_are_highlighted_side_by_side() {
+        let pieces = diff_pieces(
+            "@@ -1,4 +1,4 @@ fn main() {\n /* both\n-   before */ 1\n+   after */ fn\n fn f() {}",
+        );
+
+        assert_eq!(pieces[0], [], "the hunk's line");
+        assert_eq!(pieces[1], [("/* both", Class::Comment)]);
+        assert_eq!(
+            pieces[2][0],
+            ("   before */", Class::Comment),
+            "the comment goes on before"
+        );
+        assert_eq!(pieces[3][0], ("   after */", Class::Comment), "and after");
+        assert!(pieces[3].contains(&("fn", Class::Keyword)), "{pieces:?}");
+        assert_eq!(pieces[4][0], ("fn", Class::Keyword), "both sides closed it");
+    }
+
+    #[test]
+    fn diff_sides_and_hunks_start_apart() {
+        let pieces = diff_pieces(
+            "@@ -1 +1 @@\n-/* before only\n+fn after() {}\n@@ -9 +9 @@\n+/* open\n@@ -20 +20 @@\n fn f() {}",
+        );
+
+        assert_eq!(
+            pieces[2][0],
+            ("fn", Class::Keyword),
+            "not in the comment before"
+        );
+        assert_eq!(
+            pieces[6][0],
+            ("fn", Class::Keyword),
+            "not in the last hunk's comment"
+        );
+    }
+
+    #[test]
+    fn diffs_go_by_the_file_name_only() {
+        assert!(Highlighting::of_diff("Dockerfile", "@@ -1 +1 @@\n+FROM scratch").is_some());
+        assert!(Highlighting::of_diff("bin/run", "@@ -0,0 +1 @@\n+#!/bin/sh").is_none());
     }
 
     #[test]

@@ -3116,6 +3116,25 @@ mod tests {
         cell_of(app, text).bg
     }
 
+    /// The last cell inside the border on the line `text` is on, on the screen `app` draws for the Preview tests.
+    fn line_end_of(app: &mut App, text: &str) -> ratatui::buffer::Cell {
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, PREVIEW_SCREEN_HEIGHT))
+            .expect("test backend never fails");
+        terminal
+            .draw(|frame| app.render(frame, false))
+            .expect("test backend never fails");
+        let buffer = terminal.backend().buffer();
+        let y = (0..PREVIEW_SCREEN_HEIGHT)
+            .find(|&y| {
+                (0..SCREEN_WIDTH)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap_or_else(|| panic!("{text:?} isn't on screen"));
+        buffer[(SCREEN_WIDTH - 2, y)].clone()
+    }
+
     /// The cell `text` starts at, on the screen `app` draws for the Preview tests.
     fn cell_of(app: &mut App, text: &str) -> ratatui::buffer::Cell {
         let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, PREVIEW_SCREEN_HEIGHT))
@@ -3481,6 +3500,56 @@ mod tests {
 
         app.press(key_named("w"));
         assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
+    }
+
+    #[test]
+    fn diffs_are_highlighted_on_their_lines_background() {
+        let mut app = app_with_files(changed_files());
+        app.theme = Theme {
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            diff_added: Style::new().fg(Color::Green),
+            diff_removed: Style::new().fg(Color::Red),
+            diff_added_line: Style::new().bg(Color::Rgb(1, 1, 1)),
+            diff_removed_line: Style::new().bg(Color::Rgb(2, 2, 2)),
+            markdown_muted: Style::new().fg(Color::Gray),
+            ..Theme::default()
+        };
+        app.press(key_named("j"));
+
+        assert_eq!(cell_of(&mut app, "@@ -1,2").fg, Color::Gray);
+        assert_eq!(cell_of(&mut app, "fn a()").fg, Color::Magenta, "context");
+        let added = cell_of(&mut app, "+new");
+        assert_eq!((added.fg, added.bg), (Color::Green, Color::Rgb(1, 1, 1)));
+        assert_eq!(cell_of(&mut app, "new ").bg, Color::Rgb(1, 1, 1));
+        let removed = cell_of(&mut app, "-old");
+        assert_eq!((removed.fg, removed.bg), (Color::Red, Color::Rgb(2, 2, 2)));
+        assert_eq!(
+            line_end_of(&mut app, "-old").bg,
+            Color::Rgb(2, 2, 2),
+            "past the text, across the pane"
+        );
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let removed_at = lines.iter().position(|line| line.contains("-old"));
+        let added_at = lines.iter().position(|line| line.contains("+new"));
+        assert_eq!(
+            added_at,
+            removed_at.map(|at| at + 1),
+            "no line of its own: {lines:#?}"
+        );
+
+        app.press(key_named("w"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        app.files.took_text(files::TextFetched {
+            thread: wanted.thread,
+            contents_path: wanted.contents_path,
+            text: Ok(FileText::of("fn a() {}\nnew\n".to_owned())),
+        });
+
+        assert_eq!(
+            cell_of(&mut app, "fn a()").fg,
+            Color::Magenta,
+            "whole, highlighted apart from its diff"
+        );
     }
 
     #[test]
