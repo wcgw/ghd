@@ -35,3 +35,9 @@ merged = { fg = "magenta" }
 closed = { fg = "red" }
 completed = { fg = "magenta" }
 not_planned = { dim = true }
+
+# voight's Heatmap (`H`): the terminal's green, yellow and red, stepped between rather than blended.
+[styles.heatmap]
+human = { fg = "black", bg = "green" }
+even = { fg = "black", bg = "yellow" }
+llm = { fg = "black", bg = "red" }

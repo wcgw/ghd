@@ -149,6 +149,12 @@ theme! {
     ci_pending = "ci.pending",
     /// voight's Assessment, at the end of the Preview's bottom border.
     voight = "voight",
+    /// In the Heatmap, text in a window voight scored 0%; see [`Theme::heat`].
+    heatmap_human = "heatmap.human",
+    /// … scored 50%.
+    heatmap_even = "heatmap.even",
+    /// … scored 100%.
+    heatmap_llm = "heatmap.llm",
 }
 
 impl Theme {
@@ -217,6 +223,30 @@ impl Theme {
             SubjectState::Completed => self.state_completed,
             SubjectState::NotPlanned => self.state_not_planned,
         }
+    }
+
+    /// The style of text in the Heatmap that voight scored `share`, between 0 and 1: `heatmap.human` at 0,
+    /// `heatmap.even` at 0.5 and `heatmap.llm` at 1. In between, the nearer one's, with a background blended from
+    /// both's when they're RGB colors.
+    pub fn heat(&self, share: f64) -> Style {
+        let share = share.clamp(0.0, 1.0);
+        let (from, to, toward) = if share < 0.5 {
+            (self.heatmap_human, self.heatmap_even, share * 2.0)
+        } else {
+            (self.heatmap_even, self.heatmap_llm, share * 2.0 - 1.0)
+        };
+        let nearer = if toward < 0.5 { from } else { to };
+        let (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) = (from.bg, to.bg) else {
+            return nearer;
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rounded, between two `u8`s"
+        )]
+        let blend =
+            |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * toward).round() as u8;
+        nearer.bg(Color::Rgb(blend(r0, r1), blend(g0, g1), blend(b0, b1)))
     }
 
     /// The theme that the TOML `text` describes.
@@ -470,6 +500,49 @@ mod tests {
             unstyled.is_empty(),
             "tokyonight-moon leaves out {unstyled:?}"
         );
+    }
+
+    #[test]
+    fn heat_blends_rgb_backgrounds_and_steps_between_others() {
+        let blended = parse(
+            r##"
+            [styles.heatmap]
+            human = { fg = "black", bg = "#0ac80a" }
+            even = { fg = "black", bg = "#c8c80a" }
+            llm = { fg = "white", bg = "#c80a0a", bold = true }
+            "##,
+        );
+        assert_eq!(blended.heat(0.0), blended.heatmap_human);
+        assert_eq!(blended.heat(0.5), blended.heatmap_even);
+        assert_eq!(blended.heat(1.0), blended.heatmap_llm);
+        assert_eq!(blended.heat(-1.0), blended.heatmap_human, "clamped");
+        assert_eq!(blended.heat(2.0), blended.heatmap_llm, "clamped");
+        assert_eq!(
+            blended.heat(0.2),
+            Style::new().fg(Color::Black).bg(Color::Rgb(86, 200, 10)),
+            "40% of the way to yellow"
+        );
+        assert_eq!(
+            blended.heat(0.8),
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Rgb(200, 86, 10))
+                .add_modifier(Modifier::BOLD),
+            "nearer red: its foreground"
+        );
+
+        let stepped = parse(
+            r#"
+            [styles.heatmap]
+            human = { bg = "green" }
+            even = { bg = "yellow" }
+            llm = { bg = "red" }
+            "#,
+        );
+        assert_eq!(stepped.heat(0.24), Style::new().bg(Color::Green));
+        assert_eq!(stepped.heat(0.26), Style::new().bg(Color::Yellow));
+        assert_eq!(stepped.heat(0.74), Style::new().bg(Color::Yellow));
+        assert_eq!(stepped.heat(0.76), Style::new().bg(Color::Red));
     }
 
     #[test]

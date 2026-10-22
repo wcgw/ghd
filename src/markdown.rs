@@ -7,16 +7,21 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use tui_markdown::{AlertKind, Options, StyleSheet};
 
+use crate::assessment::Window;
+use crate::heatmap;
 use crate::theme::Theme;
 
-/// The lines `markdown` draws in `theme`, its tables fitted to `width` cells. As github.com shows issues, pull
-/// requests and comments, a new line within a paragraph breaks the line. HTML outside code is rewritten, as a
-/// terminal can't draw it: comments are dropped, `<br>` breaks the line, `<img>` shows its description, and any
-/// other tag is dropped for its text, so a `<details>` block shows open, its `<summary>` on a line of its own.
-pub fn lines(markdown: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+/// The lines `markdown` draws in `theme`, its tables fitted to `width` cells, as the Heatmap of `heat`: the windows of
+/// an Assessment of the text [`as_github_shows`] makes of it; none for no Heatmap.
+///
+/// As github.com shows issues, pull requests and comments, a new line within a paragraph breaks the line. HTML outside
+/// code is rewritten, as a terminal can't draw it: comments are dropped, `<br>` breaks the line, `<img>` shows its
+/// description, and any other tag is dropped for its text, so a `<details>` block shows open, its `<summary>` on a
+/// line of its own.
+pub fn lines(markdown: &str, theme: &Theme, width: u16, heat: &[Window]) -> Vec<Line<'static>> {
     let markdown = as_github_shows(markdown);
     let options = Options::new(Styles(*theme)).table_width(width);
-    tui_markdown::from_str_with_options(&markdown, &options)
+    let mut lines: Vec<Line<'static>> = tui_markdown::from_str_with_options(&markdown, &options)
         .lines
         .into_iter()
         .map(|line| Line {
@@ -27,7 +32,9 @@ pub fn lines(markdown: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
                 .collect(),
             ..line
         })
-        .collect()
+        .collect();
+    heatmap::shade(&mut lines, &markdown, heat, theme);
+    lines
 }
 
 /// Whether `markdown` mentions `handle`, a login (`octocat`) or a team (`github/docs`), as GitHub notifies for:
@@ -290,7 +297,7 @@ mod tests {
     use super::*;
 
     fn text(markdown: &str) -> Vec<String> {
-        lines(markdown, &Theme::default(), 60)
+        lines(markdown, &Theme::default(), 60, &[])
             .iter()
             .map(ToString::to_string)
             .collect()
@@ -377,7 +384,7 @@ mod tests {
             ..Theme::default()
         };
 
-        let drawn = lines("# Title\n\nRun `ghd`.", &theme, 60);
+        let drawn = lines("# Title\n\nRun `ghd`.", &theme, 60, &[]);
 
         // As drawn: the span's style over its line's.
         let style_of = |text: &str| {
@@ -388,6 +395,67 @@ mod tests {
         };
         assert_eq!(style_of("Title"), Some(Some(Color::Red)));
         assert_eq!(style_of("ghd"), Some(Some(Color::Green)));
+    }
+
+    #[test]
+    fn heatmap_shades_the_text_where_it_is_drawn() {
+        let theme = Theme {
+            heatmap_human: Style::new().bg(Color::Green),
+            heatmap_llm: Style::new().bg(Color::Red),
+            ..Theme::default()
+        };
+        let markdown = "# Title\n\n- An item, and a [link](https://example.com).<br>Same item.\n\n```\ncode\n```\n\nThe end.\n";
+        let assessed = as_github_shows(markdown);
+        let window = |part: &str, share| {
+            let start = assessed.find(part).expect("part of the text");
+            Window {
+                range: start..start + part.len(),
+                share,
+            }
+        };
+        let heat = [
+            window(
+                "# Title\n\n- An item, and a [link](https://example.com).",
+                1.0,
+            ),
+            window("Same item.\n\n", 0.0),
+            window("The end.", 0.0),
+        ];
+
+        let drawn = lines(markdown, &theme, 60, &heat);
+
+        // Each line's text, and the background of each span on it, as drawn.
+        let shaded: Vec<(String, Vec<Option<Color>>)> = drawn
+            .iter()
+            .map(|line| {
+                let bgs = line
+                    .spans
+                    .iter()
+                    .map(|span| line.style.patch(span.style).bg)
+                    .collect();
+                (line.to_string(), bgs)
+            })
+            .collect();
+        let red = Some(Color::Red);
+        let green = Some(Color::Green);
+        assert_eq!(
+            shaded,
+            [
+                ("# Title".to_owned(), vec![red, red]),
+                (String::new(), vec![]),
+                (
+                    "- An item, and a link (https://example.com).".to_owned(),
+                    vec![red; 7]
+                ),
+                ("Same item.".to_owned(), vec![green]),
+                (String::new(), vec![]),
+                ("```".to_owned(), vec![None]),
+                ("code".to_owned(), vec![None]),
+                ("```".to_owned(), vec![None]),
+                (String::new(), vec![]),
+                ("The end.".to_owned(), vec![green]),
+            ]
+        );
     }
 
     #[test]

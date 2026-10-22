@@ -9,6 +9,7 @@ mod fetched;
 mod files;
 mod filter;
 mod github;
+mod heatmap;
 mod inbox;
 mod markdown;
 mod preview;

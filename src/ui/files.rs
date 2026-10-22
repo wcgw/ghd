@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
 use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, counted};
-use crate::assessment;
+use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
 use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText};
 use crate::github::{FilesRequest, GitHub};
@@ -132,8 +132,10 @@ impl Files {
                 self.screen = None;
                 return Pressed::Nothing;
             }
-            // What acts on Notifications; `?` never reaches here, the app around it showing the help itself.
+            // What acts on Notifications; `?` and `H` never reach here, the app around it showing the help and the
+            // Heatmap itself.
             Command::Help
+            | Command::ToggleHeatmap
             | Command::ToggleSelected
             | Command::SelectAllShown
             | Command::NextView
@@ -395,21 +397,23 @@ impl Files {
         frame.render_stateful_widget(table, area, &mut screen.cursor);
     }
 
-    /// Draws the selected Changed file in `area`, as far down as it's scrolled, with what voight says of it in the
-    /// bottom border, if `label` says anything.
+    /// Draws the selected Changed file in `area`, as far down as it's scrolled, as the Heatmap of `heat`, the windows
+    /// of its Assessment, if there are any; with what voight says of it in the bottom border, if `label` says
+    /// anything.
     pub(super) fn render_selected(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
-        label: Option<String>,
+        label: Option<Span<'static>>,
+        heat: &[Window],
     ) {
         // Inside the border.
         let width = area.width.saturating_sub(2);
         let (path, lines) = match self.selected() {
             Some(file) => (
                 format!(" {} ", file.path),
-                self.lines_of(file, theme, width),
+                self.lines_of(file, theme, width, heat),
             ),
             None => (String::new(), Vec::new()),
         };
@@ -418,7 +422,7 @@ impl Files {
             .border_style(theme.border)
             .title(Line::styled(path, theme.tab));
         if let Some(label) = label {
-            block = block.title_bottom(Line::styled(label, theme.voight).right_aligned());
+            block = block.title_bottom(Line::from(label).right_aligned());
         }
         if let Some(screen) = &mut self.screen {
             screen.scroll.render(frame, area, text, block);
@@ -426,8 +430,14 @@ impl Files {
     }
 
     /// What the file pane shows of `file`, `width` cells wide: where it was renamed or copied from, then the file
-    /// whole or its diff, or why there's neither.
-    fn lines_of(&self, file: &ChangedFile, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    /// whole, as the Heatmap of `heat`, or its diff, or why there's neither.
+    fn lines_of(
+        &self,
+        file: &ChangedFile,
+        theme: &Theme,
+        width: u16,
+        heat: &[Window],
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         match (file.status, &file.previous_path) {
             (FileStatus::Renamed, Some(previous)) => lines.push(Line::styled(
@@ -445,7 +455,7 @@ impl Files {
                 format!("Deleted: {}", counted(file.deletions, "line")),
                 theme.markdown_muted,
             )],
-            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width),
+            _ if self.shows_whole(file) => self.whole_lines_of(file, theme, width, heat),
             Some(patch) => diff_lines(patch, theme),
             // Renamed or copied as it was: that's all there is to say.
             None if file.additions + file.deletions == 0 && !lines.is_empty() => Vec::new(),
@@ -461,8 +471,15 @@ impl Files {
         lines
     }
 
-    /// `file`, whole, `width` cells wide: rendered if it's Markdown; or why it can't be shown yet, or at all.
-    fn whole_lines_of(&self, file: &ChangedFile, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    /// `file`, whole, `width` cells wide: rendered if it's Markdown, as the Heatmap of `heat`; or why it can't be shown
+    /// yet, or at all.
+    fn whole_lines_of(
+        &self,
+        file: &ChangedFile,
+        theme: &Theme,
+        width: u16,
+        heat: &[Window],
+    ) -> Vec<Line<'static>> {
         let (text, truncated) = if let Some(text) = file.added_text() {
             (Cow::Owned(text), false)
         } else {
@@ -492,7 +509,7 @@ impl Files {
             return vec![Line::styled("Empty file.", theme.message)];
         }
         let mut lines = if file.is_markdown() {
-            markdown::lines(&text, theme, width)
+            markdown::lines(&text, theme, width, heat)
         } else {
             text.lines().map(|line| Line::raw(untabbed(line))).collect()
         };

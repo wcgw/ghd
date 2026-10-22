@@ -64,6 +64,10 @@ _Avoid_: diff, patch, file change
 voight's estimate, as a percentage, of how much of the text a **Preview** shows was written by an LLM; made only of text with enough prose to mean something. Never evidence of authorship.
 _Avoid_: score, AI detection, verdict
 
+**Heatmap**:
+The text an **Assessment** is of, each window of prose voight scored on its own (paragraphs of about 100 to 400 words) shaded by its own estimate, from green at 0% through yellow to red at 100%; text it didn't score, like code, stays as it is.
+_Avoid_: highlighting, heat
+
 **View**:
 A named tab, defined in configuration, that shows the **Inbox** **Notifications** matching its **Filter**.
 _Avoid_: folder, bucket, tab, filter

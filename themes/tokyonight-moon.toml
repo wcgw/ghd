@@ -96,3 +96,9 @@ merged = { fg = "magenta" }
 closed = { fg = "red" }
 completed = { fg = "magenta" }
 not_planned = { fg = "dark5" }
+
+# voight's Heatmap (`H`): green through yellow to red, blended; the background's color over them.
+[styles.heatmap]
+human = { fg = "bg", bg = "green" }
+even = { fg = "bg", bg = "yellow" }
+llm = { fg = "bg", bg = "red" }
