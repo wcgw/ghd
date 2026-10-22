@@ -1,0 +1,4 @@
+# The longest functions ghd has are a `select!` loop, a command dispatch and three render functions: each one long
+# match whose arms belong together, which splitting would scatter rather than simplify. 140 leaves them as they are
+# and still catches anything growing past them.
+too-many-lines-threshold = 140
