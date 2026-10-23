@@ -40,6 +40,7 @@ diff_delete = "#4b2a3d"
 # No `bg`: the terminal's own background shows through.
 text = { fg = "fg" }
 border = { fg = "dark3" }
+scrollbar = { fg = "fg_dark" }
 tab = { fg = "dark5" }
 tab_current = { fg = "bg", bg = "blue", bold = true }
 cursor = { bg = "bg_highlight" }

@@ -12,10 +12,13 @@ use chrono::{DateTime, TimeDelta, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::future::OptionFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableState, Wrap,
+};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 
@@ -698,8 +701,16 @@ impl Scrolled {
         self.lines.saturating_sub(self.rows)
     }
 
-    /// Draws `text` in `block` on `area` of `frame`, as far down as it's scrolled, noting what fits.
-    fn render(&mut self, frame: &mut Frame, area: Rect, text: Paragraph, block: Block) {
+    /// Draws `text` in `block` on `area` of `frame`, as far down as it's scrolled, noting what fits; and when it
+    /// doesn't all fit, a scrollbar on the right border, its thumb in `thumb` over the lines that show.
+    fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        text: Paragraph,
+        block: Block,
+        thumb: Style,
+    ) {
         // Inside the border.
         self.rows = area.height.saturating_sub(2);
         self.lines =
@@ -707,6 +718,25 @@ impl Scrolled {
         // Shorter text, or a taller pane, than at the last scroll.
         self.by = self.by.min(self.furthest());
         frame.render_widget(text.scroll((self.by, 0)).block(block), area);
+        if self.lines > self.rows {
+            // A position for each line the text can be scrolled down by: with the track as long as the pane's rows,
+            // the thumb then spans the lines that show, out of all of them.
+            let mut state =
+                ScrollbarState::new(usize::from(self.furthest()) + 1).position(self.by.into());
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                // The border shows where the thumb isn't.
+                .track_symbol(None)
+                .thumb_symbol("┃")
+                .thumb_style(thumb);
+            // Between the border's corners.
+            let track = area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            });
+            frame.render_stateful_widget(scrollbar, track, &mut state);
+        }
     }
 }
 
@@ -1792,7 +1822,8 @@ impl App {
             block = block.title_bottom(Line::from(label).right_aligned());
         }
         if let Some(pane) = &mut self.preview {
-            pane.scroll.render(frame, area, text, block);
+            pane.scroll
+                .render(frame, area, text, block, theme.scrollbar);
         }
     }
 
@@ -3168,6 +3199,61 @@ mod tests {
         assert_eq!(text, "The description");
     }
 
+    /// The right border of `lines`, from the line under `top` to the line over `bottom`: where a scrollbar goes.
+    fn right_border(lines: &[String], top: usize, bottom: usize) -> String {
+        lines[top + 1..bottom]
+            .iter()
+            .map(|line| line.chars().last().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn longer_preview_has_a_scrollbar_over_what_shows() {
+        let (mut app, since) = app_previewing();
+        app.theme = Theme {
+            scrollbar: Style::new().fg(Color::Magenta),
+            ..Theme::default()
+        };
+        let body: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+        let long = add_polling_preview(Body::Markdown(body.join("\n")));
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(long));
+        let scrollbar = |app: &mut App| {
+            let lines = screen_of(app, PREVIEW_SCREEN_HEIGHT);
+            let top = lines
+                .iter()
+                .position(|line| line.contains(" Preview "))
+                .expect("open");
+            let bottom = usize::from(PREVIEW_SCREEN_HEIGHT) - 2;
+            assert!(
+                lines[top].ends_with('┐') && lines[bottom].ends_with('┘'),
+                "between the corners: {lines:#?}"
+            );
+            right_border(&lines, top, bottom)
+        };
+
+        let at_top = scrollbar(&mut app);
+        let thumb = at_top.chars().filter(|&c| c == '┃').count();
+        assert!(
+            at_top.starts_with('┃') && at_top.ends_with('│') && thumb < at_top.chars().count() / 2,
+            "{at_top}"
+        );
+        assert_eq!(cell_of(&mut app, "┃").fg, Color::Magenta);
+        for _ in 0..20 {
+            app.press(key_named("J"));
+            screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        }
+        let at_end = scrollbar(&mut app);
+        assert!(at_end.starts_with('│') && at_end.ends_with('┃'), "{at_end}");
+        assert_eq!(at_end.chars().filter(|&c| c == '┃').count(), thumb);
+    }
+
+    #[test]
+    fn preview_that_fits_has_no_scrollbar() {
+        let lines = previewing(add_polling_preview(Body::Markdown("Short".to_owned())));
+
+        assert!(!shows(&lines, "┃"), "{lines:#?}");
+    }
+
     #[test]
     fn comment_shows_who_wrote_it_and_where() {
         let (mut app, since) = app_previewing();
@@ -4031,6 +4117,29 @@ mod tests {
         app.press(key_named("j"));
 
         assert_eq!(app.files.scrolled_by(), 0);
+    }
+
+    #[test]
+    fn longer_file_has_a_scrollbar() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
+        let mut app = app_with_files(vec![
+            changed("long.txt", FileStatus::Added, Some(&patch)),
+            changed(
+                "short.txt",
+                FileStatus::Added,
+                Some("@@ -0,0 +1 @@\n+Short"),
+            ),
+        ]);
+        app.theme = Theme {
+            scrollbar: Style::new().fg(Color::Magenta),
+            ..Theme::default()
+        };
+
+        assert_eq!(cell_of(&mut app, "┃").fg, Color::Magenta);
+        app.press(key_named("j"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(!shows(&lines, "┃"), "{lines:#?}");
     }
 
     #[test]

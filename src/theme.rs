@@ -70,6 +70,8 @@ theme! {
     /// Everything not styled otherwise. Its background, if any, paints the whole screen.
     text = "text",
     border = "border",
+    /// The thumb of the scrollbar on a pane's right border, while its text is longer than the pane.
+    scrollbar = "scrollbar",
     /// A View's tab, other than the one on screen.
     tab = "tab",
     tab_current = "tab_current",

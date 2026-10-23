@@ -459,7 +459,9 @@ impl Files {
             block = block.title_bottom(Line::from(label).right_aligned());
         }
         if let Some(screen) = &mut self.screen {
-            screen.scroll.render(frame, area, text, block);
+            screen
+                .scroll
+                .render(frame, area, text, block, theme.scrollbar);
         }
     }
 
