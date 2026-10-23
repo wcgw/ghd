@@ -47,7 +47,8 @@ const QUIT_GRACE: Duration = Duration::from_secs(10);
 /// fetches nothing.
 const PREVIEW_REST: Duration = Duration::from_millis(200);
 
-/// The fewest lines the screen needs for the Preview pane: a few rows of the list, and of the Preview.
+/// The fewest lines the screen needs for the Preview pane: the list's row at the cursor, and a few lines of the
+/// Preview.
 const PREVIEW_MIN_HEIGHT: u16 = 12;
 
 /// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`, naming Subject
@@ -1608,6 +1609,9 @@ impl App {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
         let tall_enough = self.screen_height >= PREVIEW_MIN_HEIGHT;
+        // The Preview or the file below is what's read: a quarter is plenty for the list.
+        let [list_area, read_area] =
+            Layout::vertical([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)]).areas(view_area);
         // On a terminal made too short while they're open, the Preview and a file wait for it to grow again.
         if self.files.is_open() {
             // Taken before the Files screen is borrowed, which it would otherwise be twice over.
@@ -1615,22 +1619,15 @@ impl App {
             let heat = self.heat().to_vec();
             let theme = self.theme;
             if tall_enough {
-                // The file is what's read: a quarter is plenty for the list.
-                let [list_area, file_area] =
-                    Layout::vertical([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
-                        .areas(view_area);
                 self.files.render_list(frame, list_area, &theme);
                 self.files
-                    .render_selected(frame, file_area, &theme, label, &heat);
+                    .render_selected(frame, read_area, &theme, label, &heat);
             } else {
                 self.files.render_list(frame, view_area, &theme);
             }
         } else if self.preview.is_some() && tall_enough {
-            let [list_area, preview_area] =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .areas(view_area);
             self.render_view(frame, list_area, fetching);
-            self.render_preview(frame, preview_area);
+            self.render_preview(frame, read_area);
         } else {
             self.render_view(frame, view_area, fetching);
         }
@@ -2771,10 +2768,8 @@ mod tests {
             .iter()
             .position(|line| line.contains(" Preview "))
             .expect("the Preview is open");
-        assert!(
-            (8..=10).contains(&pane_top),
-            "in the bottom half: {lines:#?}"
-        );
+        // A line for the status, 19 for the screen: the Preview takes three quarters of them.
+        assert_eq!(pane_top, 5, "{lines:#?}");
         assert!(shows(&lines, "Fetching…"), "{lines:#?}");
         assert!(
             shows(&lines, "wcgw/ghd · review-requested · now"),
