@@ -4,12 +4,14 @@ mod files;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::mem;
 use std::time::Duration;
+use std::{fmt, io, mem, panic};
 
 use anyhow::{Context as _, bail};
 use chrono::{DateTime, TimeDelta, Utc};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures_util::future::OptionFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
@@ -53,6 +55,55 @@ const PREVIEW_REST: Duration = Duration::from_millis(200);
 /// The fewest lines the screen needs for the Preview pane: the list's row at the cursor, and a few lines of the
 /// Preview.
 const PREVIEW_MIN_HEIGHT: u16 = 12;
+
+/// How many lines a turn of the mouse wheel scrolls a pane by, as desktops commonly do.
+const WHEEL_LINES: u16 = 3;
+
+/// Has the terminal report its mouse wheel to ghd, rather than turn it into arrow keys, until [`release_mouse`] or a
+/// panic. Its buttons too, which ghd leaves be, but not the pointer's every move, which would have the screen drawn
+/// again at each.
+///
+/// # Errors
+///
+/// Fails if the terminal can't be written to.
+pub fn capture_mouse() -> io::Result<()> {
+    let hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        release_mouse();
+        hook(info);
+    }));
+    crossterm::execute!(io::stdout(), ReportMouse(true))
+}
+
+/// Has the terminal stop reporting its mouse, as before [`capture_mouse`].
+pub fn release_mouse() {
+    // A terminal that can't be written to is past caring.
+    let _ = crossterm::execute!(io::stdout(), ReportMouse(false));
+}
+
+/// Turns the terminal's reporting of mouse buttons, the wheel's included, on or off: X11's (1000), with coordinates
+/// as SGR's (1006).
+struct ReportMouse(bool);
+
+impl crossterm::Command for ReportMouse {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str(if self.0 {
+            "\x1b[?1000h\x1b[?1006h"
+        } else {
+            "\x1b[?1006l\x1b[?1000l"
+        })
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        // The console has no mode for buttons alone.
+        if self.0 {
+            crossterm::event::EnableMouseCapture.execute_winapi()
+        } else {
+            crossterm::event::DisableMouseCapture.execute_winapi()
+        }
+    }
+}
 
 /// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`, naming Subject
 /// kinds with `kind_labels`. Meanwhile it
@@ -188,6 +239,7 @@ pub async fn run(
                     }
                     None => {}
                 },
+                Some(Ok(Event::Mouse(mouse))) => app.mouse(mouse),
                 // Anything else, a resize included, just needs the redraw at the top of the loop.
                 Some(Ok(_)) => {}
                 Some(Err(error)) => return Err(error).context("reading terminal events"),
@@ -684,16 +736,41 @@ struct Scrolled {
     lines: u16,
 }
 
+/// Which way the mouse wheel turned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wheel {
+    Down,
+    Up,
+}
+
 impl Scrolled {
     /// Scrolls down by half the pane, no further than to the text's last line at the bottom of the pane.
     fn half_down(&mut self) {
-        let half = (self.rows / 2).max(1);
-        self.by = self.by.saturating_add(half).min(self.furthest());
+        self.down((self.rows / 2).max(1));
     }
 
     /// Scrolls up by half the pane, no further than the top.
     fn half_up(&mut self) {
-        self.by = self.by.saturating_sub((self.rows / 2).max(1));
+        self.up((self.rows / 2).max(1));
+    }
+
+    /// Scrolls by a turn of the mouse wheel: [`WHEEL_LINES`], no further than the text's last line at the bottom of
+    /// the pane, nor than its top.
+    fn wheel(&mut self, turn: Wheel) {
+        match turn {
+            Wheel::Down => self.down(WHEEL_LINES),
+            Wheel::Up => self.up(WHEEL_LINES),
+        }
+    }
+
+    /// Scrolls down by `lines`, no further than to the text's last line at the bottom of the pane.
+    fn down(&mut self, lines: u16) {
+        self.by = self.by.saturating_add(lines).min(self.furthest());
+    }
+
+    /// Scrolls up by `lines`, no further than the top.
+    fn up(&mut self, lines: u16) {
+        self.by = self.by.saturating_sub(lines);
     }
 
     /// The furthest the text can be scrolled: until its last line is at the bottom of the pane.
@@ -1330,6 +1407,41 @@ impl App {
                 let changes = self.execute(command);
                 (!changes.is_empty()).then_some(Outcome::Send(changes))
             }
+        }
+    }
+
+    /// Takes what the mouse did: only a turn of its wheel does anything.
+    fn mouse(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::ScrollDown => self.wheel(Wheel::Down),
+            MouseEventKind::ScrollUp => self.wheel(Wheel::Up),
+            _ => {}
+        }
+    }
+
+    /// Takes a turn of the mouse wheel: it scrolls what's read while it shows, the file on the Files screen or else
+    /// the Preview, wherever the pointer is; otherwise it moves the cursor, as arrow keys do. Over the help, it does
+    /// nothing.
+    fn wheel(&mut self, turn: Wheel) {
+        if self.help_shown {
+            return;
+        }
+        let shows_more = self.screen_height >= PREVIEW_MIN_HEIGHT;
+        let moving = match turn {
+            Wheel::Down => Command::Down,
+            Wheel::Up => Command::Up,
+        };
+        if self.files.is_open() {
+            if shows_more {
+                self.files.wheel(turn);
+            } else {
+                // Moving only ever leaves the screen to deal with it.
+                self.files.press(moving);
+            }
+        } else if let Some(pane) = self.preview.as_mut().filter(|_| shows_more) {
+            pane.scroll.wheel(turn);
+        } else {
+            self.execute(moving);
         }
     }
 
@@ -3247,6 +3359,80 @@ mod tests {
         assert_eq!(at_end.chars().filter(|&c| c == '┃').count(), thumb);
     }
 
+    /// The row of the cursor in the View on screen.
+    fn cursor_row(app: &App) -> Option<usize> {
+        app.views[app.current].cursor.selected()
+    }
+
+    #[test]
+    fn wheel_scrolls_the_preview_while_it_shows() {
+        let (mut app, since) = app_previewing();
+        let body: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+        let long = add_polling_preview(Body::Markdown(body.join("\n")));
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(long));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let row = cursor_row(&app);
+        let by = |app: &App| app.preview.as_ref().expect("open").scroll.by;
+
+        app.wheel(Wheel::Down);
+        app.wheel(Wheel::Down);
+        assert_eq!(by(&app), 2 * WHEEL_LINES);
+        assert_eq!(cursor_row(&app), row, "the list stays");
+        app.wheel(Wheel::Up);
+        assert_eq!(by(&app), WHEEL_LINES);
+    }
+
+    #[test]
+    fn only_the_mouse_wheel_does_anything() {
+        let mut app = app();
+        app.fetched(fetched(notifications()));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let row = cursor_row(&app).expect("on the first");
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.mouse(mouse(MouseEventKind::Down(
+            crossterm::event::MouseButton::Left,
+        )));
+        app.mouse(mouse(MouseEventKind::ScrollRight));
+        assert_eq!(cursor_row(&app), Some(row));
+        app.mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(cursor_row(&app), Some(row + 1));
+        app.mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(cursor_row(&app), Some(row));
+    }
+
+    #[test]
+    fn wheel_moves_the_cursor_without_the_preview() {
+        let mut app = app();
+        app.fetched(fetched(notifications()));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let row = cursor_row(&app).expect("on the first");
+
+        app.wheel(Wheel::Down);
+        assert_eq!(cursor_row(&app), Some(row + 1));
+        app.wheel(Wheel::Up);
+        assert_eq!(cursor_row(&app), Some(row));
+
+        app.press(key_named("p"));
+        screen_of(&mut app, PREVIEW_MIN_HEIGHT - 1);
+        app.wheel(Wheel::Down);
+        assert_eq!(
+            cursor_row(&app),
+            Some(row + 1),
+            "the Preview doesn't show on a terminal this short"
+        );
+
+        app.press(key_named("?"));
+        app.wheel(Wheel::Down);
+        assert_eq!(cursor_row(&app), Some(row + 1), "nothing over the help");
+        assert!(app.help_shown);
+    }
+
     #[test]
     fn preview_that_fits_has_no_scrollbar() {
         let lines = previewing(add_polling_preview(Body::Markdown("Short".to_owned())));
@@ -4117,6 +4303,30 @@ mod tests {
         app.press(key_named("j"));
 
         assert_eq!(app.files.scrolled_by(), 0);
+    }
+
+    #[test]
+    fn wheel_scrolls_the_file_on_the_files_screen() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
+        let mut app = app_with_files(vec![
+            changed("long.txt", FileStatus::Added, Some(&patch)),
+            changed(
+                "short.txt",
+                FileStatus::Added,
+                Some("@@ -0,0 +1 @@\n+Short"),
+            ),
+        ]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        app.wheel(Wheel::Down);
+
+        assert_eq!(app.files.scrolled_by(), WHEEL_LINES);
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            lines.iter().any(|line| line.starts_with("┌ long.txt")),
+            "the same file: {lines:#?}"
+        );
     }
 
     #[test]

@@ -54,6 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let views = config.into_views();
 
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
+    if let Err(error) = ui::capture_mouse() {
+        ratatui::restore();
+        return Err(error).context("setting up the terminal's mouse");
+    }
     let outcome = ui::run(
         &mut terminal,
         &github,
@@ -64,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         assessor,
     )
     .await;
+    ui::release_mouse();
     ratatui::restore();
     outcome
 }

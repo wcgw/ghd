@@ -11,7 +11,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
-use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, counted};
+use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, Wheel, counted};
 use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
 use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText, LineChange};
@@ -103,6 +103,13 @@ impl Files {
             highlighting: RefCell::default(),
         });
         None
+    }
+
+    /// Scrolls the selected file by a turn of the mouse wheel.
+    pub(super) fn wheel(&mut self, turn: Wheel) {
+        if let Some(screen) = &mut self.screen {
+            screen.scroll.wheel(turn);
+        }
     }
 
     /// Carries out `command` on the screen, where only moving, scrolling, `w`, `o`, `r`, Esc or `f`, `?` and

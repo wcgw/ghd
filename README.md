@@ -108,6 +108,9 @@ either, different ones must all match. The details are in [the decision record](
 | `?` | show these keys |
 | `q` `Ctrl-C` | quit |
 
+The mouse wheel scrolls the Preview, or the file on the Files screen, while it shows, and otherwise moves through the
+list. As ghd takes the mouse's clicks too, most terminals select text with Shift held.
+
 ## License
 
 [Apache-2.0](LICENSE).
