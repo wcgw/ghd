@@ -11,9 +11,10 @@ a trip to the browser.
 - **Views**: tabs you define, each showing the notifications its filter matches, in GitHub's inbox filter syntax
   (`org:cel-rust`, `reason:review-requested`, `is:pr is:unread`, …). The built-in Inbox View shows them all.
 - **Preview**: `p` shows what the notification at the cursor is about: its number, title, state, author and labels,
-  then what its reason calls for: the comment that mentions you, the description of what you're asked to review or
-  assigned, or else the latest comment. Pull requests add their diffstat, commits, CI and reviews; discussions their
-  category and answer. Markdown is rendered and its code highlighted. Looking never marks anything read.
+  then the comment it's about, the latest by the time of the notification, or the description of what you're asked
+  to review or assigned. `J` and `K` scroll it, then step through the other comments, the ones that mention you
+  marked. Pull requests add their diffstat, commits, CI and reviews; discussions their category and answer. Markdown
+  is rendered and its code highlighted. Looking never marks anything read.
 - **Files**: `f` lists a pull request's changed files and shows each one's diff, highlighted.
 
   ![A pull request's changed file, as its diff](docs/screenshots/files.png)
@@ -98,7 +99,8 @@ either, different ones must all match. The details are in [the decision record](
 | `e` | mark Done; in the Done list, back to the Inbox |
 | `D` | show the Done list, or the Inbox again |
 | `u` | show unread only, or all again |
-| `p` `J` `K` `H` | show or hide the Preview; scroll it; voight's Heatmap |
+| `p` `H` | show or hide the Preview; voight's Heatmap |
+| `J` `K` | scroll the Preview, and step through its comments |
 | `f` `w` | a pull request's files; files whole, or their diffs |
 | `/` | search the View on screen |
 | `Esc` | clear the selection, or else the search |

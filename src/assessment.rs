@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::inbox::{Listing, ThreadId};
+use crate::preview::Place;
 
 /// The fewest words of prose worth assessing: on fewer, voight's estimate means little.
 #[cfg(feature = "voight")]
@@ -53,14 +54,21 @@ impl fmt::Display for Device {
     }
 }
 
-/// What an Assessment is of: the text a thread's Preview shows, or one of its Changed files, with the activity its
-/// Notification had.
+/// What an Assessment is of: one of a thread's texts, with the activity its Notification had.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     pub thread: ThreadId,
     pub as_of: DateTime<Utc>,
-    /// The Changed file's contents path; `None` for the Preview.
-    pub file: Option<String>,
+    pub part: Part,
+}
+
+/// Which of a thread's texts an Assessment is of.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Part {
+    /// What its Preview shows at a place: the Subject's body, or one of its comments.
+    Preview(Place),
+    /// One of its Changed files, by its contents path.
+    File(String),
 }
 
 /// voight at work on a thread of its own: it loads the model, then assesses the texts it's given, one at a time,
@@ -303,7 +311,7 @@ impl Assessments {
     /// Notes that the Assessment under `key` is under way, in place of any of the same text for older activity.
     pub fn assessing(&mut self, key: Key) {
         self.by_key.retain(|kept, assessed| {
-            kept.thread != key.thread || kept.file != key.file || *assessed == Assessed::Assessing
+            kept.thread != key.thread || kept.part != key.part || *assessed == Assessed::Assessing
         });
         self.by_key.insert(key, Assessed::Assessing);
     }
@@ -341,7 +349,7 @@ mod tests {
         Key {
             thread: ThreadId(thread),
             as_of: "2026-10-22T12:00:00Z".parse().expect("valid RFC 3339"),
-            file: None,
+            part: Part::Preview(Place::Body),
         }
     }
 
@@ -389,6 +397,28 @@ mod tests {
         };
 
         assert_eq!(assessments.get(&newer), None);
+    }
+
+    #[test]
+    fn each_text_keeps_its_assessment_until_newer_activity() {
+        let mut assessments = Assessments::default();
+        let comment = |at: usize| Key {
+            part: Part::Preview(Place::Comment(at)),
+            ..key(1)
+        };
+        assessments.assessed(key(1), Ok(None));
+        assessments.assessed(comment(0), Ok(None));
+
+        assessments.assessing(comment(1));
+        assert!(assessments.get(&key(1)).is_some(), "the body's");
+        assert!(assessments.get(&comment(0)).is_some(), "another comment's");
+
+        assessments.assessing(Key {
+            as_of: key(1).as_of + TimeDelta::minutes(5),
+            ..comment(0)
+        });
+        assert_eq!(assessments.get(&comment(0)), None, "for older activity");
+        assert!(assessments.get(&key(1)).is_some());
     }
 
     #[test]

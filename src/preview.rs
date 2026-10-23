@@ -8,7 +8,8 @@ use crate::fetched::Fetched;
 use crate::inbox::{Listing, Notification, ThreadId};
 use crate::state::SubjectState;
 
-/// What a Preview shows of a Subject: a header, then the one thing its Notification's Reason calls for.
+/// What a Preview shows of a Subject: a header, then its body or one of its comments, from the one its Notification's
+/// Reason calls for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
     /// How GitHub refers to the Subject: `#123` for a pull request, an issue or a Discussion, a release's tag, a
@@ -27,9 +28,55 @@ pub struct Preview {
     pub pull_request: Option<PullRequestSummary>,
     /// A Discussion's category and whether it's answered; `None` for any other Subject.
     pub discussion: Option<DiscussionSummary>,
-    pub shown: Shown,
+    /// The Subject's own text: a pull request's or an issue's description, a Discussion's, a release's notes, a
+    /// commit's message.
+    pub body: Body,
+    /// The comments on the Subject, oldest first, as far back as ghd looks; none without text.
+    pub comments: Vec<Comment>,
+    /// Where the Preview opens: on the comment its Notification is about, or on the body.
+    pub opens_on: Place,
     /// Something to know about what's shown, said above it.
     pub note: Option<Note>,
+}
+
+impl Preview {
+    /// What's at `place`; the body, for a comment this Preview doesn't have.
+    pub fn at(&self, place: Place) -> Shown<'_> {
+        match place {
+            Place::Comment(index) => self
+                .comments
+                .get(index)
+                .map_or(Shown::Body(&self.body), Shown::Comment),
+            Place::Body => Shown::Body(&self.body),
+        }
+    }
+
+    /// The place after `place`: the next comment, the first after the body; `None` after the last.
+    pub fn after(&self, place: Place) -> Option<Place> {
+        let next = match place {
+            Place::Body => 0,
+            Place::Comment(index) => index + 1,
+        };
+        (next < self.comments.len()).then_some(Place::Comment(next))
+    }
+}
+
+/// A place in a Preview: the Subject's body, or one of its comments, by its index in [`Preview::comments`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Place {
+    Body,
+    Comment(usize),
+}
+
+impl Place {
+    /// The place before this one: the previous comment, the body before the first; `None` before the body.
+    pub fn before(self) -> Option<Self> {
+        match self {
+            Self::Body => None,
+            Self::Comment(0) => Some(Self::Body),
+            Self::Comment(index) => Some(Self::Comment(index - 1)),
+        }
+    }
 }
 
 /// How a Subject came to be closed.
@@ -80,35 +127,32 @@ pub struct DiscussionSummary {
     pub answered: bool,
 }
 
-/// The one thing a Preview shows to read, under its header.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Shown {
-    /// A comment on the Subject.
-    Comment(Comment),
-    /// The Subject's own text: a pull request's or an issue's description, a release's notes, a commit's message.
-    Body(Body),
+/// What a Preview shows to read at a [`Place`], under its header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown<'p> {
+    Body(&'p Body),
+    Comment(&'p Comment),
 }
 
-/// A comment on a Subject.
+/// A comment on a Subject, or a pull request review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     /// The author's login; `None` when the account is gone.
     pub author: Option<String>,
-    pub created_at: DateTime<Utc>,
+    /// When it was published: for a review, when it was submitted.
+    pub published_at: DateTime<Utc>,
     /// The file a comment on a pull request's changes is about; `None` for any other comment.
     pub path: Option<String>,
     /// In Markdown.
     pub body: String,
-    /// Why it's the comment shown.
-    pub why: Why,
+    /// What the Preview says of it besides who wrote it; `None` for a comment like any other.
+    pub mark: Option<Mark>,
 }
 
-/// Why a Preview shows a comment.
+/// What a Preview says of a comment, besides who wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Why {
-    /// It's the latest.
-    Latest,
-    /// It's the latest to mention the user, or one of their teams.
+pub enum Mark {
+    /// It mentions the user, or one of their teams, in a Preview of a mention.
     MentionsYou,
     /// It's a Discussion's accepted answer.
     Answer,
@@ -117,9 +161,9 @@ pub enum Why {
 /// Something to know about what a Preview shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Note {
-    /// The Subject's own text is shown for mentioning the user.
+    /// The Subject's own text mentions the user: said above it.
     BodyMentionsYou,
-    /// Why ghd couldn't look for the comment mentioning the user, and shows the latest one instead.
+    /// Why ghd couldn't tell which comments mention the user: said above whatever's shown.
     MentionNotLookedFor(String),
 }
 
@@ -218,9 +262,46 @@ mod tests {
             closed: None,
             pull_request: None,
             discussion: None,
-            shown: Shown::Body(Body::Markdown("Hello".to_owned())),
+            body: Body::Markdown("Hello".to_owned()),
+            comments: Vec::new(),
+            opens_on: Place::Body,
             note: None,
         }
+    }
+
+    fn comment(body: &str) -> Comment {
+        Comment {
+            author: Some("hubot".to_owned()),
+            published_at: then(),
+            path: None,
+            body: body.to_owned(),
+            mark: None,
+        }
+    }
+
+    #[test]
+    fn places_go_from_the_body_through_the_comments() {
+        let commented = Preview {
+            comments: vec![comment("First"), comment("Second")],
+            ..preview()
+        };
+
+        assert_eq!(commented.after(Place::Body), Some(Place::Comment(0)));
+        assert_eq!(commented.after(Place::Comment(0)), Some(Place::Comment(1)));
+        assert_eq!(commented.after(Place::Comment(1)), None);
+        assert_eq!(Place::Comment(1).before(), Some(Place::Comment(0)));
+        assert_eq!(Place::Comment(0).before(), Some(Place::Body));
+        assert_eq!(Place::Body.before(), None);
+        assert_eq!(
+            commented.at(Place::Comment(1)),
+            Shown::Comment(&commented.comments[1])
+        );
+        assert_eq!(
+            commented.at(Place::Comment(2)),
+            Shown::Body(&commented.body),
+            "a comment it doesn't have"
+        );
+        assert_eq!(preview().after(Place::Body), None);
     }
 
     #[test]

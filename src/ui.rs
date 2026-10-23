@@ -30,7 +30,7 @@ use crate::heatmap;
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
 use crate::markdown;
 use crate::preview::{
-    Body, Ci, Note, Preview, Previews, PullRequestSummary, ReviewDecision, Shown, Why,
+    Body, Ci, Mark, Note, Place, Preview, Previews, PullRequestSummary, ReviewDecision, Shown,
 };
 use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
@@ -356,9 +356,11 @@ enum Command {
     ToggleUnreadOnly,
     /// Opens the Preview of the Notification at the cursor below the list, or closes it.
     TogglePreview,
-    /// Scrolls the Preview down by half its height; on the Files screen, the selected file.
+    /// Scrolls the Preview down by half its height, and once its end shows, steps to the next comment; on the Files
+    /// screen, scrolls the selected file.
     ScrollPreviewDown,
-    /// Scrolls the Preview up by half its height; on the Files screen, the selected file.
+    /// Scrolls the Preview up by half its height, and once its top shows, steps to the previous comment, or the body
+    /// before the first; on the Files screen, scrolls the selected file.
     ScrollPreviewUp,
     /// Shows the Changed files of the pull request at the cursor in place of the list, or closes them.
     OpenFiles,
@@ -371,7 +373,7 @@ enum Command {
 
 /// The help's lines for commands, in order, each with the commands its keys stand for. Adding a command means adding
 /// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
-const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
+const COMMAND_HELP: [(&[Command], KeyHelp); 18] = [
     (
         &[Command::Down, Command::Up],
         KeyHelp {
@@ -443,15 +445,17 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
         },
     ),
     (
-        &[
-            Command::TogglePreview,
-            Command::ScrollPreviewDown,
-            Command::ScrollPreviewUp,
-            Command::ToggleHeatmap,
-        ],
+        &[Command::TogglePreview, Command::ToggleHeatmap],
         KeyHelp {
-            keys: "p  J  K  H",
-            does: "show or hide the Preview; scroll it; voight's Heatmap",
+            keys: "p  H",
+            does: "show or hide the Preview; voight's Heatmap",
+        },
+    ),
+    (
+        &[Command::ScrollPreviewDown, Command::ScrollPreviewUp],
+        KeyHelp {
+            keys: "J  K",
+            does: "scroll the Preview, and step through its comments",
         },
     ),
     (
@@ -660,6 +664,9 @@ struct PreviewPane {
     /// The thread at the cursor, and since when: its Preview is fetched once the cursor has stayed on it for
     /// [`PREVIEW_REST`].
     at: Option<(ThreadId, Instant)>,
+    /// Where J and K stepped the Preview at the cursor to, and for its Notification's activity then; `None` while it's
+    /// where it opens.
+    stepped: Option<(DateTime<Utc>, Place)>,
     scroll: Scrolled,
 }
 
@@ -924,7 +931,8 @@ impl App {
     }
 
     /// Notes where the cursor is `now`, while the Preview is open. When it's moved to another Notification, the
-    /// Preview shows that one from its top, once fetched; one that failed to be fetched is tried again.
+    /// Preview shows that one where it opens, from its top, once fetched; one that failed to be fetched is tried
+    /// again.
     fn note_cursor(&mut self, now: Instant) {
         let thread = self.at_cursor().map(|n| n.thread);
         let Some(pane) = &mut self.preview else {
@@ -934,6 +942,7 @@ impl App {
             return;
         }
         pane.at = thread.map(|thread| (thread, now));
+        pane.stepped = None;
         pane.scroll.by = 0;
         if let Some(thread) = thread {
             self.previews.forget_failed(thread);
@@ -979,23 +988,59 @@ impl App {
             .fetched(fetched.thread, fetched.as_of, fetched.preview);
     }
 
-    /// The Preview on screen, fetched, with what it's of; `None` while it's closed, hidden by the Files screen, not
-    /// fetched yet, or has nothing to show.
-    fn preview_on_screen(&self) -> Option<(assessment::Key, &Preview)> {
+    /// The Preview on screen, fetched, and the place it's at, with what that's of; `None` while it's closed, hidden
+    /// by the Files screen, not fetched yet, or has nothing to show.
+    fn preview_on_screen(&self) -> Option<(assessment::Key, &Preview, Place)> {
         if self.files.is_open() {
             return None;
         }
-        self.preview.as_ref()?;
+        let pane = self.preview.as_ref()?;
         let notification = self.at_cursor()?;
         let fetched::Fetched::Done(preview) = self.previews.get(notification)? else {
             return None;
         };
+        let place = pane
+            .stepped
+            .filter(|(as_of, _)| *as_of == notification.updated_at)
+            .map_or(preview.opens_on, |(_, place)| place);
         let key = assessment::Key {
             thread: notification.thread,
             as_of: notification.updated_at,
-            file: None,
+            part: assessment::Part::Preview(place),
         };
-        Some((key, preview))
+        Some((key, preview, place))
+    }
+
+    /// Scrolls the Preview down by half its height; once its end shows, steps to the next comment, from its top.
+    fn preview_down(&mut self) {
+        let next = self
+            .preview_on_screen()
+            .and_then(|(key, preview, place)| Some((key.as_of, preview.after(place)?)));
+        let Some(pane) = &mut self.preview else {
+            return;
+        };
+        if pane.scroll.by < pane.scroll.furthest() {
+            pane.scroll.half_down();
+        } else if let Some(next) = next {
+            pane.stepped = Some(next);
+            pane.scroll.by = 0;
+        }
+    }
+
+    /// Scrolls the Preview up by half its height; once its top shows, steps to the previous comment, or the body
+    /// before the first, from its top.
+    fn preview_up(&mut self) {
+        let previous = self
+            .preview_on_screen()
+            .and_then(|(key, _, place)| Some((key.as_of, place.before()?)));
+        let Some(pane) = &mut self.preview else {
+            return;
+        };
+        if pane.scroll.by > 0 {
+            pane.scroll.half_up();
+        } else if let Some(previous) = previous {
+            pane.stepped = Some(previous);
+        }
     }
 
     /// What's on screen for voight to assess: on the Files screen, the selected file, if it's Markdown shown whole;
@@ -1004,8 +1049,8 @@ impl App {
         if self.files.is_open() {
             return self.files.assessable();
         }
-        let (key, preview) = self.preview_on_screen()?;
-        let (text, markdown) = match &preview.shown {
+        let (key, preview, place) = self.preview_on_screen()?;
+        let (text, markdown) = match preview.at(place) {
             Shown::Comment(comment) => (comment.body.as_str(), true),
             Shown::Body(Body::Markdown(body)) => (body.as_str(), true),
             Shown::Body(Body::Plain(body)) => (body.as_str(), false),
@@ -1240,9 +1285,10 @@ impl App {
             Command::Quit => Some(Outcome::Quit),
             Command::Refresh => {
                 // The Preview on screen too: what it shows can change without notifying, like labels.
-                if self.preview.is_some()
-                    && let Some(thread) = self.at_cursor().map(|n| n.thread)
+                if let Some(thread) = self.at_cursor().map(|n| n.thread)
+                    && let Some(pane) = &mut self.preview
                 {
+                    pane.stepped = None;
                     self.previews.forget(thread);
                     if let Some(assessments) = &mut self.assessments {
                         assessments.forget(thread);
@@ -1381,16 +1427,8 @@ impl App {
             Command::OpenFiles => self.open_files(),
             // Only on the Files screen, which `press` hands its keys to.
             Command::ToggleWholeFiles => {}
-            Command::ScrollPreviewDown => {
-                if let Some(pane) = &mut self.preview {
-                    pane.scroll.half_down();
-                }
-            }
-            Command::ScrollPreviewUp => {
-                if let Some(pane) = &mut self.preview {
-                    pane.scroll.half_up();
-                }
-            }
+            Command::ScrollPreviewDown => self.preview_down(),
+            Command::ScrollPreviewUp => self.preview_up(),
             Command::Open => return self.open(),
             Command::MarkRead => {
                 let targets = self.take_targets();
@@ -1734,9 +1772,22 @@ impl App {
         // Inside the border.
         let width = area.width.saturating_sub(2);
         let text = Paragraph::new(self.preview_lines(Utc::now(), width)).wrap(Wrap { trim: false });
+        let comments = self
+            .preview_on_screen()
+            .filter(|(_, preview, _)| !preview.comments.is_empty())
+            .map(|(_, preview, place)| {
+                let count = preview.comments.len() as u64;
+                match place {
+                    Place::Body => format!("· {} ", counted(count, "comment")),
+                    Place::Comment(index) => format!("· comment {} of {count} ", index + 1),
+                }
+            });
         let mut block = Block::bordered()
             .border_style(theme.border)
-            .title(Line::styled(" Preview ", theme.tab));
+            .title(Line::from(vec![
+                Span::styled(" Preview ", theme.tab),
+                Span::styled(comments.unwrap_or_default(), theme.age),
+            ]));
         if let Some(label) = self.assessment_label() {
             block = block.title_bottom(Line::from(label).right_aligned());
         }
@@ -1761,8 +1812,12 @@ impl App {
                 theme.message,
             ),
             (Some(_), Some(fetched::Fetched::Done(preview))) => {
+                let place = self
+                    .preview_on_screen()
+                    .map_or(preview.opens_on, |(_, _, place)| place);
                 return preview_lines(
                     preview,
+                    place,
                     &notification.repository,
                     theme,
                     now,
@@ -1875,10 +1930,11 @@ impl App {
     }
 }
 
-/// The lines of `preview`, of a Subject in `repository`, as of `now`, `width` cells wide: its header, then the
-/// latest comment or the Subject's body, as the Heatmap of `heat`, the windows of its Assessment, if there are any.
+/// The lines of `preview`, of a Subject in `repository`, as of `now`, `width` cells wide: its header, then what it
+/// shows at `place`, as the Heatmap of `heat`, the windows of its Assessment, if there are any.
 fn preview_lines(
     preview: &Preview,
+    place: Place,
     repository: &str,
     theme: &Theme,
     now: DateTime<Utc>,
@@ -1939,8 +1995,9 @@ fn preview_lines(
         lines.push(pull_request_line(summary, theme));
     }
     lines.push(Line::default());
+    let shown = preview.at(place);
     match &preview.note {
-        Some(Note::BodyMentionsYou) => lines.push(Line::styled(
+        Some(Note::BodyMentionsYou) if matches!(shown, Shown::Body(_)) => lines.push(Line::styled(
             format!(
                 "{} mentioned you in the description",
                 who(preview.author.as_ref())
@@ -1954,14 +2011,14 @@ fn preview_lines(
             ));
             lines.push(Line::default());
         }
-        None => {}
+        Some(Note::BodyMentionsYou) | None => {}
     }
-    match &preview.shown {
+    match shown {
         Shown::Comment(comment) => {
-            let did = match comment.why {
-                Why::Latest => "commented",
-                Why::MentionsYou => "mentioned you",
-                Why::Answer => "answered",
+            let did = match comment.mark {
+                None => "commented",
+                Some(Mark::MentionsYou) => "mentioned you",
+                Some(Mark::Answer) => "answered",
             };
             let on = comment
                 .path
@@ -1972,7 +2029,7 @@ fn preview_lines(
                 format!(
                     "{} {did}{on} {}",
                     who(comment.author.as_ref()),
-                    ago(comment.created_at)
+                    ago(comment.published_at)
                 ),
                 theme.age,
             ));
@@ -2738,8 +2795,8 @@ mod tests {
         (app, since)
     }
 
-    /// The Preview of "Add polling", showing `shown`.
-    fn add_polling_preview(shown: Shown) -> Preview {
+    /// The Preview of "Add polling", with `body` and no comments.
+    fn add_polling_preview(body: Body) -> Preview {
         Preview {
             reference: "#1".to_owned(),
             title: "Add polling".to_owned(),
@@ -2749,8 +2806,30 @@ mod tests {
             closed: None,
             pull_request: None,
             discussion: None,
-            shown,
+            body,
+            comments: Vec::new(),
+            opens_on: Place::Body,
             note: None,
+        }
+    }
+
+    /// A comment by @hubot, `ago`, saying `body`.
+    fn comment_by_hubot(body: &str, ago: TimeDelta) -> crate::preview::Comment {
+        crate::preview::Comment {
+            author: Some("hubot".to_owned()),
+            published_at: Utc::now() - ago,
+            path: None,
+            body: body.to_owned(),
+            mark: None,
+        }
+    }
+
+    /// The Preview of "Add polling", with no description, opening on `comment`.
+    fn add_polling_comment(comment: crate::preview::Comment) -> Preview {
+        Preview {
+            comments: vec![comment],
+            opens_on: Place::Comment(0),
+            ..add_polling_preview(Body::Markdown(String::new()))
         }
     }
 
@@ -2785,7 +2864,7 @@ mod tests {
             "{lines:#?}"
         );
 
-        let body = Shown::Body(Body::Markdown("Polls the Inbox.".to_owned()));
+        let body = Body::Markdown("Polls the Inbox.".to_owned());
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
@@ -2841,7 +2920,7 @@ mod tests {
     #[test]
     fn newer_activity_fetches_the_preview_again() {
         let (mut app, since) = app_previewing();
-        let body = Shown::Body(Body::Markdown(String::new()));
+        let body = Body::Markdown(String::new());
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
@@ -2882,7 +2961,7 @@ mod tests {
     #[test]
     fn r_fetches_the_preview_on_screen_again() {
         let (mut app, since) = app_previewing();
-        let body = Shown::Body(Body::Markdown(String::new()));
+        let body = Body::Markdown(String::new());
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
@@ -2898,7 +2977,7 @@ mod tests {
     fn shift_j_and_k_scroll_the_preview_half_its_height() {
         let (mut app, since) = app_previewing();
         let body: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
-        let shown = Shown::Body(Body::Markdown(body.join("\n")));
+        let shown = Body::Markdown(body.join("\n"));
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
@@ -2937,20 +3016,169 @@ mod tests {
         assert_eq!(pane(&app).0, 0, "the next Notification's from its top");
     }
 
+    /// The Preview of "Add polling" with its description and two long comments, opening on the first.
+    fn add_polling_discussed() -> Preview {
+        let long = |first: &str| {
+            let lines: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+            format!("{first}\n\n{}", lines.join("\n\n"))
+        };
+        Preview {
+            comments: vec![
+                comment_by_hubot(&long("First"), TimeDelta::hours(2)),
+                comment_by_hubot(&long("Second"), TimeDelta::hours(1)),
+            ],
+            opens_on: Place::Comment(0),
+            ..add_polling_preview(Body::Markdown("The description".to_owned()))
+        }
+    }
+
+    #[test]
+    fn shift_j_and_k_step_through_the_comments_once_scrolled_to_their_end() {
+        let (mut app, since) = app_previewing();
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(add_polling_discussed()));
+        // The Preview's title, how far down it's scrolled, and the screen, as drawn.
+        let look = |app: &mut App| {
+            let lines = screen_of(app, PREVIEW_SCREEN_HEIGHT);
+            let title = lines
+                .iter()
+                .find(|line| line.contains(" Preview "))
+                .expect("open")
+                .clone();
+            (title, app.preview.as_ref().expect("open").scroll.by, lines)
+        };
+        // Drawn after each key, as the app does.
+        let press = |app: &mut App, key: &str| {
+            app.press(key_named(key));
+            look(app)
+        };
+        let (title, _, _) = look(&mut app);
+        assert!(title.contains(" Preview · comment 1 of 2 "), "{title}");
+
+        let (title, by, _) = press(&mut app, "J");
+        assert!(by > 0 && title.contains("comment 1 of 2"), "scrolls first");
+        let (title, by, lines) = (0..20)
+            .map(|_| press(&mut app, "J"))
+            .find(|(title, _, _)| title.contains("comment 2 of 2"))
+            .expect("steps to the next comment");
+        assert!(title.contains(" Preview · comment 2 of 2 "));
+        assert_eq!(by, 0, "from its top");
+        assert!(shows(&lines, "Second"), "{lines:#?}");
+        for _ in 0..20 {
+            press(&mut app, "J");
+        }
+        let (title, by, _) = press(&mut app, "J");
+        assert!(
+            title.contains("comment 2 of 2") && by > 0,
+            "the last, scrolled to its end"
+        );
+
+        let (title, by, _) = press(&mut app, "K");
+        assert!(
+            title.contains("comment 2 of 2") && by > 0,
+            "scrolls back up first"
+        );
+        let (_, by, lines) = (0..20)
+            .map(|_| press(&mut app, "K"))
+            .find(|(title, _, _)| title.contains("comment 1 of 2"))
+            .expect("steps to the previous comment");
+        assert_eq!(by, 0, "from its top");
+        assert!(shows(&lines, "First"), "{lines:#?}");
+        let (title, _, lines) = press(&mut app, "K");
+        assert!(title.contains(" Preview · 2 comments "), "{title}");
+        assert!(shows(&lines, "The description"), "{lines:#?}");
+        let (_, _, lines) = press(&mut app, "K");
+        assert!(shows(&lines, "The description"), "the first place");
+
+        app.execute(Command::Down);
+        app.note_cursor(since);
+        app.execute(Command::Up);
+        app.note_cursor(since);
+        let (title, _, _) = look(&mut app);
+        assert!(title.contains("comment 1 of 2"), "back where it opens");
+    }
+
+    #[test]
+    fn newer_activity_opens_the_preview_where_it_opens() {
+        let (mut app, since) = app_previewing();
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(add_polling_discussed()));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("K"));
+
+        let mut newer = previewable(notifications());
+        newer[0].updated_at += TimeDelta::minutes(5);
+        app.fetched(fetched(newer));
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(add_polling_discussed()));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(" Preview · comment 1 of 2 ")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn r_takes_the_preview_back_where_it_opens() {
+        let (mut app, since) = app_previewing();
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(add_polling_discussed()));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("K"));
+        assert!(app.preview.as_ref().expect("open").stepped.is_some());
+
+        app.press(key_named("r"));
+
+        assert_eq!(app.preview.as_ref().expect("open").stepped, None);
+    }
+
+    #[test]
+    fn description_mentioning_you_says_so_on_it() {
+        let (mut app, since) = app_previewing();
+        let preview = Preview {
+            note: Some(Note::BodyMentionsYou),
+            ..add_polling_discussed()
+        };
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(preview));
+        let said = "@octocat mentioned you in the description";
+        assert!(!shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), said));
+
+        app.press(key_named("K"));
+
+        assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), said));
+    }
+
+    #[test]
+    fn voight_assesses_the_comment_on_screen() {
+        let (mut app, since) = app_previewing();
+        app.assessments = Some(Assessments::default());
+        fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(add_polling_discussed()));
+        app.voight_said(assessment::Event::Loaded { fallback: None });
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let (key, _) = app.assessment_to_start().expect("ready");
+        assert_eq!(key.part, assessment::Part::Preview(Place::Comment(0)));
+        app.voight_said(assessment::Event::Assessed {
+            key,
+            assessment: Ok(None),
+        });
+
+        app.press(key_named("K"));
+        let (key, text) = app.assessment_to_start().expect("another text");
+
+        assert_eq!(key.part, assessment::Part::Preview(Place::Body));
+        assert_eq!(text, "The description");
+    }
+
     #[test]
     fn comment_shows_who_wrote_it_and_where() {
         let (mut app, since) = app_previewing();
-        let comment = Shown::Comment(crate::preview::Comment {
-            author: Some("hubot".to_owned()),
-            created_at: Utc::now() - TimeDelta::hours(2),
+        let comment = crate::preview::Comment {
             path: Some("src/ui.rs".to_owned()),
-            body: "Typo here".to_owned(),
-            why: Why::Latest,
-        });
+            ..comment_by_hubot("Typo here", TimeDelta::hours(2))
+        };
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
-            Ok(add_polling_preview(comment)),
+            Ok(add_polling_comment(comment)),
         );
 
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
@@ -2971,7 +3199,7 @@ mod tests {
 
     #[test]
     fn pull_request_preview_shows_its_changes_and_checks() {
-        let body = Shown::Body(Body::Markdown("What it does".to_owned()));
+        let body = Body::Markdown("What it does".to_owned());
         let lines = previewing(Preview {
             state: Some(SubjectState::Merged),
             closed: Some(crate::preview::Closed {
@@ -3009,7 +3237,7 @@ mod tests {
                 at: Utc::now() - TimeDelta::days(3),
                 merged: false,
             }),
-            ..add_polling_preview(Shown::Body(Body::Markdown("Body".to_owned())))
+            ..add_polling_preview(Body::Markdown("Body".to_owned()))
         });
 
         assert!(shows(&lines, "Closed as not planned 3d ago"), "{lines:#?}");
@@ -3017,19 +3245,16 @@ mod tests {
 
     #[test]
     fn mentions_say_where_you_were_mentioned() {
-        let mentioned = Shown::Comment(crate::preview::Comment {
-            author: Some("hubot".to_owned()),
-            created_at: Utc::now() - TimeDelta::hours(2),
-            path: None,
-            body: "@alxs look".to_owned(),
-            why: Why::MentionsYou,
-        });
-        let lines = previewing(add_polling_preview(mentioned));
+        let mentioned = crate::preview::Comment {
+            mark: Some(Mark::MentionsYou),
+            ..comment_by_hubot("@alxs look", TimeDelta::hours(2))
+        };
+        let lines = previewing(add_polling_comment(mentioned));
         assert!(shows(&lines, "@hubot mentioned you 2h ago"), "{lines:#?}");
 
         let lines = previewing(Preview {
             note: Some(Note::BodyMentionsYou),
-            ..add_polling_preview(Shown::Body(Body::Markdown("cc @alxs".to_owned())))
+            ..add_polling_preview(Body::Markdown("cc @alxs".to_owned()))
         });
         assert!(
             shows(&lines, "@octocat mentioned you in the description"),
@@ -3038,7 +3263,7 @@ mod tests {
 
         let lines = previewing(Preview {
             note: Some(Note::MentionNotLookedFor("rate limited".to_owned())),
-            ..add_polling_preview(Shown::Body(Body::Markdown(String::new())))
+            ..add_polling_preview(Body::Markdown(String::new()))
         });
         assert!(
             shows(&lines, "Couldn't look for the mention: rate limited"),
@@ -3048,20 +3273,18 @@ mod tests {
 
     #[test]
     fn discussion_preview_shows_its_category_and_answer() {
-        let answer = Shown::Comment(crate::preview::Comment {
+        let answer = crate::preview::Comment {
             author: Some("alxs".to_owned()),
-            created_at: Utc::now() - TimeDelta::days(3),
-            path: None,
-            body: "Like so".to_owned(),
-            why: Why::Answer,
-        });
+            mark: Some(Mark::Answer),
+            ..comment_by_hubot("Like so", TimeDelta::days(3))
+        };
         let lines = previewing(Preview {
             state: None,
             discussion: Some(crate::preview::DiscussionSummary {
                 category: "Q&A".to_owned(),
                 answered: true,
             }),
-            ..add_polling_preview(answer)
+            ..add_polling_comment(answer)
         });
 
         assert!(
@@ -3076,7 +3299,7 @@ mod tests {
     fn app_assessing(body: &str) -> App {
         let (mut app, since) = app_previewing();
         app.assessments = Some(Assessments::default());
-        let shown = Shown::Body(Body::Markdown(body.to_owned()));
+        let shown = Body::Markdown(body.to_owned());
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
@@ -3205,23 +3428,13 @@ mod tests {
 
     #[test]
     fn heatmap_shades_comments_and_plain_bodies() {
-        let comment = Shown::Comment(crate::preview::Comment {
-            author: Some("hubot".to_owned()),
-            created_at: Utc::now(),
-            path: None,
-            body: "Polls the Inbox.".to_owned(),
-            why: Why::Latest,
-        });
-        let plain = Shown::Body(Body::Plain("Polls the Inbox.".to_owned()));
-        for shown in [comment, plain] {
+        let comment = add_polling_comment(comment_by_hubot("Polls the Inbox.", TimeDelta::zero()));
+        let plain = add_polling_preview(Body::Plain("Polls the Inbox.".to_owned()));
+        for preview in [comment, plain] {
             let (mut app, since) = app_previewing();
             app.theme = heatmap_theme();
             app.assessments = Some(Assessments::default());
-            fetch_preview_at(
-                &mut app,
-                since + PREVIEW_REST,
-                Ok(add_polling_preview(shown)),
-            );
+            fetch_preview_at(&mut app, since + PREVIEW_REST, Ok(preview));
             app.voight_said(assessment::Event::Loaded { fallback: None });
             let (key, text) = app.assessment_to_start().expect("ready");
             app.voight_said(assessment::Event::Assessed {
@@ -3357,7 +3570,7 @@ mod tests {
         });
 
         app.press(key_named("r"));
-        let shown = Shown::Body(Body::Markdown("Edited".to_owned()));
+        let shown = Body::Markdown("Edited".to_owned());
         fetch_preview_at(
             &mut app,
             Instant::now() + PREVIEW_REST,
@@ -3371,7 +3584,7 @@ mod tests {
     #[test]
     fn voight_off_assesses_nothing() {
         let (mut app, since) = app_previewing();
-        let shown = Shown::Body(Body::Markdown("Polls the Inbox.".to_owned()));
+        let shown = Body::Markdown("Polls the Inbox.".to_owned());
         fetch_preview_at(
             &mut app,
             since + PREVIEW_REST,
@@ -3924,8 +4137,8 @@ mod tests {
 
         let (key, text) = app.assessment_to_start().expect("a new Markdown file");
         assert_eq!(
-            key.file.as_deref(),
-            Some("/repos/wcgw/ghd/contents/docs/guide.md?ref=abc")
+            key.part,
+            assessment::Part::File("/repos/wcgw/ghd/contents/docs/guide.md?ref=abc".to_owned())
         );
         assert_eq!(text, "# Guide\n\nRead me.\n");
         app.voight_said(assessment::Event::Assessed {

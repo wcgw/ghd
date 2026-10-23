@@ -315,7 +315,7 @@ impl Files {
             key: assessment::Key {
                 thread: screen.notification.thread,
                 as_of: screen.notification.updated_at,
-                file: Some(file.contents_path.clone()),
+                part: assessment::Part::File(file.contents_path.clone()),
             },
             text,
             markdown: true,

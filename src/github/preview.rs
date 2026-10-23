@@ -1,7 +1,6 @@
-//! Previews of Subjects: from the REST API, and from GraphQL what REST can't give in one go (the comments to look
-//! through for a mention, a pull request's checks and review decision, and Discussions).
+//! Previews of Subjects: from the REST API, and from GraphQL what REST can't give in one go (the comments and reviews,
+//! a pull request's checks and review decision, and Discussions).
 
-use std::cmp::Reverse;
 use std::sync::MutexGuard;
 
 use anyhow::{anyhow, bail};
@@ -15,18 +14,18 @@ use super::{Account, GitHub, below_repos, issue_state, pull_request_state};
 use crate::inbox::{Notification, Reason};
 use crate::markdown;
 use crate::preview::{
-    Body, Ci, Closed, Comment, DiscussionSummary, Note, Preview, PullRequestSummary,
-    ReviewDecision, Shown, Why,
+    Body, Ci, Closed, Comment, DiscussionSummary, Mark, Note, Place, Preview, PullRequestSummary,
+    ReviewDecision,
 };
 
-/// What GraphQL adds to a pull request's or an issue's Preview: `$mention` asks for the comments to look through
-/// for a mention.
-const EXTRAS_QUERY: &str = "query($url: URI!, $mention: Boolean!) { resource(url: $url) { \
+/// What GraphQL adds to a pull request's or an issue's Preview: its latest comments and reviews, and a pull
+/// request's checks and review decision.
+const EXTRAS_QUERY: &str = "query($url: URI!) { resource(url: $url) { \
      ... on PullRequest { statusCheckRollup { state } reviewDecision \
-       comments(last: 30) @include(if: $mention) { nodes { ...Said } } \
-       reviews(last: 10) @include(if: $mention) { nodes { ...Said comments(last: 10) { nodes { ...Said path } } } } } \
-     ... on Issue { comments(last: 30) @include(if: $mention) { nodes { ...Said } } } } } \
-     fragment Said on Comment { author { login } body createdAt }";
+       comments(last: 30) { nodes { ...Said } } \
+       reviews(last: 10) { nodes { ...Said comments(last: 10) { nodes { ...Said path } } } } } \
+     ... on Issue { comments(last: 30) { nodes { ...Said } } } } } \
+     fragment Said on Comment { author { login } body createdAt publishedAt }";
 
 /// A Discussion's Preview, all from GraphQL: the REST API has no Discussions.
 const DISCUSSION_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
@@ -34,7 +33,7 @@ const DISCUSSION_QUERY: &str = "query($owner: String!, $name: String!, $number: 
        number title body author { login } category { name } labels(first: 20) { nodes { name } } \
        closed closedAt isAnswered answer { ...Said } \
        comments(last: 30) { nodes { ...Said replies(last: 5) { nodes { ...Said } } } } } } } \
-     fragment Said on Comment { author { login } body createdAt }";
+     fragment Said on Comment { author { login } body createdAt publishedAt }";
 
 /// What to fetch for a Notification's Preview, and what to show of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +46,8 @@ pub struct PreviewRequest {
     /// The latest comment's path in the REST API, if GitHub points to a comment.
     comment_path: Option<String>,
     wanted: Wanted,
+    /// When the Subject had the activity its Notification is about.
+    activity_at: DateTime<Utc>,
 }
 
 /// The kinds of Subject ghd previews.
@@ -63,15 +64,17 @@ enum PreviewSubject {
     },
 }
 
-/// What a Preview shows under its header, by the Notification's Reason.
+/// Where a Preview opens, and what it marks, by the Notification's Reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wanted {
     /// The Subject's description: what a review request or an assignment is about.
     Description,
-    /// The latest comment to mention the user, or one of their teams (`team`); or the description, if it does.
+    /// The comment the Notification is about, as for [`Activity`](Self::Activity), marking the comments that mention
+    /// the user, or one of their teams (`team`).
     Mention { team: bool },
-    /// The latest comment, or else the Subject's body.
-    LatestComment,
+    /// The comment the Notification is about: the latest published by the time of its activity; or else the
+    /// Subject's body.
+    Activity,
 }
 
 impl Wanted {
@@ -81,7 +84,7 @@ impl Wanted {
             Reason::Mention => Self::Mention { team: false },
             Reason::TeamMention => Self::Mention { team: true },
             // Reasons GitHub adds later too.
-            _ => Self::LatestComment,
+            _ => Self::Activity,
         }
     }
 }
@@ -122,6 +125,7 @@ impl PreviewRequest {
             page: notification.subject_url.clone(),
             comment_path,
             wanted: Wanted::for_reason(&notification.reason),
+            activity_at: notification.updated_at,
         })
     }
 }
@@ -151,9 +155,9 @@ impl GitHub {
     ///
     /// # Errors
     ///
-    /// Fails if GitHub can't be reached, or doesn't give the Subject or the latest comment. What GraphQL adds to a
-    /// pull request or an issue is left out if it fails, a mention noting why; a Discussion, all from GraphQL,
-    /// fails with it.
+    /// Fails if GitHub can't be reached, or doesn't give the Subject. What GraphQL adds to a pull request or an issue
+    /// is left out if it fails, the latest comment standing in for its comments, and a mention noting why; then the
+    /// Preview fails if GitHub doesn't give that comment. A Discussion, all from GraphQL, fails with it.
     ///
     /// # Cancel Safety
     ///
@@ -165,48 +169,49 @@ impl GitHub {
             number,
         } = &request.subject
         {
-            return self
-                .discussion_preview(owner, name, *number, request.wanted)
-                .await;
+            return self.discussion_preview(owner, name, *number, request).await;
         }
-        let latest = OptionFuture::from(
-            request
-                .comment_path
-                .as_deref()
-                .filter(|_| request.wanted != Wanted::Description)
-                .map(|path| self.get::<ApiComment>(path)),
-        );
-        let (subject, latest, extras, handles) = tokio::join!(
+        let (subject, extras, handles) = tokio::join!(
             self.preview_subject(request),
-            latest,
             self.extras(request),
             OptionFuture::from(self.handles_for(request.wanted)),
         );
         let mut preview = subject?;
-        let latest = latest.transpose()?.map(ApiComment::into_comment);
-        let extras = extras.map(|extras| extras.map_err(|error| format!("{error:#}")));
-        if let (Some(summary), Some(Ok(extras))) = (&mut preview.pull_request, &extras) {
-            summary.ci = extras.ci;
-            summary.review = extras.review;
-        }
-        match (request.wanted, handles) {
-            (Wanted::Mention { .. }, Some(handles)) => {
-                let comments = extras
-                    .unwrap_or_else(|| Ok(Extras::default()))
-                    .map(|extras| extras.comments);
-                show_mention(&mut preview, handles, comments, latest);
-            }
-            (Wanted::LatestComment | Wanted::Mention { .. }, _) => {
-                if let Some(latest) = latest {
-                    preview.shown = Shown::Comment(latest);
+        let (comments, unfetched) = match extras {
+            Some(Ok(extras)) => {
+                if let Some(summary) = &mut preview.pull_request {
+                    summary.ci = extras.ci;
+                    summary.review = extras.review;
                 }
+                (extras.comments, None)
             }
-            (Wanted::Description, _) => {}
-        }
+            // The latest comment stands in for the comments GraphQL didn't give, or has none of: a commit's.
+            unfetched => {
+                let latest = OptionFuture::from(
+                    request
+                        .comment_path
+                        .as_deref()
+                        .map(|path| self.get::<ApiComment>(path)),
+                )
+                .await
+                .transpose()?;
+                let why = unfetched
+                    .and_then(Result::err)
+                    .map(|error| format!("{error:#}"));
+                (
+                    latest.map(ApiComment::into_comment).into_iter().collect(),
+                    why,
+                )
+            }
+        };
+        // Without the comments, which mention the user isn't known either.
+        let handles =
+            handles.map(|handles| handles.and_then(|handles| unfetched.map_or(Ok(handles), Err)));
+        arrange(&mut preview, comments, request, handles);
         Ok(preview)
     }
 
-    /// The Preview of `request`'s Subject, from the REST API alone, showing its body.
+    /// The Preview of `request`'s Subject, from the REST API alone, with no comments.
     async fn preview_subject(&self, request: &PreviewRequest) -> anyhow::Result<Preview> {
         let path = request.subject_path.as_str();
         let labels = |labels: Vec<ApiLabel>| labels.into_iter().map(|label| label.name).collect();
@@ -219,7 +224,9 @@ impl GitHub {
             closed: None,
             pull_request: None,
             discussion: None,
-            shown: Shown::Body(body),
+            body,
+            comments: Vec::new(),
+            opens_on: Place::Body,
             note: None,
         };
         Ok(match &request.subject {
@@ -315,20 +322,14 @@ impl GitHub {
         })
     }
 
-    /// What GraphQL adds to `request`'s Preview; `None` when it needs nothing from it: an issue not about a
-    /// mention, a release, a commit.
+    /// What GraphQL adds to `request`'s Preview; `None` for a Subject it has nothing for: a release, a commit.
     async fn extras(&self, request: &PreviewRequest) -> Option<anyhow::Result<Extras>> {
-        let mention = matches!(request.wanted, Wanted::Mention { .. });
         match request.subject {
-            PreviewSubject::PullRequest => {}
-            PreviewSubject::Issue if mention => {}
+            PreviewSubject::PullRequest | PreviewSubject::Issue => {}
             _ => return None,
         }
         let looked_up = self
-            .graphql::<ResourceData>(
-                EXTRAS_QUERY,
-                json!({ "url": request.page, "mention": mention }),
-            )
+            .graphql::<ResourceData>(EXTRAS_QUERY, json!({ "url": request.page }))
             .await
             .and_then(|data| {
                 data.resource.ok_or_else(|| {
@@ -370,21 +371,20 @@ impl GitHub {
         }))
     }
 
-    /// The Preview of Discussion `number` in `owner/name`, showing what `wanted` calls for: the accepted answer, if
-    /// there's one, rather than the latest comment.
+    /// The Preview of Discussion `number` in `owner/name`, for `request`, its accepted answer marked.
     async fn discussion_preview(
         &self,
         owner: &str,
         name: &str,
         number: u64,
-        wanted: Wanted,
+        request: &PreviewRequest,
     ) -> anyhow::Result<Preview> {
         let (data, handles) = tokio::join!(
             self.graphql::<RepositoryData>(
                 DISCUSSION_QUERY,
                 json!({ "owner": owner, "name": name, "number": number }),
             ),
-            OptionFuture::from(self.handles_for(wanted)),
+            OptionFuture::from(self.handles_for(request.wanted)),
         );
         let Some(discussion) = data?
             .repository
@@ -392,19 +392,22 @@ impl GitHub {
         else {
             bail!("GitHub has no Discussion #{number} in {owner}/{name}");
         };
-        let comments: Vec<Comment> = discussion
+        let mut comments: Vec<Comment> = discussion
             .comments
             .into_iter()
             .flat_map(|comment| std::iter::once(comment.said).chain(comment.replies))
             .map(Said::into_comment)
             .collect();
-        let latest = discussion
-            .answer
-            .map(|answer| Comment {
-                why: Why::Answer,
-                ..answer.into_comment()
-            })
-            .or_else(|| comments.iter().max_by_key(|c| c.created_at).cloned());
+        if let Some(answer) = discussion.answer.map(Said::into_comment) {
+            match comments.iter_mut().find(|comment| **comment == answer) {
+                Some(comment) => comment.mark = Some(Mark::Answer),
+                // Older than the comments looked at.
+                None => comments.push(Comment {
+                    mark: Some(Mark::Answer),
+                    ..answer
+                }),
+            }
+        }
         let mut preview = Preview {
             reference: format!("#{}", discussion.number),
             title: discussion.title,
@@ -429,19 +432,12 @@ impl GitHub {
                 category: discussion.category.name,
                 answered: discussion.is_answered.unwrap_or(false),
             }),
-            shown: Shown::Body(Body::Markdown(discussion.body)),
+            body: Body::Markdown(discussion.body),
+            comments: Vec::new(),
+            opens_on: Place::Body,
             note: None,
         };
-        match (wanted, handles) {
-            (Wanted::Mention { .. }, Some(handles)) => {
-                show_mention(&mut preview, handles, Ok(comments), latest);
-            }
-            _ => {
-                if let Some(latest) = latest {
-                    preview.shown = Shown::Comment(latest);
-                }
-            }
-        }
+        arrange(&mut preview, comments, request, handles);
         Ok(preview)
     }
 
@@ -452,7 +448,7 @@ impl GitHub {
     ) -> Option<impl Future<Output = Result<Vec<String>, String>> + '_> {
         match wanted {
             Wanted::Mention { team } => Some(self.handles(team)),
-            Wanted::Description | Wanted::LatestComment => None,
+            Wanted::Description | Wanted::Activity => None,
         }
     }
 
@@ -520,42 +516,46 @@ impl GitHub {
     }
 }
 
-/// Puts in `preview`, which shows its body, what a mention calls for: the latest of `comments` to mention one of
-/// `handles`, else the body if it mentions one; and otherwise `latest`, noting why if the mention couldn't be
-/// looked for.
-fn show_mention(
+/// Puts `comments` in `preview`, oldest first and none without text, and opens it where `request` calls for: on its
+/// body, or on the latest comment published by the time of the Notification's activity. For a mention, marks the
+/// comments that mention one of `handles`, and notes whether the body does; or why they're not known.
+fn arrange(
     preview: &mut Preview,
-    handles: Result<Vec<String>, String>,
-    comments: Result<Vec<Comment>, String>,
-    latest: Option<Comment>,
+    mut comments: Vec<Comment>,
+    request: &PreviewRequest,
+    handles: Option<Result<Vec<String>, String>>,
 ) {
-    match handles.and_then(|handles| comments.map(|comments| (handles, comments))) {
-        Ok((handles, mut comments)) => {
+    comments.retain(|comment| !comment.body.trim().is_empty());
+    comments.sort_by_key(|comment| comment.published_at);
+    match handles {
+        Some(Ok(handles)) => {
             let mentions = |text: &str| {
                 handles
                     .iter()
                     .any(|handle| markdown::mentions(text, handle))
             };
-            comments.sort_by_key(|comment| Reverse(comment.created_at));
-            if let Some(comment) = comments.into_iter().find(|comment| mentions(&comment.body)) {
-                preview.shown = Shown::Comment(Comment {
-                    why: Why::MentionsYou,
-                    ..comment
-                });
-                return;
+            for comment in &mut comments {
+                if mentions(&comment.body) {
+                    comment.mark = Some(Mark::MentionsYou);
+                }
             }
-            if let Shown::Body(Body::Markdown(body) | Body::Plain(body)) = &preview.shown
+            if let Body::Markdown(body) | Body::Plain(body) = &preview.body
                 && mentions(body)
             {
                 preview.note = Some(Note::BodyMentionsYou);
-                return;
             }
         }
-        Err(why) => preview.note = Some(Note::MentionNotLookedFor(why)),
+        Some(Err(why)) => preview.note = Some(Note::MentionNotLookedFor(why)),
+        None => {}
     }
-    if let Some(latest) = latest {
-        preview.shown = Shown::Comment(latest);
-    }
+    preview.opens_on = match request.wanted {
+        Wanted::Description => Place::Body,
+        Wanted::Mention { .. } | Wanted::Activity => comments
+            .iter()
+            .rposition(|comment| comment.published_at <= request.activity_at)
+            .map_or(Place::Body, Place::Comment),
+    };
+    preview.comments = comments;
 }
 
 /// What GraphQL adds to a pull request's or an issue's Preview.
@@ -563,7 +563,7 @@ fn show_mention(
 struct Extras {
     ci: Option<Ci>,
     review: Option<ReviewDecision>,
-    /// The comments to look through for a mention, in no particular order; empty unless asked for.
+    /// The comments and reviews, in no particular order.
     comments: Vec<Comment>,
 }
 
@@ -664,14 +664,13 @@ struct ApiComment {
 }
 
 impl ApiComment {
-    /// The comment, as the latest.
     fn into_comment(self) -> Comment {
         Comment {
             author: self.user.map(|user| user.login),
-            created_at: self.created_at,
+            published_at: self.created_at,
             path: self.path,
             body: self.body.unwrap_or_default(),
-            why: Why::Latest,
+            mark: None,
         }
     }
 }
@@ -732,19 +731,22 @@ struct Said {
     author: Option<ApiUser>,
     body: String,
     created_at: DateTime<Utc>,
+    /// When it was published: a review is created when it's begun, but notifies when it's submitted. `None` while
+    /// it's pending.
+    published_at: Option<DateTime<Utc>>,
     /// The file, for a comment on a pull request's changes.
     path: Option<String>,
 }
 
 impl Said {
-    /// What was said, as a comment, as the latest.
+    /// What was said, as a comment.
     fn into_comment(self) -> Comment {
         Comment {
             author: self.author.map(|author| author.login),
-            created_at: self.created_at,
+            published_at: self.published_at.unwrap_or(self.created_at),
             path: self.path,
             body: self.body,
-            why: Why::Latest,
+            mark: None,
         }
     }
 }
@@ -792,6 +794,7 @@ mod tests {
     use super::super::tests::github_for;
     use super::*;
     use crate::inbox::{ApiPaths, SubjectKind, ThreadId};
+    use crate::preview::Shown;
     use crate::state::SubjectState;
 
     /// A Notification for `reason` whose Subject and latest comment the REST API has at `subject` and
@@ -872,7 +875,23 @@ mod tests {
             "body": body,
             "created_at": at,
             "createdAt": at,
+            "publishedAt": at,
         })
+    }
+
+    /// Answers GraphQL's query for issue 7's extras with `comments`, once.
+    async fn serve_comments(server: &MockServer, comments: Value) {
+        serve_graphql(
+            server,
+            json!({ "url": "https://github.com/wcgw/ghd/issues/7" }),
+            json!({ "resource": { "comments": { "nodes": comments } } }),
+        )
+        .await;
+    }
+
+    /// What `preview` opens on.
+    fn opening(preview: &Preview) -> Shown<'_> {
+        preview.at(preview.opens_on)
     }
 
     #[test]
@@ -919,16 +938,16 @@ mod tests {
             (Reason::Assign, Wanted::Description),
             (Reason::Mention, Wanted::Mention { team: false }),
             (Reason::TeamMention, Wanted::Mention { team: true }),
-            (Reason::Comment, Wanted::LatestComment),
-            (Reason::StateChange, Wanted::LatestComment),
-            (Reason::Other("brand_new".to_owned()), Wanted::LatestComment),
+            (Reason::Comment, Wanted::Activity),
+            (Reason::StateChange, Wanted::Activity),
+            (Reason::Other("brand_new".to_owned()), Wanted::Activity),
         ] {
             assert_eq!(Wanted::for_reason(&reason), wanted, "{reason}");
         }
     }
 
     #[tokio::test]
-    async fn preview_shows_the_latest_comment_under_the_subject() {
+    async fn preview_opens_on_the_comment_its_notification_is_about() {
         let server = MockServer::start().await;
         serve(
             &server,
@@ -946,13 +965,25 @@ mod tests {
             }),
         )
         .await;
-        serve(
+        serve_comments(
             &server,
-            "/repos/wcgw/ghd/issues/comments/70",
-            said("hubot", "Closing, sorry", "2026-10-22T11:00:00Z"),
+            json!([
+                said("hubot", "Closing, sorry", "2026-10-22T12:00:00Z"),
+                said("alxs", "Since the notification", "2026-10-22T12:00:01Z"),
+                said("octocat", "Earlier", "2026-10-22T09:00:00Z"),
+                said("octocat", " ", "2026-10-22T09:30:00Z"),
+            ]),
         )
         .await;
+        let comment = |author: &str, body: &str, at| Comment {
+            author: Some(author.to_owned()),
+            published_at: time(at),
+            path: None,
+            body: body.to_owned(),
+            mark: None,
+        };
 
+        // The latest comment isn't served: GraphQL gives the comments.
         let preview = github_for(&server)
             .await
             .preview(&preview_request(
@@ -978,15 +1009,60 @@ mod tests {
                 }),
                 pull_request: None,
                 discussion: None,
-                shown: Shown::Comment(Comment {
-                    author: Some("hubot".to_owned()),
-                    created_at: time("2026-10-22T11:00:00Z"),
-                    path: None,
-                    body: "Closing, sorry".to_owned(),
-                    why: Why::Latest,
-                }),
+                body: Body::Markdown("The description".to_owned()),
+                comments: vec![
+                    comment("octocat", "Earlier", "2026-10-22T09:00:00Z"),
+                    // At the very time of the Notification's activity.
+                    comment("hubot", "Closing, sorry", "2026-10-22T12:00:00Z"),
+                    comment("alxs", "Since the notification", "2026-10-22T12:00:01Z"),
+                ],
+                opens_on: Place::Comment(1),
                 note: None,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn review_counts_from_when_it_was_submitted() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/pulls/8",
+            json!({ "number": 8, "title": "T", "state": "open", "body": "" }),
+        )
+        .await;
+        serve_graphql(
+            &server,
+            json!({ "url": "https://github.com/wcgw/ghd/issues/7" }),
+            json!({ "resource": {
+                "comments": { "nodes": [said("octocat", "Meanwhile", "2026-10-22T11:00:00Z")] },
+                "reviews": { "nodes": [{
+                    "author": { "login": "hubot" },
+                    "body": "Looks good",
+                    "createdAt": "2026-10-22T10:00:00Z",
+                    "publishedAt": "2026-10-22T11:30:00Z",
+                    "comments": { "nodes": [] },
+                }] },
+            } }),
+        )
+        .await;
+
+        let preview = github_for(&server)
+            .await
+            .preview(&preview_request(
+                "/repos/wcgw/ghd/pulls/8",
+                None,
+                Reason::Subscribed,
+            ))
+            .await
+            .expect("served");
+
+        let Shown::Comment(review) = opening(&preview) else {
+            panic!("opens on a comment: {preview:?}");
+        };
+        assert_eq!(
+            (review.body.as_str(), review.published_at),
+            ("Looks good", time("2026-10-22T11:30:00Z"))
         );
     }
 
@@ -1023,7 +1099,10 @@ mod tests {
         assert_eq!(preview.state, Some(SubjectState::Draft));
         assert_eq!(preview.author, None, "a deleted account");
         assert_eq!(preview.closed, None);
-        assert_eq!(preview.shown, Shown::Body(Body::Markdown(String::new())));
+        assert_eq!(
+            (&preview.body, preview.comments.as_slice(), preview.opens_on),
+            (&Body::Markdown(String::new()), [].as_slice(), Place::Body)
+        );
     }
 
     #[tokio::test]
@@ -1046,10 +1125,11 @@ mod tests {
         .await;
         serve_graphql(
             &server,
-            json!({ "url": "https://github.com/wcgw/ghd/issues/7", "mention": false }),
+            json!({ "url": "https://github.com/wcgw/ghd/issues/7" }),
             json!({ "resource": {
                 "statusCheckRollup": { "state": "FAILURE" },
                 "reviewDecision": "CHANGES_REQUESTED",
+                "comments": { "nodes": [said("hubot", "Rebased", "2026-10-22T11:00:00Z")] },
             } }),
         )
         .await;
@@ -1066,9 +1146,10 @@ mod tests {
             .expect("served");
 
         assert_eq!(
-            preview.shown,
-            Shown::Body(Body::Markdown("What it does".to_owned()))
+            opening(&preview),
+            Shown::Body(&Body::Markdown("What it does".to_owned()))
         );
+        assert_eq!(preview.comments.len(), 1, "to step through");
         assert_eq!(
             preview.pull_request,
             Some(PullRequestSummary {
@@ -1123,24 +1204,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mention_shows_the_latest_comment_mentioning_you() {
+    async fn mention_marks_the_comments_mentioning_you() {
         let server = MockServer::start().await;
         serve(&server, "/user", json!({ "login": "alxs" })).await;
         serve(&server, "/repos/wcgw/ghd/issues/7", api_issue(7, "Body")).await;
-        serve(
+        serve_comments(
             &server,
-            "/repos/wcgw/ghd/issues/comments/72",
-            said("hubot", "Merging soon", "2026-10-22T11:30:00Z"),
-        )
-        .await;
-        serve_graphql(
-            &server,
-            json!({ "mention": true }),
-            json!({ "resource": { "comments": { "nodes": [
-                said("octocat", "@alxs what do you think?", "2026-10-22T10:00:00Z"),
+            json!([
+                said(
+                    "octocat",
+                    "@alxs what do you think?",
+                    "2026-10-22T10:00:00Z"
+                ),
                 said("hubot", "@alxs-bot ran the tests", "2026-10-22T11:00:00Z"),
                 null,
-            ] } } }),
+                said("hubot", "Merging soon", "2026-10-22T11:30:00Z"),
+            ]),
         )
         .await;
 
@@ -1154,15 +1233,12 @@ mod tests {
             .await
             .expect("served");
 
+        let marks: Vec<Option<Mark>> = preview.comments.iter().map(|c| c.mark).collect();
+        assert_eq!(marks, [Some(Mark::MentionsYou), None, None]);
         assert_eq!(
-            preview.shown,
-            Shown::Comment(Comment {
-                author: Some("octocat".to_owned()),
-                created_at: time("2026-10-22T10:00:00Z"),
-                path: None,
-                body: "@alxs what do you think?".to_owned(),
-                why: Why::MentionsYou,
-            })
+            preview.opens_on,
+            Place::Comment(2),
+            "what the Notification is about, newer than the mention"
         );
         assert_eq!(preview.note, None);
     }
@@ -1184,7 +1260,7 @@ mod tests {
         .await;
         serve_graphql(
             &server,
-            json!({ "mention": true }),
+            json!({ "url": "https://github.com/wcgw/ghd/issues/7" }),
             json!({ "resource": {
                 "comments": { "nodes": [said("octocat", "@alxs early", "2026-10-22T09:00:00Z")] },
                 "reviews": { "nodes": [{
@@ -1211,18 +1287,22 @@ mod tests {
             .await
             .expect("served, without looking up who the user is");
 
-        let Shown::Comment(comment) = preview.shown else {
-            panic!("shows a comment, not {:?}", preview.shown);
+        assert_eq!(
+            preview.comments.len(),
+            2,
+            "not the review, which says nothing"
+        );
+        let Shown::Comment(comment) = opening(&preview) else {
+            panic!("opens on a comment: {preview:?}");
         };
         assert_eq!(
-            (comment.path.as_deref(), comment.why),
-            (Some("src/ui.rs"), Why::MentionsYou),
-            "the newest mention"
+            (comment.path.as_deref(), comment.mark),
+            (Some("src/ui.rs"), Some(Mark::MentionsYou)),
         );
     }
 
     #[tokio::test]
-    async fn mention_in_the_description_shows_it() {
+    async fn mention_in_the_description_is_noted() {
         let server = MockServer::start().await;
         serve(&server, "/user", json!({ "login": "alxs" })).await;
         serve(
@@ -1231,12 +1311,9 @@ mod tests {
             api_issue(7, "cc @alxs"),
         )
         .await;
-        serve_graphql(
+        serve_comments(
             &server,
-            json!({ "mention": true }),
-            json!({ "resource": { "comments": { "nodes": [
-                said("hubot", "Not you", "2026-10-22T10:00:00Z"),
-            ] } } }),
+            json!([said("hubot", "Not you", "2026-10-22T10:00:00Z")]),
         )
         .await;
 
@@ -1250,28 +1327,22 @@ mod tests {
             .await
             .expect("served");
 
-        assert_eq!(
-            preview.shown,
-            Shown::Body(Body::Markdown("cc @alxs".to_owned()))
-        );
         assert_eq!(preview.note, Some(Note::BodyMentionsYou));
+        assert_eq!(
+            preview.opens_on,
+            Place::Comment(0),
+            "newer than the mention"
+        );
     }
 
     #[tokio::test]
-    async fn mention_not_found_shows_the_latest_comment() {
+    async fn preview_without_a_comment_by_its_activity_opens_on_the_body() {
         let server = MockServer::start().await;
         serve(&server, "/user", json!({ "login": "alxs" })).await;
         serve(&server, "/repos/wcgw/ghd/issues/7", api_issue(7, "Body")).await;
-        serve(
+        serve_comments(
             &server,
-            "/repos/wcgw/ghd/issues/comments/72",
-            said("hubot", "Latest", "2026-10-22T11:30:00Z"),
-        )
-        .await;
-        serve_graphql(
-            &server,
-            json!({ "mention": true }),
-            json!({ "resource": { "comments": { "nodes": [] } } }),
+            json!([said("alxs", "My own, since", "2026-10-22T12:30:00Z")]),
         )
         .await;
 
@@ -1285,13 +1356,8 @@ mod tests {
             .await
             .expect("served");
 
-        let Shown::Comment(comment) = preview.shown else {
-            panic!("shows a comment, not {:?}", preview.shown);
-        };
-        assert_eq!(
-            (comment.body.as_str(), comment.why),
-            ("Latest", Why::Latest)
-        );
+        assert_eq!(preview.opens_on, Place::Body);
+        assert_eq!(preview.comments.len(), 1);
         assert_eq!(preview.note, None);
     }
 
@@ -1305,12 +1371,13 @@ mod tests {
         )
         .await;
         serve(&server, "/repos/wcgw/ghd/issues/7", api_issue(7, "Body")).await;
-        serve_graphql(
+        serve_comments(
             &server,
-            json!({ "mention": true }),
-            json!({ "resource": { "comments": { "nodes": [
-                said("octocat", "@wcgw/maintainers please look", "2026-10-22T10:00:00Z"),
-            ] } } }),
+            json!([said(
+                "octocat",
+                "@wcgw/maintainers please look",
+                "2026-10-22T10:00:00Z"
+            )]),
         )
         .await;
 
@@ -1325,9 +1392,8 @@ mod tests {
             .expect("served");
 
         assert!(
-            matches!(&preview.shown, Shown::Comment(c) if c.why == Why::MentionsYou),
-            "{:?}",
-            preview.shown
+            matches!(opening(&preview), Shown::Comment(c) if c.mark == Some(Mark::MentionsYou)),
+            "{preview:?}"
         );
     }
 
@@ -1368,9 +1434,8 @@ mod tests {
 
         for preview in [first, second] {
             assert!(
-                matches!(&preview.shown, Shown::Comment(c) if c.why == Why::Latest),
-                "{:?}",
-                preview.shown
+                matches!(opening(&preview), Shown::Comment(c) if c.body == "Latest" && c.mark.is_none()),
+                "the latest comment, standing in for GraphQL's: {preview:?}"
             );
             let Some(Note::MentionNotLookedFor(why)) = preview.note else {
                 panic!("says why: {:?}", preview.note);
@@ -1409,9 +1474,8 @@ mod tests {
             .expect("the Subject and its latest comment are enough");
 
         assert!(
-            matches!(&preview.shown, Shown::Comment(c) if c.why == Why::Latest),
-            "{:?}",
-            preview.shown
+            matches!(opening(&preview), Shown::Comment(c) if c.body == "Latest"),
+            "{preview:?}"
         );
         let Some(Note::MentionNotLookedFor(why)) = preview.note else {
             panic!("says why: {:?}", preview.note);
@@ -1420,13 +1484,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discussion_shows_its_accepted_answer() {
+    async fn discussion_marks_its_accepted_answer() {
         let server = MockServer::start().await;
-        serve_graphql(
-            &server,
-            json!({ "owner": "wcgw", "name": "ghd", "number": 12 }),
+        let discussion = |number: u64, comments: Value| {
             json!({ "repository": { "discussion": {
-                "number": 12,
+                "number": number,
                 "title": "How do I theme it?",
                 "body": "Question",
                 "author": { "login": "octocat" },
@@ -1436,44 +1498,61 @@ mod tests {
                 "closedAt": null,
                 "isAnswered": true,
                 "answer": said("alxs", "Like so", "2026-10-20T10:00:00Z"),
-                "comments": { "nodes": [{
-                    "author": { "login": "hubot" },
-                    "body": "Thanks!",
-                    "createdAt": "2026-10-21T10:00:00Z",
-                    "replies": { "nodes": [] },
-                }] },
-            } } }),
+                "comments": { "nodes": comments },
+            } } })
+        };
+        let thanks = json!({
+            "author": { "login": "hubot" },
+            "body": "Thanks!",
+            "createdAt": "2026-10-21T10:00:00Z",
+            "replies": { "nodes": [] },
+        });
+        let mut answer = said("alxs", "Like so", "2026-10-20T10:00:00Z");
+        answer["replies"] = json!({ "nodes": [] });
+        serve_graphql(
+            &server,
+            json!({ "owner": "wcgw", "name": "ghd", "number": 12 }),
+            discussion(12, json!([answer, thanks])),
         )
         .await;
-
-        let preview = github_for(&server)
-            .await
-            .preview(&preview_request(
-                "/repos/wcgw/ghd/discussions/12",
+        serve_graphql(
+            &server,
+            json!({ "number": 13 }),
+            discussion(13, json!([thanks])),
+        )
+        .await;
+        let github = github_for(&server).await;
+        let preview = |number| {
+            preview_request(
+                &format!("/repos/wcgw/ghd/discussions/{number}"),
                 None,
                 Reason::Subscribed,
-            ))
-            .await
-            .expect("served");
+            )
+        };
+
+        let answered = github.preview(&preview(12)).await.expect("served");
+        let older = github.preview(&preview(13)).await.expect("served");
 
         assert_eq!(
-            (preview.reference.as_str(), preview.labels.as_slice()),
+            (answered.reference.as_str(), answered.labels.as_slice()),
             ("#12", ["themes".to_owned()].as_slice())
         );
         assert_eq!(
-            preview.discussion,
+            answered.discussion,
             Some(DiscussionSummary {
                 category: "Q&A".to_owned(),
                 answered: true,
             })
         );
-        let Shown::Comment(comment) = preview.shown else {
-            panic!("shows a comment, not {:?}", preview.shown);
-        };
-        assert_eq!(
-            (comment.body.as_str(), comment.why),
-            ("Like so", Why::Answer)
-        );
+        for preview in [answered, older] {
+            let said: Vec<(&str, Option<Mark>)> = preview
+                .comments
+                .iter()
+                .map(|c| (c.body.as_str(), c.mark))
+                .collect();
+            assert_eq!(said, [("Like so", Some(Mark::Answer)), ("Thanks!", None)]);
+            assert_eq!(preview.opens_on, Place::Comment(1), "the latest");
+        }
     }
 
     #[tokio::test]
@@ -1516,11 +1595,10 @@ mod tests {
             .await
             .expect("served");
 
-        assert!(preview.closed.is_some_and(|closed| !closed.merged));
+        assert!(preview.closed.as_ref().is_some_and(|closed| !closed.merged));
         assert!(
-            matches!(&preview.shown, Shown::Comment(c) if c.why == Why::MentionsYou && c.body == "@alxs thoughts?"),
-            "{:?}",
-            preview.shown
+            matches!(opening(&preview), Shown::Comment(c) if c.mark == Some(Mark::MentionsYou) && c.body == "@alxs thoughts?"),
+            "{preview:?}"
         );
     }
 
@@ -1574,6 +1652,12 @@ mod tests {
             }),
         )
         .await;
+        serve(
+            &server,
+            "/repos/wcgw/ghd/comments/72",
+            said("hubot", "On the commit", "2026-10-22T11:00:00Z"),
+        )
+        .await;
         let github = github_for(&server).await;
 
         let release = github
@@ -1587,7 +1671,7 @@ mod tests {
         let commit = github
             .preview(&preview_request(
                 "/repos/wcgw/ghd/commits/0123456789abcdef",
-                None,
+                Some("/repos/wcgw/ghd/comments/72"),
                 Reason::Subscribed,
             ))
             .await
@@ -1598,16 +1682,20 @@ mod tests {
             ("v0.1.0", "First")
         );
         assert_eq!(
-            release.shown,
-            Shown::Body(Body::Markdown("## Notes".to_owned()))
+            opening(&release),
+            Shown::Body(&Body::Markdown("## Notes".to_owned()))
         );
         assert_eq!(
             (commit.reference.as_str(), commit.title.as_str()),
             ("0123456", "Fix the thing")
         );
         assert_eq!(
-            commit.shown,
-            Shown::Body(Body::Plain("Fix the thing\n\nIt was broken.".to_owned()))
+            commit.body,
+            Body::Plain("Fix the thing\n\nIt was broken.".to_owned())
+        );
+        assert!(
+            matches!(opening(&commit), Shown::Comment(c) if c.body == "On the commit"),
+            "its latest comment: {commit:?}"
         );
     }
 
