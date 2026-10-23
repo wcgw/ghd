@@ -1619,9 +1619,18 @@ impl App {
             let heat = self.heat().to_vec();
             let theme = self.theme;
             if tall_enough {
+                // Less than its quarter if that lists every file, the file below taking the rest. A message in their
+                // place keeps it: there's no file to give the rest to.
+                let list_height = self
+                    .files
+                    .lines_listing_all()
+                    .map_or(list_area.height, |all| all.min(list_area.height));
+                let [list_area, file_area] =
+                    Layout::vertical([Constraint::Length(list_height), Constraint::Fill(1)])
+                        .areas(view_area);
                 self.files.render_list(frame, list_area, &theme);
                 self.files
-                    .render_selected(frame, read_area, &theme, label, &heat);
+                    .render_selected(frame, file_area, &theme, label, &heat);
             } else {
                 self.files.render_list(frame, view_area, &theme);
             }
@@ -3630,6 +3639,47 @@ mod tests {
             .position(|line| line.starts_with("┌ docs/guide.md"))
             .expect("the file's pane");
         assert_eq!(file_pane, 5, "{lines:#?}");
+    }
+
+    #[test]
+    fn the_file_takes_what_the_list_needs_not_of_its_quarter() {
+        let mut app = app_with_files(changed_files());
+
+        // A line for the status, 40 for the screen: a quarter of them is 10, and 6 list the 4 files.
+        let lines = screen_of(&mut app, 41);
+
+        let file_pane = lines
+            .iter()
+            .position(|line| line.starts_with("┌ docs/guide.md"))
+            .expect("the file's pane");
+        assert_eq!(file_pane, 6, "{lines:#?}");
+        assert!(shows(&lines, "src/new.rs"), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_pull_request_without_files_says_so() {
+        let mut app = app_with_files(Vec::new());
+
+        let lines = screen_of(&mut app, 21);
+
+        assert!(shows(&lines, "│No files."), "{lines:#?}");
+    }
+
+    #[test]
+    fn the_list_keeps_its_quarter_while_it_shows_no_files() {
+        let mut app = app_with_a_pull_request();
+        app.press(key_named("f"));
+
+        let lines = screen_of(&mut app, 21);
+
+        assert!(shows(&lines, "Fetching files…"), "{lines:#?}");
+        let panes: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with('┌'))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(panes, [0, 5], "{lines:#?}");
     }
 
     #[test]

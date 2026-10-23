@@ -196,6 +196,27 @@ impl Files {
         list.get(screen.cursor.selected()?)
     }
 
+    /// The lines the list takes to show every Changed file, its border included; `None` while it shows a message in
+    /// their place: the screen closed, the files not fetched yet, or none.
+    pub(super) fn lines_listing_all(&self) -> Option<u16> {
+        let screen = self.screen.as_ref()?;
+        let Fetched::Done(list) = self
+            .fetched
+            .list(screen.notification.thread, screen.notification.updated_at)?
+        else {
+            return None;
+        };
+        if list.is_empty() {
+            return None;
+        }
+        // And a line above and below for the border.
+        Some(
+            u16::try_from(list.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(2),
+        )
+    }
+
     /// Whether `file` shows whole rather than as its diff: a new one, or one `w` asked for, but never a removed one.
     fn shows_whole(&self, file: &ChangedFile) -> bool {
         match file.status {
