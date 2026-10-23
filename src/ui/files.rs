@@ -39,8 +39,8 @@ struct Screen {
     cursor: TableState,
     /// How many rows the list had room for at the last draw.
     rows: u16,
-    /// The files shown whole rather than as their diff, by path.
-    whole: HashSet<String>,
+    /// How the files that can show either way show; a new one always shows whole, and a removed one as its diff.
+    showing: Showing,
     /// The selected file's pane.
     scroll: Scrolled,
     /// Each file's highlighting so far, whole or as its diff, by its contents path; `None` for one in a language ghd
@@ -98,7 +98,7 @@ impl Files {
             request,
             cursor: TableState::new().with_selected(Some(0)),
             rows: 0,
-            whole: HashSet::new(),
+            showing: Showing::Diff,
             scroll: Scrolled::default(),
             highlighting: RefCell::default(),
         });
@@ -108,10 +108,6 @@ impl Files {
     /// Carries out `command` on the screen, where only moving, scrolling, `w`, `o`, `r`, Esc or `f`, `?` and
     /// quitting do anything: the rest act on Notifications. Returns what's left for the app around it to do.
     pub(super) fn press(&mut self, command: Command) -> Pressed {
-        let togglable = self
-            .selected()
-            .filter(|file| !matches!(file.status, FileStatus::Added | FileStatus::Removed))
-            .map(|file| file.path.clone());
         let Some(screen) = &mut self.screen else {
             return Pressed::Nothing;
         };
@@ -129,12 +125,11 @@ impl Files {
                 screen.scroll.half_up();
                 return Pressed::Nothing;
             }
-            Command::ToggleWholeFile => {
-                if let Some(path) = togglable
-                    && !screen.whole.remove(&path)
-                {
-                    screen.whole.insert(path);
-                }
+            Command::ToggleWholeFiles => {
+                screen.showing = match screen.showing {
+                    Showing::Whole => Showing::Diff,
+                    Showing::Diff => Showing::Whole,
+                };
             }
             Command::Refresh => {
                 let thread = screen.notification.thread;
@@ -217,7 +212,8 @@ impl Files {
         )
     }
 
-    /// Whether `file` shows whole rather than as its diff: a new one, or one `w` asked for, but never a removed one.
+    /// Whether `file` shows whole rather than as its diff: a new one, or any but a removed one once `w` asks for files
+    /// whole.
     fn shows_whole(&self, file: &ChangedFile) -> bool {
         match file.status {
             FileStatus::Added => true,
@@ -225,7 +221,7 @@ impl Files {
             FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => self
                 .screen
                 .as_ref()
-                .is_some_and(|screen| screen.whole.contains(&file.path)),
+                .is_some_and(|screen| screen.showing == Showing::Whole),
         }
     }
 
@@ -362,7 +358,7 @@ impl Files {
             .border_style(theme.border)
             .title(Line::from(title))
             .title_bottom(
-                Line::styled(" Esc back · w whole file or diff · ? keys ", theme.hint)
+                Line::styled(" Esc back · w whole files or diffs · ? keys ", theme.hint)
                     .right_aligned(),
             );
         let list = match fetched {

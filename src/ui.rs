@@ -362,8 +362,8 @@ enum Command {
     ScrollPreviewUp,
     /// Shows the Changed files of the pull request at the cursor in place of the list, or closes them.
     OpenFiles,
-    /// On the Files screen, shows the selected file whole rather than its diff, or its diff again.
-    ToggleWholeFile,
+    /// On the Files screen, shows the files whole rather than as their diffs, or as their diffs again.
+    ToggleWholeFiles,
     /// Shows the Heatmap of the text voight assessed, on the Preview or the Files screen, or stops.
     ToggleHeatmap,
     Help,
@@ -455,10 +455,10 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
         },
     ),
     (
-        &[Command::OpenFiles, Command::ToggleWholeFile],
+        &[Command::OpenFiles, Command::ToggleWholeFiles],
         KeyHelp {
             keys: "f  w",
-            does: "a pull request's files; a file whole, or its diff",
+            does: "a pull request's files; files whole, or their diffs",
         },
     ),
     (
@@ -552,7 +552,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('J') => Some(Command::ScrollPreviewDown),
         KeyCode::Char('K') => Some(Command::ScrollPreviewUp),
         KeyCode::Char('f') => Some(Command::OpenFiles),
-        KeyCode::Char('w') => Some(Command::ToggleWholeFile),
+        KeyCode::Char('w') => Some(Command::ToggleWholeFiles),
         KeyCode::Char('H') => Some(Command::ToggleHeatmap),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
@@ -1380,7 +1380,7 @@ impl App {
             Command::TogglePreview => self.preview = Some(PreviewPane::default()),
             Command::OpenFiles => self.open_files(),
             // Only on the Files screen, which `press` hands its keys to.
-            Command::ToggleWholeFile => {}
+            Command::ToggleWholeFiles => {}
             Command::ScrollPreviewDown => {
                 if let Some(pane) = &mut self.preview {
                     pane.scroll.half_down();
@@ -2545,7 +2545,7 @@ mod tests {
         assert_eq!(press(KeyCode::Char('f'), none), Some(Command::OpenFiles));
         assert_eq!(
             press(KeyCode::Char('w'), none),
-            Some(Command::ToggleWholeFile)
+            Some(Command::ToggleWholeFiles)
         );
         assert_eq!(
             press(KeyCode::Char('J'), KeyModifiers::SHIFT),
@@ -3505,6 +3505,36 @@ mod tests {
         assert!(!shows(&lines, "-old"), "{lines:#?}");
 
         app.press(key_named("w"));
+        assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
+    }
+
+    #[test]
+    fn w_shows_every_file_whole_until_pressed_again() {
+        let mut app = app_with_files(changed_files());
+        // On the new file, which shows whole all the same.
+        app.press(key_named("w"));
+
+        app.press(key_named("j"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        assert_eq!(
+            wanted.contents_path,
+            "/repos/wcgw/ghd/contents/src/ui.rs?ref=abc"
+        );
+        app.press(key_named("j"));
+        assert!(
+            app.files.text_to_fetch().is_none(),
+            "a removed file isn't shown whole all the same"
+        );
+        app.press(key_named("j"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        assert_eq!(
+            wanted.contents_path,
+            "/repos/wcgw/ghd/contents/src/new.rs?ref=abc"
+        );
+
+        app.press(key_named("w"));
+        app.press(key_named("k"));
+        app.press(key_named("k"));
         assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
     }
 
