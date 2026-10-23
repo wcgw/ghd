@@ -47,7 +47,8 @@ const QUIT_GRACE: Duration = Duration::from_secs(10);
 /// fetches nothing.
 const PREVIEW_REST: Duration = Duration::from_millis(200);
 
-/// The fewest lines the screen needs for the Preview pane: a few rows of the list, and of the Preview.
+/// The fewest lines the screen needs for the Preview pane: the list's row at the cursor, and a few lines of the
+/// Preview.
 const PREVIEW_MIN_HEIGHT: u16 = 12;
 
 /// Runs the UI on `terminal` until the user quits, showing `views` as tabs in that order, in `theme`, naming Subject
@@ -361,8 +362,8 @@ enum Command {
     ScrollPreviewUp,
     /// Shows the Changed files of the pull request at the cursor in place of the list, or closes them.
     OpenFiles,
-    /// On the Files screen, shows the selected file whole rather than its diff, or its diff again.
-    ToggleWholeFile,
+    /// On the Files screen, shows the files whole rather than as their diffs, or as their diffs again.
+    ToggleWholeFiles,
     /// Shows the Heatmap of the text voight assessed, on the Preview or the Files screen, or stops.
     ToggleHeatmap,
     Help,
@@ -454,10 +455,10 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
         },
     ),
     (
-        &[Command::OpenFiles, Command::ToggleWholeFile],
+        &[Command::OpenFiles, Command::ToggleWholeFiles],
         KeyHelp {
             keys: "f  w",
-            does: "a pull request's files; a file whole, or its diff",
+            does: "a pull request's files; files whole, or their diffs",
         },
     ),
     (
@@ -551,7 +552,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('J') => Some(Command::ScrollPreviewDown),
         KeyCode::Char('K') => Some(Command::ScrollPreviewUp),
         KeyCode::Char('f') => Some(Command::OpenFiles),
-        KeyCode::Char('w') => Some(Command::ToggleWholeFile),
+        KeyCode::Char('w') => Some(Command::ToggleWholeFiles),
         KeyCode::Char('H') => Some(Command::ToggleHeatmap),
         KeyCode::Char('/') => Some(Command::Search),
         KeyCode::Esc => Some(Command::Clear),
@@ -1379,7 +1380,7 @@ impl App {
             Command::TogglePreview => self.preview = Some(PreviewPane::default()),
             Command::OpenFiles => self.open_files(),
             // Only on the Files screen, which `press` hands its keys to.
-            Command::ToggleWholeFile => {}
+            Command::ToggleWholeFiles => {}
             Command::ScrollPreviewDown => {
                 if let Some(pane) = &mut self.preview {
                     pane.scroll.half_down();
@@ -1608,6 +1609,9 @@ impl App {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         self.render_status(frame, status_area);
         let tall_enough = self.screen_height >= PREVIEW_MIN_HEIGHT;
+        // The Preview or the file below is what's read: a quarter is plenty for the list.
+        let [list_area, read_area] =
+            Layout::vertical([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)]).areas(view_area);
         // On a terminal made too short while they're open, the Preview and a file wait for it to grow again.
         if self.files.is_open() {
             // Taken before the Files screen is borrowed, which it would otherwise be twice over.
@@ -1615,9 +1619,14 @@ impl App {
             let heat = self.heat().to_vec();
             let theme = self.theme;
             if tall_enough {
-                // The file is what's read: a quarter is plenty for the list.
+                // Less than its quarter if that lists every file, the file below taking the rest. A message in their
+                // place keeps it: there's no file to give the rest to.
+                let list_height = self
+                    .files
+                    .lines_listing_all()
+                    .map_or(list_area.height, |all| all.min(list_area.height));
                 let [list_area, file_area] =
-                    Layout::vertical([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
+                    Layout::vertical([Constraint::Length(list_height), Constraint::Fill(1)])
                         .areas(view_area);
                 self.files.render_list(frame, list_area, &theme);
                 self.files
@@ -1626,11 +1635,8 @@ impl App {
                 self.files.render_list(frame, view_area, &theme);
             }
         } else if self.preview.is_some() && tall_enough {
-            let [list_area, preview_area] =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .areas(view_area);
             self.render_view(frame, list_area, fetching);
-            self.render_preview(frame, preview_area);
+            self.render_preview(frame, read_area);
         } else {
             self.render_view(frame, view_area, fetching);
         }
@@ -2539,7 +2545,7 @@ mod tests {
         assert_eq!(press(KeyCode::Char('f'), none), Some(Command::OpenFiles));
         assert_eq!(
             press(KeyCode::Char('w'), none),
-            Some(Command::ToggleWholeFile)
+            Some(Command::ToggleWholeFiles)
         );
         assert_eq!(
             press(KeyCode::Char('J'), KeyModifiers::SHIFT),
@@ -2771,10 +2777,8 @@ mod tests {
             .iter()
             .position(|line| line.contains(" Preview "))
             .expect("the Preview is open");
-        assert!(
-            (8..=10).contains(&pane_top),
-            "in the bottom half: {lines:#?}"
-        );
+        // A line for the status, 19 for the screen: the Preview takes three quarters of them.
+        assert_eq!(pane_top, 5, "{lines:#?}");
         assert!(shows(&lines, "Fetching…"), "{lines:#?}");
         assert!(
             shows(&lines, "wcgw/ghd · review-requested · now"),
@@ -3505,6 +3509,36 @@ mod tests {
     }
 
     #[test]
+    fn w_shows_every_file_whole_until_pressed_again() {
+        let mut app = app_with_files(changed_files());
+        // On the new file, which shows whole all the same.
+        app.press(key_named("w"));
+
+        app.press(key_named("j"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        assert_eq!(
+            wanted.contents_path,
+            "/repos/wcgw/ghd/contents/src/ui.rs?ref=abc"
+        );
+        app.press(key_named("j"));
+        assert!(
+            app.files.text_to_fetch().is_none(),
+            "a removed file isn't shown whole all the same"
+        );
+        app.press(key_named("j"));
+        let wanted = app.files.text_to_fetch().expect("fetches it whole");
+        assert_eq!(
+            wanted.contents_path,
+            "/repos/wcgw/ghd/contents/src/new.rs?ref=abc"
+        );
+
+        app.press(key_named("w"));
+        app.press(key_named("k"));
+        app.press(key_named("k"));
+        assert!(shows(&screen_of(&mut app, PREVIEW_SCREEN_HEIGHT), "-old"));
+    }
+
+    #[test]
     fn diffs_are_highlighted_on_their_lines_background() {
         let mut app = app_with_files(changed_files());
         app.theme = Theme {
@@ -3635,6 +3669,47 @@ mod tests {
             .position(|line| line.starts_with("┌ docs/guide.md"))
             .expect("the file's pane");
         assert_eq!(file_pane, 5, "{lines:#?}");
+    }
+
+    #[test]
+    fn the_file_takes_what_the_list_needs_not_of_its_quarter() {
+        let mut app = app_with_files(changed_files());
+
+        // A line for the status, 40 for the screen: a quarter of them is 10, and 6 list the 4 files.
+        let lines = screen_of(&mut app, 41);
+
+        let file_pane = lines
+            .iter()
+            .position(|line| line.starts_with("┌ docs/guide.md"))
+            .expect("the file's pane");
+        assert_eq!(file_pane, 6, "{lines:#?}");
+        assert!(shows(&lines, "src/new.rs"), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_pull_request_without_files_says_so() {
+        let mut app = app_with_files(Vec::new());
+
+        let lines = screen_of(&mut app, 21);
+
+        assert!(shows(&lines, "│No files."), "{lines:#?}");
+    }
+
+    #[test]
+    fn the_list_keeps_its_quarter_while_it_shows_no_files() {
+        let mut app = app_with_a_pull_request();
+        app.press(key_named("f"));
+
+        let lines = screen_of(&mut app, 21);
+
+        assert!(shows(&lines, "Fetching files…"), "{lines:#?}");
+        let panes: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with('┌'))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(panes, [0, 5], "{lines:#?}");
     }
 
     #[test]
