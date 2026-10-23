@@ -1,6 +1,7 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
 mod files;
+mod pane_search;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -396,9 +397,14 @@ enum Command {
     PreviousView,
     /// Shows the View at this index in tab order, counting from 0; nothing happens past the last View.
     ShowView(usize),
-    /// Opens the prompt to type a Search into.
+    /// Opens the prompt to type a Search into; on the Files screen, what to look for in the selected file.
     Search,
-    /// Clears the Selection, or the Search if nothing is selected.
+    /// On the Files screen, jumps to the next place what's looked for is found in the selected file.
+    NextMatch,
+    /// On the Files screen, jumps back to the previous place what's looked for is found in the selected file.
+    PreviousMatch,
+    /// Clears the Selection, or the Search if nothing is selected; on the Files screen, stops looking for anything in
+    /// the selected file, or else closes the screen.
     Clear,
     /// Opens the Subjects in the browser, which also marks them read.
     Open,
@@ -428,7 +434,7 @@ enum Command {
 
 /// The help's lines for commands, in order, each with the commands its keys stand for. Adding a command means adding
 /// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
-const COMMAND_HELP: [(&[Command], KeyHelp); 18] = [
+const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     (
         &[Command::Down, Command::Up],
         KeyHelp {
@@ -521,10 +527,10 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 18] = [
         },
     ),
     (
-        &[Command::Search],
+        &[Command::Search, Command::NextMatch, Command::PreviousMatch],
         KeyHelp {
-            keys: "/",
-            does: "search the View on screen",
+            keys: "/  n  N",
+            does: "search the View or a file; next or previous match",
         },
     ),
     (
@@ -541,18 +547,12 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 18] = [
             does: "fetch the Inbox now",
         },
     ),
+    // On one line, so that the help fits a 24-line terminal.
     (
-        &[Command::Help],
+        &[Command::Help, Command::Quit],
         KeyHelp {
-            keys: "?",
-            does: "show these keys",
-        },
-    ),
-    (
-        &[Command::Quit],
-        KeyHelp {
-            keys: "q  Ctrl-C",
-            does: "quit",
+            keys: "?  q  Ctrl-C",
+            does: "show these keys; quit",
         },
     ),
 ];
@@ -614,6 +614,8 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('w') => Some(Command::ToggleWholeFiles),
         KeyCode::Char('H') => Some(Command::ToggleHeatmap),
         KeyCode::Char('/') => Some(Command::Search),
+        KeyCode::Char('n') => Some(Command::NextMatch),
+        KeyCode::Char('N') => Some(Command::PreviousMatch),
         KeyCode::Esc => Some(Command::Clear),
         KeyCode::Char('?') => Some(Command::Help),
         _ => None,
@@ -833,8 +835,9 @@ struct Completion {
     at: usize,
 }
 
-/// Which way Tab and Shift-Tab go through the completions.
-#[derive(Debug, Clone, Copy)]
+/// Which way to go through a list: Tab and Shift-Tab through the completions, n and N through where what's looked for
+/// in a file is found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Next,
     Previous,
@@ -1358,9 +1361,9 @@ impl App {
         }
     }
 
-    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search,
-    /// every key but Ctrl-C goes to the prompt; otherwise the key's command is carried out on screen. Returns what's
-    /// left for `run` to do.
+    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search, or
+    /// what to look for in a file, every key but Ctrl-C goes to the prompt; otherwise the key's command is carried out
+    /// on screen. Returns what's left for `run` to do.
     fn press(&mut self, key: KeyEvent) -> Option<Outcome> {
         if self.help_shown && !is_interrupt(key) {
             self.help_shown = false;
@@ -1368,6 +1371,10 @@ impl App {
         }
         if self.is_typing_search() && !is_interrupt(key) {
             self.type_search(key);
+            return None;
+        }
+        if self.files.typed().is_some() && !is_interrupt(key) {
+            self.files.type_key(key);
             return None;
         }
         let command = command_for(key)?;
@@ -1530,6 +1537,8 @@ impl App {
                     self.current = index;
                 }
             }
+            // Only a file is looked in, on the Files screen.
+            Command::NextMatch | Command::PreviousMatch => {}
             Command::Search => {
                 self.search_prompt = Some(SearchPrompt {
                     input_before: self.search_input.clone(),
@@ -1999,13 +2008,19 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        if let Some(prompt) = &self.search_prompt {
-            let typed = format!("/{}", self.search_input);
+        // The prompt of a Search, or of what's looked for in a file: only a Search's has completions.
+        let prompt = match (&self.search_prompt, self.files.typed()) {
+            (Some(prompt), _) => Some((self.search_input.as_str(), prompt.completion.as_ref())),
+            (None, Some(typed)) => Some((typed, None)),
+            (None, None) => None,
+        };
+        if let Some((typed, completion)) = prompt {
+            let typed = format!("/{typed}");
             let width = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
             let mut spans = vec![Span::styled(typed, self.theme.prompt)];
             // The completed words to go through, the one in the input highlighted.
-            if let Some(completion) = &prompt.completion {
+            if let Some(completion) = completion {
                 spans.push(Span::raw("  "));
                 for (index, input) in completion.inputs.iter().enumerate() {
                     let word = input.rsplit(char::is_whitespace).next().unwrap_or(input);
@@ -4352,6 +4367,374 @@ mod tests {
         assert!(!shows(&lines, "┃"), "{lines:#?}");
     }
 
+    /// [`app_with_files`] with a new file, "long.txt", of 60 lines "Line 0" to "Line 59", the ones at `needles`
+    /// ending in " needle"; then a short one, "short.txt", that's "Short needle". Drawn once.
+    fn app_with_needles(needles: &[usize]) -> App {
+        let long: Vec<String> = (0..60)
+            .map(|i| {
+                if needles.contains(&i) {
+                    format!("+Line {i} needle")
+                } else {
+                    format!("+Line {i}")
+                }
+            })
+            .collect();
+        let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
+        let mut app = app_with_files(vec![
+            changed("long.txt", FileStatus::Added, Some(&patch)),
+            changed(
+                "short.txt",
+                FileStatus::Added,
+                Some("@@ -0,0 +1 @@\n+Short needle"),
+            ),
+        ]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app
+    }
+
+    /// Presses `/` on the Files screen and types `text`, which does nothing else.
+    fn look_for(app: &mut App, text: &str) {
+        assert!(app.press(key_named("/")).is_none());
+        for character in text.chars() {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert!(app.press(key).is_none(), "{character:?} is typed");
+        }
+    }
+
+    /// The line in the middle of the Files screen's file pane, inside its border, on `lines`; and its bottom border.
+    fn file_pane(lines: &[String]) -> (&str, &str) {
+        let top = lines
+            .iter()
+            .rposition(|line| line.starts_with('┌'))
+            .expect("a file pane");
+        let bottom = lines
+            .iter()
+            .rposition(|line| line.starts_with('└'))
+            .expect("a file pane");
+        let rows = bottom - top - 1;
+        (&lines[top + 1 + rows / 2], &lines[bottom])
+    }
+
+    #[test]
+    fn slash_looks_in_the_file_from_where_it_shows_and_brings_it_to_the_middle() {
+        let mut app = app_with_needles(&[5, 40]);
+        // Past the first.
+        for _ in 0..3 {
+            app.wheel(Wheel::Down);
+        }
+
+        look_for(&mut app, "NEEDLE");
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let (middle, bottom) = file_pane(&lines);
+        assert!(middle.contains("Line 40 needle"), "{lines:#?}");
+        assert!(bottom.contains(" 2 of 2 "), "{bottom}");
+        assert!(!bottom.contains("NEEDLE"), "not shown twice while typing");
+        assert!(lines[lines.len() - 1].starts_with("/NEEDLE "), "{lines:#?}");
+
+        app.press(key_named("Enter"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let (middle, bottom) = file_pane(&lines);
+        assert!(middle.contains("Line 40 needle"), "stays: {lines:#?}");
+        assert!(bottom.contains(" /NEEDLE · 2 of 2 "), "{bottom}");
+        assert!(
+            !lines[lines.len() - 1].contains("NEEDLE"),
+            "the prompt closed"
+        );
+    }
+
+    #[test]
+    fn n_and_shift_n_go_through_the_matches_and_around() {
+        let mut app = app_with_needles(&[10, 30, 50]);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let (middle, bottom) = file_pane(&lines);
+        assert!(middle.contains("Line 10 needle"), "{lines:#?}");
+        assert!(bottom.contains(" 1 of 3 "), "{bottom}");
+
+        for (key, line, of) in [
+            ("n", 30, 2),
+            ("n", 50, 3),
+            ("n", 10, 1),
+            ("N", 50, 3),
+            ("N", 30, 2),
+        ] {
+            assert!(app.press(key_named(key)).is_none());
+
+            let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+            let (middle, bottom) = file_pane(&lines);
+            assert!(
+                middle.contains(&format!("Line {line} needle")),
+                "{key}: {lines:#?}"
+            );
+            assert!(bottom.contains(&format!(" {of} of 3 ")), "{key}: {bottom}");
+        }
+    }
+
+    #[test]
+    fn n_and_shift_n_go_from_what_shows_once_scrolled_away() {
+        let mut app = app_with_needles(&[10, 30, 50]);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        // From line 4 down to 37: past the second, the first gone above.
+        for _ in 0..11 {
+            app.wheel(Wheel::Down);
+        }
+
+        app.press(key_named("n"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let (middle, bottom) = file_pane(&lines);
+        assert!(middle.contains("Line 50 needle"), "{lines:#?}");
+        assert!(bottom.contains(" 3 of 3 "), "{bottom}");
+
+        // From line 44 up to 17: the third gone below, and the second just below the 13 rows that show.
+        for _ in 0..9 {
+            app.wheel(Wheel::Up);
+        }
+        assert_eq!(app.files.scrolled_by(), 17);
+        app.press(key_named("N"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let (middle, bottom) = file_pane(&lines);
+        assert!(middle.contains("Line 10 needle"), "{lines:#?}");
+        assert!(bottom.contains(" 1 of 3 "), "{bottom}");
+    }
+
+    #[test]
+    fn jumps_go_around_the_ends_of_the_file() {
+        let mut app = app_with_needles(&[40]);
+        // Past it.
+        for _ in 0..15 {
+            app.wheel(Wheel::Down);
+        }
+
+        look_for(&mut app, "needle");
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(file_pane(&lines).0.contains("Line 40 needle"), "{lines:#?}");
+
+        app.press(key_named("Enter"));
+        // Above it, with nothing above it to go back to.
+        for _ in 0..12 {
+            app.wheel(Wheel::Up);
+        }
+        assert_eq!(app.files.scrolled_by(), 0);
+        app.press(key_named("N"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(file_pane(&lines).0.contains("Line 40 needle"), "{lines:#?}");
+    }
+
+    #[test]
+    fn n_does_nothing_before_anything_is_looked_for() {
+        let mut app = app_with_needles(&[40]);
+
+        app.press(key_named("n"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert_eq!(app.files.scrolled_by(), 0);
+        assert!(!file_pane(&lines).1.contains("needle"), "{lines:#?}");
+    }
+
+    #[test]
+    fn every_match_in_the_file_is_highlighted_the_one_jumped_to_apart() {
+        let mut app = app_with_files(vec![changed(
+            "notes.txt",
+            FileStatus::Added,
+            Some("@@ -0,0 +1,3 @@\n+One needle\n+Two\n+Three NEEDLE"),
+        )]);
+        app.theme = Theme {
+            found: Style::new().bg(Color::Yellow),
+            found_current: Style::new().bg(Color::Red),
+            ..Theme::default()
+        };
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+
+        assert_eq!(cell_of(&mut app, "needle").bg, Color::Red);
+        assert_eq!(cell_of(&mut app, "NEEDLE").bg, Color::Yellow);
+        assert_eq!(cell_of(&mut app, "One").bg, Color::Reset);
+
+        app.press(key_named("n"));
+
+        assert_eq!(cell_of(&mut app, "needle").bg, Color::Yellow);
+        assert_eq!(cell_of(&mut app, "NEEDLE").bg, Color::Red);
+    }
+
+    #[test]
+    fn a_jump_down_the_file_is_highlighted_where_it_lands() {
+        let comments = "+// a comment\n".repeat(200);
+        let patch = format!("@@ -0,0 +1,201 @@\n{comments}+fn needle() {{}}");
+        let mut app = app_with_files(vec![changed(
+            "src/main.rs",
+            FileStatus::Added,
+            Some(&patch),
+        )]);
+        app.theme = Theme {
+            syntax_keyword: Style::new().fg(Color::Magenta),
+            ..Theme::default()
+        };
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        look_for(&mut app, "needle");
+
+        assert_eq!(cell_of(&mut app, "fn needle").fg, Color::Magenta);
+    }
+
+    #[test]
+    fn typing_on_looks_again_from_where_the_prompt_opened() {
+        let mut app = app_with_needles(&[40]);
+        look_for(&mut app, "needle");
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let found_at = app.files.scrolled_by();
+        assert!(found_at > 0);
+
+        app.press(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(file_pane(&lines).1.contains(" no match "), "{lines:#?}");
+        assert_eq!(app.files.scrolled_by(), 0, "back where it was");
+
+        app.press(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(file_pane(&lines).1.contains(" 1 of 1 "), "{lines:#?}");
+        assert_eq!(app.files.scrolled_by(), found_at);
+    }
+
+    #[test]
+    fn esc_in_the_files_prompt_puts_back_what_was_looked_for_and_where() {
+        let mut app = app_with_needles(&[40]);
+        look_for(&mut app, "needle");
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(app.files.scrolled_by() > 0);
+
+        app.press(key_named("Esc"));
+
+        assert!(app.files.is_open(), "only the prompt closed");
+        assert_eq!(app.files.scrolled_by(), 0, "back where it was");
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(!file_pane(&lines).1.contains("needle"), "{lines:#?}");
+
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        let found_at = app.files.scrolled_by();
+        // After what's looked for already.
+        look_for(&mut app, "zzz");
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+
+        app.press(key_named("Esc"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            file_pane(&lines).1.contains(" /needle · 1 of 1 "),
+            "{lines:#?}"
+        );
+        assert_eq!(app.files.scrolled_by(), found_at);
+
+        // Before the pane is drawn again: nothing is left to jump to.
+        for _ in 0..12 {
+            app.wheel(Wheel::Up);
+        }
+        look_for(&mut app, "x");
+        app.press(key_named("Esc"));
+
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert_eq!(app.files.scrolled_by(), 0);
+    }
+
+    #[test]
+    fn esc_stops_looking_in_the_file_before_going_back() {
+        let mut app = app_with_needles(&[40]);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+
+        app.press(key_named("Esc"));
+
+        assert!(app.files.is_open());
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(!file_pane(&lines).1.contains("needle"), "{lines:#?}");
+
+        app.press(key_named("Esc"));
+
+        assert!(!app.files.is_open());
+    }
+
+    #[test]
+    fn keys_go_to_the_files_prompt_while_typing() {
+        let mut app = app_with_needles(&[]);
+
+        // Not quitting, nor the next file, nor back.
+        look_for(&mut app, "qjf");
+
+        assert!(app.files.is_open());
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            lines.iter().any(|line| line.starts_with("┌ long.txt")),
+            "{lines:#?}"
+        );
+        assert!(lines[lines.len() - 1].starts_with("/qjf "), "{lines:#?}");
+
+        // Nor half a page down.
+        assert!(app.press(key_named("Ctrl-D")).is_none());
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(lines[lines.len() - 1].starts_with("/qjf "), "{lines:#?}");
+        assert!(matches!(
+            app.press(key_named("Ctrl-C")),
+            Some(Outcome::Quit)
+        ));
+    }
+
+    #[test]
+    fn another_file_is_looked_in_too_from_its_top() {
+        // "needle" where it is in the other.
+        let mut app = app_with_files(vec![
+            changed("a.txt", FileStatus::Added, Some("@@ -0,0 +1 @@\n+a needle")),
+            changed(
+                "b.txt",
+                FileStatus::Added,
+                Some("@@ -0,0 +1,2 @@\n+b needle\n+more needles"),
+            ),
+        ]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        // Not made before the next file shows.
+        app.press(key_named("n"));
+
+        app.press(key_named("j"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            file_pane(&lines).1.contains(" /needle · 2 matches "),
+            "{lines:#?}"
+        );
+
+        app.press(key_named("n"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            file_pane(&lines).1.contains(" /needle · 1 of 2 "),
+            "{lines:#?}"
+        );
+
+        app.press(key_named("k"));
+
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(
+            file_pane(&lines).1.contains(" /needle · 1 match "),
+            "{lines:#?}"
+        );
+    }
+
     #[test]
     fn removed_and_renamed_files_say_so() {
         let mut app = app_with_files(changed_files());
@@ -5363,6 +5746,8 @@ mod tests {
             "I",
             "e",
             "/",
+            "n",
+            "N",
             "Esc",
             "r",
             "?",
@@ -5428,6 +5813,12 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Tab  Shift-Tab  complete a field's name")),
             "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("put back the search there was before")),
+            "the last line: {lines:#?}"
         );
     }
 

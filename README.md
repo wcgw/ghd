@@ -24,6 +24,9 @@ a trip to the browser.
 
   ![The same file whole, its changed lines marked in the gutter](docs/screenshots/whole-file.png)
 
+  `/` searches the file shown as you type, ignoring case: every match is highlighted, and the first one from where
+  the file is scrolled to comes to the middle of the pane; `n` and `N` go on to the next match or back to the previous.
+
 - **voight**: optionally, [voight](https://github.com/wcgw/voight) estimates how much of a Preview's text an LLM
   wrote, shown at the bottom of the pane; `H` shows its Heatmap, each stretch of prose it scored (about 100 to 400
   words) shaded from green (0%) to red (100%). An estimate, never evidence of authorship.
@@ -102,7 +105,7 @@ either, different ones must all match. The details are in [the decision record](
 | `p` `H` | show or hide the Preview; voight's Heatmap |
 | `J` `K` | scroll the Preview, and step through its comments |
 | `f` `w` | a pull request's files; files whole, or their diffs |
-| `/` | search the View on screen |
+| `/` `n` `N` | search the View on screen, or the file on the Files screen; the next or previous match |
 | `Esc` | clear the selection, or else the search |
 | `r` | fetch the Inbox now |
 | `?` | show these keys |

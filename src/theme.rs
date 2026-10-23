@@ -118,8 +118,12 @@ theme! {
     /// The ways to complete the word being typed, other than the current one.
     completion = "completion",
     completion_current = "completion_current",
-    /// The Search, in the bottom border.
+    /// The Search, in the bottom border; and what's looked for in a file, with how many times it's found.
     search = "search",
+    /// Where what's looked for in a file is found, over the style of the text there.
+    found = "found",
+    /// … the place jumped to.
+    found_current = "found_current",
     /// "fetching…", in the top border.
     fetching = "fetching",
     /// "? keys", in the bottom border.

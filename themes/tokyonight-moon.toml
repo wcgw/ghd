@@ -60,6 +60,9 @@ prompt = { fg = "fg" }
 completion = { fg = "dark5" }
 completion_current = { fg = "bg", bg = "blue1" }
 search = { fg = "yellow" }
+# Like Tokyo Night's Search and CurSearch, the background's color over orange.
+found = { fg = "fg", bg = "blue0" }
+found_current = { fg = "bg", bg = "orange" }
 fetching = { fg = "blue1", italic = true }
 hint = { fg = "dark3" }
 help_keys = { fg = "blue1", bold = true }

@@ -5,13 +5,17 @@ use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
-use super::{Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, Wheel, counted};
+use super::pane_search::PaneSearch;
+use super::{
+    Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, Step, Wheel, counted,
+};
 use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
 use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText, LineChange};
@@ -43,6 +47,8 @@ struct Screen {
     showing: Showing,
     /// The selected file's pane.
     scroll: Scrolled,
+    /// What's looked for in the selected file, and in the others once they're selected.
+    search: PaneSearch,
     /// Each file's highlighting so far, whole or as its diff, by its contents path; `None` for one in a language ghd
     /// doesn't know. Drawing highlights a file as far down as it shows, which only drawing knows, and otherwise only
     /// reads the screen.
@@ -100,6 +106,7 @@ impl Files {
             rows: 0,
             showing: Showing::Diff,
             scroll: Scrolled::default(),
+            search: PaneSearch::default(),
             highlighting: RefCell::default(),
         });
         None
@@ -112,8 +119,21 @@ impl Files {
         }
     }
 
-    /// Carries out `command` on the screen, where only moving, scrolling, `w`, `o`, `r`, Esc or `f`, `?` and
-    /// quitting do anything: the rest act on Notifications. Returns what's left for the app around it to do.
+    /// What's looked for in the selected file, as typed so far, while the user types it; `None` while they don't.
+    pub(super) fn typed(&self) -> Option<&str> {
+        self.screen.as_ref()?.search.typed()
+    }
+
+    /// Edits what's looked for in the selected file with `key`, as [`PaneSearch::type_key`] does.
+    pub(super) fn type_key(&mut self, key: KeyEvent) {
+        if let Some(screen) = &mut self.screen {
+            screen.search.type_key(key, &mut screen.scroll);
+        }
+    }
+
+    /// Carries out `command` on the screen, where only moving, scrolling, searching the selected file, `w`, `o`, `r`,
+    /// Esc or `f`, `?` and quitting do anything: the rest act on Notifications. Returns what's left for the app around
+    /// it to do.
     pub(super) fn press(&mut self, command: Command) -> Pressed {
         let Some(screen) = &mut self.screen else {
             return Pressed::Nothing;
@@ -132,6 +152,18 @@ impl Files {
                 screen.scroll.half_up();
                 return Pressed::Nothing;
             }
+            Command::Search => {
+                screen.search.start_typing(&screen.scroll);
+                return Pressed::Nothing;
+            }
+            Command::NextMatch => {
+                screen.search.step(Step::Next);
+                return Pressed::Nothing;
+            }
+            Command::PreviousMatch => {
+                screen.search.step(Step::Previous);
+                return Pressed::Nothing;
+            }
             Command::ToggleWholeFiles => {
                 screen.showing = match screen.showing {
                     Showing::Whole => Showing::Diff,
@@ -144,7 +176,14 @@ impl Files {
                 return Pressed::Forgot(thread);
             }
             Command::Open => return self.open_selected(),
-            Command::Clear | Command::OpenFiles => {
+            Command::Clear => {
+                // Esc stops looking for anything in the file before it goes back.
+                if !screen.search.clear() {
+                    self.screen = None;
+                }
+                return Pressed::Nothing;
+            }
+            Command::OpenFiles => {
                 self.screen = None;
                 return Pressed::Nothing;
             }
@@ -157,15 +196,15 @@ impl Files {
             | Command::NextView
             | Command::PreviousView
             | Command::ShowView(_)
-            | Command::Search
             | Command::MarkRead
             | Command::MarkDone
             | Command::ToggleDone
             | Command::ToggleUnreadOnly
             | Command::TogglePreview => return Pressed::Nothing,
         }
-        // Another file, or another way to show it: from its top.
+        // Another file, or another way to show it: from its top, what's looked for looked for in it.
         screen.scroll.by = 0;
+        screen.search.lose_place();
         Pressed::Nothing
     }
 
@@ -365,8 +404,11 @@ impl Files {
             .border_style(theme.border)
             .title(Line::from(title))
             .title_bottom(
-                Line::styled(" Esc back · w whole files or diffs · ? keys ", theme.hint)
-                    .right_aligned(),
+                Line::styled(
+                    " Esc back · w whole files or diffs · / search · ? keys ",
+                    theme.hint,
+                )
+                .right_aligned(),
             );
         let list = match fetched {
             None | Some(Fetched::Fetching) => {
@@ -435,9 +477,9 @@ impl Files {
         frame.render_stateful_widget(table, area, &mut screen.cursor);
     }
 
-    /// Draws the selected Changed file in `area`, as far down as it's scrolled, as the Heatmap of `heat`, the windows
-    /// of its Assessment, if there are any; with what voight says of it in the bottom border, if `label` says
-    /// anything.
+    /// Draws the selected Changed file in `area`, as far down as it's scrolled, or as a jump to where what's looked for
+    /// is found takes it, as the Heatmap of `heat`, the windows of its Assessment, if there are any; with what's looked
+    /// for in the bottom border, and what voight says of it if `label` says anything.
     pub(super) fn render_selected(
         &mut self,
         frame: &mut Frame,
@@ -449,27 +491,53 @@ impl Files {
         // Inside the border.
         let width = area.width.saturating_sub(2);
         // As far down as it's scrolled, and the pane's height more: each line takes at least a line of the pane.
+        let down_to = |scrolled_by: u16| usize::from(scrolled_by.saturating_add(area.height));
         let scrolled_by = self.screen.as_ref().map_or(0, |screen| screen.scroll.by);
-        let down_to = usize::from(scrolled_by.saturating_add(area.height));
-        let (path, lines) = match self.selected() {
-            Some(file) => (
-                format!(" {} ", file.path),
-                self.lines_of(file, theme, width, heat, down_to),
-            ),
-            None => (String::new(), Vec::new()),
-        };
-        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let mut lines = self.selected_lines(theme, width, heat, down_to(scrolled_by));
+        let jumped_to = self.screen.as_mut().map(|screen| {
+            screen.search.jump(&lines, area, &mut screen.scroll);
+            screen.scroll.by
+        });
+        if let Some(jumped_to) = jumped_to.filter(|&by| by > scrolled_by) {
+            // Further down than it's highlighted.
+            lines = self.selected_lines(theme, width, heat, down_to(jumped_to));
+        }
+        let path = self
+            .selected()
+            .map(|file| format!(" {} ", file.path))
+            .unwrap_or_default();
         let mut block = Block::bordered()
             .border_style(theme.border)
             .title(Line::styled(path, theme.tab));
+        if let Some(search) = self
+            .screen
+            .as_ref()
+            .and_then(|screen| screen.search.highlight(&mut lines, theme))
+        {
+            block = block.title_bottom(search);
+        }
         if let Some(label) = label {
             block = block.title_bottom(Line::from(label).right_aligned());
         }
+        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
         if let Some(screen) = &mut self.screen {
             screen
                 .scroll
                 .render(frame, area, text, block, theme.scrollbar);
         }
+    }
+
+    /// What the file pane shows of the selected file, as [`Self::lines_of`] does; nothing if there's none.
+    fn selected_lines(
+        &self,
+        theme: &Theme,
+        width: u16,
+        heat: &[Window],
+        down_to: usize,
+    ) -> Vec<Line<'static>> {
+        self.selected().map_or_else(Vec::new, |file| {
+            self.lines_of(file, theme, width, heat, down_to)
+        })
     }
 
     /// What the file pane shows of `file`, `width` cells wide: where it was renamed or copied from, then the file

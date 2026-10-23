@@ -9,6 +9,8 @@ read = { dim = true }
 error = { fg = "red" }
 completion = { dim = true }
 completion_current = { reversed = true }
+found = { fg = "black", bg = "yellow" }
+found_current = { reversed = true }
 help_keys = { bold = true }
 help_heading = { dim = true }
 

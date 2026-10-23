@@ -102,4 +102,5 @@ _Avoid_: folder, bucket, tab, filter
 - "read" and "done" are easy to conflate. Resolved: reading a **Notification** only clears **Unread**; only marking it **Done** removes it from the **Inbox**.
 - "selection" meant the highlighted row until several **Notifications** could be marked. Resolved: the highlighted row is the **Cursor**; the **Selection** is what's marked.
 - "search" could mean a **Filter** or a **Search**. Resolved: a **Filter** belongs to a **View** and is configured; a **Search** is typed, temporary, and narrows the **View** on screen.
+- "search" is also what `/` does on the Files screen: it looks for text in the **Changed file** shown and highlights it there. Resolved: that narrows nothing, so it's no **Search**; say "searching the file".
 - "filters/views" was used as if they were one concept. Resolved: a **Filter** is the matching rule, a **View** is the named tab in the TUI that applies one.
