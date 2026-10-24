@@ -45,8 +45,10 @@ cargo install --locked --path .
 ```
 
 That builds voight in, running on the CPU. Add `--features cuda` to run it on an NVIDIA GPU (this needs the CUDA
-toolkit's `nvcc`), or `--features metal` on a Mac's GPU (on Apple silicon, voight always builds with Metal). Or leave
-it out with `--no-default-features`.
+toolkit's `nvcc`), `--features metal` on a Mac's GPU (on Apple silicon, voight builds with Metal anyway, unless with
+wgpu), or `--features wgpu` on any other GPU, Intel or AMD say, through Vulkan on Linux. wgpu is experimental:
+candle's wgpu backend is unreleased, so voight builds on [a fork](https://github.com/huggingface/candle/pull/3379). Or
+leave voight out with `--no-default-features`.
 
 The first time it starts with voight, ghd downloads voight's model, about 1.7 GB, into the Hugging Face cache. Set
 `voight = "off"` to start without it.
@@ -66,7 +68,7 @@ host = "github.example.com"  # github.com by default
 user = "octocat"             # gh's active account on the host by default
 theme = "terminal"           # tokyonight-moon by default
 icons = true                 # Nerd Font icons for kinds of notification; false by default
-voight = "off"               # "cpu" by default; "cuda" or "metal" in a ghd built for them
+voight = "off"               # "cpu" by default; "cuda", "metal" or "wgpu" in a ghd built for them
 
 [[view]]
 name = "Reviews"

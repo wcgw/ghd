@@ -23,11 +23,14 @@ pub enum Device {
     Metal,
     /// An NVIDIA GPU.
     Cuda,
+    /// Any other GPU, through wgpu: Vulkan on Linux.
+    Wgpu,
 }
 
 impl Device {
-    /// Whether this ghd was built to run voight there: CUDA with its `cuda` feature, Metal with its `metal` one or
-    /// on Apple silicon, where voight always builds with it. Whether the machine has one is another matter.
+    /// Whether this ghd was built to run voight there: CUDA with its `cuda` feature, wgpu with its `wgpu` one, and
+    /// Metal with its `metal` one or on Apple silicon, where voight builds with it unless with wgpu, whose fork of
+    /// candle doesn't. Whether the machine has one is another matter.
     pub fn is_built_in(self) -> bool {
         match self {
             Self::Cpu => cfg!(feature = "voight"),
@@ -35,10 +38,15 @@ impl Device {
                 feature = "voight",
                 any(
                     feature = "metal",
-                    all(target_os = "macos", target_arch = "aarch64")
+                    all(
+                        target_os = "macos",
+                        target_arch = "aarch64",
+                        not(feature = "wgpu")
+                    )
                 )
             )),
             Self::Cuda => cfg!(feature = "cuda"),
+            Self::Wgpu => cfg!(feature = "wgpu"),
         }
     }
 }
@@ -50,6 +58,7 @@ impl fmt::Display for Device {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
             Self::Cuda => "cuda",
+            Self::Wgpu => "wgpu",
         })
     }
 }
@@ -177,6 +186,11 @@ fn work(
         Device::Cpu => (voight::Device::Cpu, None),
         Device::Metal => opened(voight::Device::new_metal(0), "Metal"),
         Device::Cuda => opened(voight::Device::new_cuda(0), "CUDA"),
+        // Only the fork of candle that voight builds on with wgpu has the backend.
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu => opened(voight::Device::new_wgpu(0), "wgpu"),
+        #[cfg(not(feature = "wgpu"))]
+        Device::Wgpu => unreachable!("the configuration can't pick wgpu in a ghd built without it"),
     };
     let detector = match voight::Detector::load(model, files, device) {
         Ok(detector) => detector,
