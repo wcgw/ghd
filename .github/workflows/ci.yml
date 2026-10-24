@@ -40,3 +40,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Lints
         run: cargo clippy --all-targets
+      # On the fork of candle that has its wgpu backend: the build most likely to break.
+      - name: Lints with wgpu
+        run: cargo clippy --all-targets --features wgpu

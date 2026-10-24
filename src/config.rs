@@ -5,8 +5,9 @@
 //! user = "alexsnaps"            # optional, `gh`'s active account on the host by default
 //! theme = "terminal"            # optional, tokyonight-moon by default
 //! icons = true                  # optional, false by default: Nerd Font icons for kinds of Subject
-//! voight = "metal"              # optional, "cpu" by default: where voight assesses Previews ("cpu", "metal" or
-//!                               # "cuda"; a GPU needs ghd built with `--features cuda` or `metal`), or "off"
+//! voight = "metal"              # optional, "cpu" by default: where voight assesses Previews ("cpu", "metal",
+//!                               # "cuda" or "wgpu"; a GPU needs ghd built with `--features cuda`, `metal` or
+//!                               # `wgpu`), or "off"
 //!
 //! [[view]]
 //! name = "Reviews"
@@ -184,6 +185,7 @@ enum VoightSetting {
     Cpu,
     Metal,
     Cuda,
+    Wgpu,
 }
 
 impl VoightSetting {
@@ -194,6 +196,7 @@ impl VoightSetting {
             Self::Cpu => Some(Device::Cpu),
             Self::Metal => Some(Device::Metal),
             Self::Cuda => Some(Device::Cuda),
+            Self::Wgpu => Some(Device::Wgpu),
         }
     }
 }
@@ -273,6 +276,9 @@ mod tests {
         if Device::Cuda.is_built_in() {
             assert_eq!(voight("voight = \"cuda\""), Some(Device::Cuda));
         }
+        if Device::Wgpu.is_built_in() {
+            assert_eq!(voight("voight = \"wgpu\""), Some(Device::Wgpu));
+        }
         assert!(rejection("voight = \"gpu\"").contains("voight"));
         assert!(rejection("voight = true").contains("voight"));
     }
@@ -281,6 +287,12 @@ mod tests {
     #[test]
     fn cuda_needs_building_in() {
         assert!(rejection("voight = \"cuda\"").contains("--features cuda"));
+    }
+
+    #[cfg(all(feature = "voight", not(feature = "wgpu")))]
+    #[test]
+    fn wgpu_needs_building_in() {
+        assert!(rejection("voight = \"wgpu\"").contains("--features wgpu"));
     }
 
     #[cfg(not(feature = "voight"))]

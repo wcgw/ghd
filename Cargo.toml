@@ -25,7 +25,7 @@ toml = { version = "1.1.8", default-features = false, features = ["std", "parse"
 tui-markdown = { version = "0.3.12", default-features = false }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 # voight's main, pinned: the library isn't published.
-voight = { git = "https://github.com/wcgw/voight", rev = "5f219e54eb124e7f74035e653b0677e602c4a8b5", default-features = false, optional = true }
+voight = { git = "https://github.com/wcgw/voight", rev = "26c88c90f7b971a1700e892332023a6d5771361e", default-features = false, optional = true }
 
 [dev-dependencies]
 wiremock = "0.6.5"
@@ -50,8 +50,11 @@ voight = ["dep:voight"]
 # the CUDA toolkit (`nvcc`) to build.
 cuda = ["voight", "voight/cuda"]
 # voight on a Mac's GPU (`voight = "metal"`): Metal in voight and its candle crates. Already on for Apple silicon,
-# where voight always builds with Metal.
+# where voight builds with Metal unless it's built with wgpu.
 metal = ["voight", "voight/metal"]
+# voight on any other GPU (`voight = "wgpu"`), Intel or AMD say, through Vulkan on Linux. Experimental: candle's wgpu
+# backend is unreleased, so voight runs on a fork of candle that has it, without Metal unless `metal` is on too.
+wgpu = ["voight", "voight/wgpu"]
 
 # voight's model is unusably slow unoptimized (an Assessment didn't finish in five minutes): dependencies are built
 # optimized even in debug builds, which keep ghd's own code easy to debug.
