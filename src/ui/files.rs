@@ -55,6 +55,16 @@ struct Screen {
     highlighting: RefCell<HashMap<(Showing, String), Option<Highlighting>>>,
 }
 
+impl Screen {
+    /// The pull request's Changed files in `fetched`; `None` until they're fetched, or if they couldn't be.
+    fn files<'a>(&self, fetched: &'a ChangedFiles) -> Option<&'a [ChangedFile]> {
+        match fetched.list(self.notification.thread, self.notification.updated_at)? {
+            Fetched::Done(list) => Some(list),
+            Fetched::Fetching | Fetched::Failed(_) => None,
+        }
+    }
+}
+
 /// How a Changed file shows: whole, or as its diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Showing {
@@ -142,6 +152,13 @@ impl Files {
             Command::Quit => return Pressed::Quit,
             Command::Down => screen.cursor.select_next(),
             Command::Up => screen.cursor.select_previous(),
+            Command::First => screen.cursor.select_first(),
+            Command::Last => {
+                // Not past the end, as `select_last` leaves it until the next draw: before that, fetching would take
+                // it for no file.
+                let count = screen.files(&self.fetched).map_or(0, <[ChangedFile]>::len);
+                screen.cursor.select(Some(count.saturating_sub(1)));
+            }
             Command::HalfPageDown => screen.cursor.scroll_down_by((screen.rows / 2).max(1)),
             Command::HalfPageUp => screen.cursor.scroll_up_by((screen.rows / 2).max(1)),
             Command::ScrollPreviewDown => {
@@ -187,10 +204,11 @@ impl Files {
                 self.screen = None;
                 return Pressed::Nothing;
             }
-            // What acts on Notifications; `?` and `H` never reach here, the app around it showing the help and the
-            // Heatmap itself.
+            // What acts on Notifications; `?`, `H` and `:` never reach here, the app around it showing the help, the
+            // Heatmap and the command line itself.
             Command::Help
             | Command::ToggleHeatmap
+            | Command::OpenCommandLine
             | Command::ToggleSelected
             | Command::SelectAllShown
             | Command::NextView
@@ -228,25 +246,14 @@ impl Files {
     /// The Changed file selected; `None` while the screen is closed, or its files aren't fetched yet.
     fn selected(&self) -> Option<&ChangedFile> {
         let screen = self.screen.as_ref()?;
-        let Fetched::Done(list) = self
-            .fetched
-            .list(screen.notification.thread, screen.notification.updated_at)?
-        else {
-            return None;
-        };
-        list.get(screen.cursor.selected()?)
+        screen.files(&self.fetched)?.get(screen.cursor.selected()?)
     }
 
     /// The lines the list takes to show every Changed file, its border included; `None` while it shows a message in
     /// their place: the screen closed, the files not fetched yet, or none.
     pub(super) fn lines_listing_all(&self) -> Option<u16> {
         let screen = self.screen.as_ref()?;
-        let Fetched::Done(list) = self
-            .fetched
-            .list(screen.notification.thread, screen.notification.updated_at)?
-        else {
-            return None;
-        };
+        let list = screen.files(&self.fetched)?;
         if list.is_empty() {
             return None;
         }

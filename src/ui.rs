@@ -381,10 +381,16 @@ async fn fetch_preview(github: &GitHub, wanted: WantedPreview) -> PreviewFetched
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Quit,
+    /// Opens the command line, to type a command into as in Vim: `q` to quit.
+    OpenCommandLine,
     /// Fetches the whole Inbox now, rather than at the next poll.
     Refresh,
     Down,
     Up,
+    /// Moves the cursor to the first row of the list.
+    First,
+    /// Moves the cursor to the last row of the list.
+    Last,
     /// Moves the cursor down by half the rows the list shows.
     HalfPageDown,
     /// Moves the cursor up by half the rows the list shows.
@@ -436,10 +442,10 @@ enum Command {
 /// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
 const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     (
-        &[Command::Down, Command::Up],
+        &[Command::Down, Command::Up, Command::First, Command::Last],
         KeyHelp {
-            keys: "j  k  ↓  ↑",
-            does: "move to the next or previous Notification",
+            keys: "j  k  ↓  ↑  g  G",
+            does: "move to the next, previous, first or last Notification",
         },
     ),
     (
@@ -549,9 +555,9 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     ),
     // On one line, so that the help fits a 24-line terminal.
     (
-        &[Command::Help, Command::Quit],
+        &[Command::Help, Command::OpenCommandLine, Command::Quit],
         KeyHelp {
-            keys: "?  q  Ctrl-C",
+            keys: "?  :q  Ctrl-C",
             does: "show these keys; quit",
         },
     ),
@@ -593,10 +599,12 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Command::HalfPageUp)
         }
-        KeyCode::Char('q') => Some(Command::Quit),
+        KeyCode::Char(':') => Some(Command::OpenCommandLine),
         KeyCode::Char('r') => Some(Command::Refresh),
         KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
+        KeyCode::Char('g') => Some(Command::First),
+        KeyCode::Char('G') => Some(Command::Last),
         KeyCode::Char(' ') => Some(Command::ToggleSelected),
         KeyCode::Char('A') => Some(Command::SelectAllShown),
         KeyCode::Tab => Some(Command::NextView),
@@ -622,7 +630,7 @@ fn command_for(key: KeyEvent) -> Option<Command> {
     }
 }
 
-/// Whether `key` is Ctrl-C, which quits even while the user types a Search.
+/// Whether `key` is Ctrl-C, which quits even while the user types into a prompt.
 fn is_interrupt(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
@@ -677,6 +685,8 @@ struct App {
     search: Search,
     /// The prompt in the status line, while the user types a Search.
     search_prompt: Option<SearchPrompt>,
+    /// What's typed on the command line, after `:`, while it's open.
+    command_line: Option<String>,
     /// The Selection, by thread: only ever threads the Inbox holds, whichever View shows them.
     selection: HashSet<ThreadId>,
     /// The help is shown over the View.
@@ -872,6 +882,7 @@ impl App {
             search_input: String::new(),
             search: Search::default(),
             search_prompt: None,
+            command_line: None,
             selection: HashSet::new(),
             help_shown: false,
             rows_on_screen: 0,
@@ -1010,6 +1021,49 @@ impl App {
         };
         let input = completion.inputs[completion.at].clone();
         self.set_search(input);
+    }
+
+    /// Edits the command line with `key`, as in Vim: a character adds to it, and Backspace takes the last one off or,
+    /// with nothing typed, closes it; Enter closes it and carries out the command typed, and Esc closes it. Returns
+    /// what's left for `run` to do.
+    fn type_command(&mut self, key: KeyEvent) -> Option<Outcome> {
+        let typed = self.command_line.as_mut()?;
+        match key.code {
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                typed.push(character);
+            }
+            KeyCode::Backspace => {
+                if typed.pop().is_none() {
+                    self.command_line = None;
+                }
+            }
+            KeyCode::Enter => {
+                let typed = mem::take(typed);
+                self.command_line = None;
+                return self.carry_out(&typed);
+            }
+            KeyCode::Esc => self.command_line = None,
+            _ => {}
+        }
+        None
+    }
+
+    /// Carries out the command `typed` on the command line: Vim's for quitting, the only one so far; says so if it's
+    /// none. Returns what's left for `run` to do.
+    fn carry_out(&mut self, typed: &str) -> Option<Outcome> {
+        match typed.trim() {
+            "" => None,
+            // ghd has nothing to write, nor other windows to close: they all just quit.
+            "q" | "quit" | "q!" | "quit!" | "qa" | "qall" | "qa!" | "qall!" => Some(Outcome::Quit),
+            typed => {
+                self.status = Some(StatusMessage::Error(format!("Not a command: {typed}")));
+                None
+            }
+        }
     }
 
     /// The Subjects whose State to look up now: the ones the latest Inbox changed, once after it arrives. Empty
@@ -1361,36 +1415,34 @@ impl App {
         }
     }
 
-    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search, or
-    /// what to look for in a file, every key but Ctrl-C goes to the prompt; otherwise the key's command is carried out
-    /// on screen. Returns what's left for `run` to do.
+    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search,
+    /// what to look for in a file or a command, every key but Ctrl-C goes to the prompt; otherwise the key's command
+    /// is carried out on screen. Returns what's left for `run` to do.
     fn press(&mut self, key: KeyEvent) -> Option<Outcome> {
-        if self.help_shown && !is_interrupt(key) {
-            self.help_shown = false;
-            return None;
-        }
-        if self.is_typing_search() && !is_interrupt(key) {
-            self.type_search(key);
-            return None;
-        }
-        if self.files.typed().is_some() && !is_interrupt(key) {
-            self.files.type_key(key);
-            return None;
+        if !is_interrupt(key) {
+            if self.help_shown {
+                self.help_shown = false;
+                return None;
+            }
+            if self.is_typing_search() {
+                self.type_search(key);
+                return None;
+            }
+            if self.files.typed().is_some() {
+                self.files.type_key(key);
+                return None;
+            }
+            if self.command_line.is_some() {
+                return self.type_command(key);
+            }
         }
         let command = command_for(key)?;
         if self.files.is_open() {
             // The help goes over the Files screen, as over anything else; the Heatmap shades a file as it does a
-            // Preview.
-            match command {
-                Command::Help => {
-                    self.help_shown = true;
-                    return None;
-                }
-                Command::ToggleHeatmap => {
-                    self.toggle_heatmap();
-                    return None;
-                }
-                _ => {}
+            // Preview; and the command line is the same on any screen.
+            if let Command::Help | Command::ToggleHeatmap | Command::OpenCommandLine = command {
+                self.execute(command);
+                return None;
             }
             let pressed = self.files.press(command);
             return self.pressed_in_files(pressed);
@@ -1496,8 +1548,18 @@ impl App {
         match command {
             // Nothing to do on screen: `press` hands these to `run`.
             Command::Quit | Command::Refresh => {}
+            Command::OpenCommandLine => self.command_line = Some(String::new()),
             Command::Down => self.views[self.current].cursor.select_next(),
             Command::Up => self.views[self.current].cursor.select_previous(),
+            Command::First => self.views[self.current].cursor.select_first(),
+            Command::Last => {
+                // Not past the end, as `select_last` leaves it until the next draw: before that, the Preview would
+                // take it for no Notification.
+                let shown = self.on_screen().shown(&self.views[self.current]).count();
+                self.views[self.current]
+                    .cursor
+                    .select(Some(shown.saturating_sub(1)));
+            }
             Command::HalfPageDown => {
                 let half_page = (self.rows_on_screen / 2).max(1);
                 self.views[self.current].cursor.scroll_down_by(half_page);
@@ -2008,14 +2070,18 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        // The prompt of a Search, or of what's looked for in a file: only a Search's has completions.
-        let prompt = match (&self.search_prompt, self.files.typed()) {
-            (Some(prompt), _) => Some((self.search_input.as_str(), prompt.completion.as_ref())),
-            (None, Some(typed)) => Some((typed, None)),
-            (None, None) => None,
+        // The prompt of a Search, of what's looked for in a file, or the command line, after the key that opened it:
+        // only a Search's has completions.
+        let prompt = match (&self.search_prompt, self.files.typed(), &self.command_line) {
+            (Some(prompt), _, _) => {
+                Some(('/', self.search_input.as_str(), prompt.completion.as_ref()))
+            }
+            (None, Some(typed), _) => Some(('/', typed, None)),
+            (None, None, Some(typed)) => Some((':', typed.as_str(), None)),
+            (None, None, None) => None,
         };
-        if let Some((typed, completion)) = prompt {
-            let typed = format!("/{typed}");
+        if let Some((opened_by, typed, completion)) = prompt {
+            let typed = format!("{opened_by}{typed}");
             let width = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
             let mut spans = vec![Span::styled(typed, self.theme.prompt)];
@@ -2723,7 +2789,17 @@ mod tests {
         assert_eq!(press(KeyCode::Enter, none), Some(Command::Open));
         assert_eq!(press(KeyCode::Char('j'), none), Some(Command::Down));
         assert_eq!(press(KeyCode::Up, none), Some(Command::Up));
-        assert_eq!(press(KeyCode::Char('q'), none), Some(Command::Quit));
+        assert_eq!(press(KeyCode::Char('g'), none), Some(Command::First));
+        assert_eq!(
+            press(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            Some(Command::Last)
+        );
+        // Vim's `:q` quits, not `q`.
+        assert_eq!(press(KeyCode::Char('q'), none), None);
+        assert_eq!(
+            press(KeyCode::Char(':'), KeyModifiers::SHIFT),
+            Some(Command::OpenCommandLine)
+        );
         assert_eq!(press(KeyCode::Char('r'), none), Some(Command::Refresh));
         assert_eq!(press(KeyCode::Char('/'), none), Some(Command::Search));
         assert_eq!(press(KeyCode::Esc, none), Some(Command::Clear));
@@ -4670,8 +4746,8 @@ mod tests {
     fn keys_go_to_the_files_prompt_while_typing() {
         let mut app = app_with_needles(&[]);
 
-        // Not quitting, nor the next file, nor back.
-        look_for(&mut app, "qjf");
+        // Not the command line, nor the next file, nor back.
+        look_for(&mut app, ":jf");
 
         assert!(app.files.is_open());
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
@@ -4679,13 +4755,13 @@ mod tests {
             lines.iter().any(|line| line.starts_with("┌ long.txt")),
             "{lines:#?}"
         );
-        assert!(lines[lines.len() - 1].starts_with("/qjf "), "{lines:#?}");
+        assert!(lines[lines.len() - 1].starts_with("/:jf "), "{lines:#?}");
 
         // Nor half a page down.
         assert!(app.press(key_named("Ctrl-D")).is_none());
 
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
-        assert!(lines[lines.len() - 1].starts_with("/qjf "), "{lines:#?}");
+        assert!(lines[lines.len() - 1].starts_with("/:jf "), "{lines:#?}");
         assert!(matches!(
             app.press(key_named("Ctrl-C")),
             Some(Outcome::Quit)
@@ -4829,6 +4905,27 @@ mod tests {
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn g_and_shift_g_go_to_the_first_and_last_file() {
+        let files = changed_files();
+        let mut app = app_with_files(files.clone());
+        let url_of = |file: &ChangedFile| {
+            Some(format!(
+                "https://github.com/wcgw/ghd/pull/1/files#{}",
+                file.anchor()
+            ))
+        };
+
+        app.press(key_named("G"));
+
+        // At once, not only once drawn: fetching goes by the selected file before that.
+        assert_eq!(app.files.selected_url(), url_of(&files[3]));
+
+        app.press(key_named("g"));
+
+        assert_eq!(app.files.selected_url(), url_of(&files[0]));
     }
 
     #[test]
@@ -5080,6 +5177,34 @@ mod tests {
         screen(&mut app);
 
         assert_eq!(cursor_title(&app), Some("Notification 6"));
+    }
+
+    #[test]
+    fn g_and_shift_g_go_to_the_first_and_last_row() {
+        let mut app = app_with_many(30, 10);
+
+        app.press(key_named("G"));
+
+        // At once, not only once drawn: the Preview goes by the Notification at the cursor before that.
+        assert_eq!(cursor_title(&app), Some("Notification 29"));
+        let lines = screen_of(&mut app, 13);
+        assert!(lines[10].contains("Notification 29"), "{lines:#?}");
+
+        app.press(key_named("g"));
+
+        assert_eq!(cursor_title(&app), Some("Notification 0"));
+        let lines = screen_of(&mut app, 13);
+        assert!(lines[1].contains("Notification 0"), "{lines:#?}");
+    }
+
+    #[test]
+    fn shift_g_goes_to_the_last_row_shown() {
+        let mut app = app_with_many(30, 10);
+        app.set_search("1".to_owned());
+
+        app.press(key_named("G"));
+
+        assert_eq!(cursor_title(&app), Some("Notification 21"));
     }
 
     #[test]
@@ -5524,7 +5649,7 @@ mod tests {
         let none = KeyModifiers::NONE;
 
         assert!(press(&mut app, KeyCode::Char('/'), none).is_none());
-        for character in ['q', 'e', 'r', '/'] {
+        for character in [':', 'e', 'r', '/'] {
             assert!(
                 press(&mut app, KeyCode::Char(character), none).is_none(),
                 "{character}"
@@ -5552,6 +5677,118 @@ mod tests {
         let outcome = app.press(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert!(matches!(outcome, Some(Outcome::Quit)));
+    }
+
+    /// Opens the command line with `:` and types `text` on it, each key press leaving nothing for `run` to do.
+    fn type_command_line(app: &mut App, text: &str) {
+        for character in format!(":{text}").chars() {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert!(app.press(key).is_none(), "{character}");
+        }
+    }
+
+    // Enter goes to the command line itself in these tests: pressed with it closed, it would open a browser.
+
+    #[test]
+    fn colon_q_quits_as_in_vim() {
+        for command in [
+            "q", "quit", "q!", "quit!", "qa", "qall", "qa!", "qall!", " q ",
+        ] {
+            let mut app = app();
+            type_command_line(&mut app, command);
+
+            let lines = screen(&mut app);
+            assert!(lines[4].starts_with(&format!(":{command}")), "{lines:#?}");
+            assert!(
+                matches!(app.type_command(key_named("Enter")), Some(Outcome::Quit)),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn colon_q_quits_from_the_files_screen_too() {
+        let mut app = app_with_files(changed_files());
+
+        type_command_line(&mut app, "q");
+
+        assert!(app.files.is_open());
+        assert!(matches!(
+            app.type_command(key_named("Enter")),
+            Some(Outcome::Quit)
+        ));
+    }
+
+    #[test]
+    fn what_isnt_a_command_says_so() {
+        let mut app = app();
+        type_command_line(&mut app, "bad");
+
+        assert!(app.type_command(key_named("Enter")).is_none());
+
+        assert!(app.command_line.is_none());
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with("Not a command: bad "), "{lines:#?}");
+    }
+
+    #[test]
+    fn nothing_typed_on_the_command_line_does_nothing() {
+        let mut app = app();
+        type_command_line(&mut app, " ");
+
+        assert!(app.type_command(key_named("Enter")).is_none());
+
+        assert!(app.command_line.is_none());
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn keys_go_to_the_command_line_while_typing() {
+        let mut app = app();
+
+        // Not the next Notification, nor marking Done, nor a Search, nor the help.
+        type_command_line(&mut app, "je/?");
+
+        assert_eq!(cursor_title(&app), Some("Add polling"));
+        assert!(!app.is_typing_search());
+        assert!(!app.help_shown);
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Add polling", "Old news"]);
+        assert!(lines[4].starts_with(":je/? "), "{lines:#?}");
+
+        // Nor half a page down, nor a `d`.
+        assert!(app.press(key_named("Ctrl-D")).is_none());
+
+        assert_eq!(cursor_title(&app), Some("Add polling"));
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with(":je/? "), "{lines:#?}");
+        assert!(matches!(
+            app.press(key_named("Ctrl-C")),
+            Some(Outcome::Quit)
+        ));
+    }
+
+    #[test]
+    fn esc_or_backspace_with_nothing_typed_closes_the_command_line() {
+        let mut app = app();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+
+        type_command_line(&mut app, "q");
+        assert!(app.press(key_named("Esc")).is_none());
+
+        assert!(app.press(key_named("j")).is_none());
+        assert_eq!(cursor_title(&app), Some("Old news"), "moves again");
+
+        type_command_line(&mut app, "q");
+        assert!(app.press(backspace).is_none());
+
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with(": "), "still open: {lines:#?}");
+
+        assert!(app.press(backspace).is_none());
+
+        assert!(app.press(key_named("k")).is_none());
+        assert_eq!(cursor_title(&app), Some("Add polling"), "moves again");
     }
 
     #[test]
@@ -5705,6 +5942,8 @@ mod tests {
                 continue;
             }
             for label in help.keys.split_whitespace() {
+                // A command is typed after the key that opens the command line.
+                let label = if label.starts_with(':') { ":" } else { label };
                 let command = command_for(key_named(label)).expect("a known key");
                 assert!(
                     commands.contains(&command),
@@ -5716,11 +5955,17 @@ mod tests {
 
     #[test]
     fn help_lists_every_command() {
-        let listed = |command: Command| {
-            COMMAND_HELP.iter().any(|(commands, _)| {
+        // On a line for its command, named in that line's keys.
+        let listed = |label: &str, command: Command| {
+            COMMAND_HELP.iter().any(|(commands, help)| {
                 commands
                     .iter()
                     .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
+                    && help.keys.split_whitespace().any(|name| {
+                        // As the help names some keys: `1` in `1–9`, and `:` with the command typed after it.
+                        name.split('–').next() == Some(label)
+                            || (label == ":" && name.starts_with(':'))
+                    })
             })
         };
         for label in [
@@ -5738,6 +5983,8 @@ mod tests {
             "k",
             "↓",
             "↑",
+            "g",
+            "G",
             "Tab",
             "Shift-Tab",
             "1",
@@ -5751,13 +5998,16 @@ mod tests {
             "Esc",
             "r",
             "?",
-            "q",
+            ":",
             "Ctrl-C",
             "Ctrl-D",
             "Ctrl-U",
         ] {
             let command = command_for(key_named(label)).expect("a known key");
-            assert!(listed(command), "{command:?} isn't in the help");
+            assert!(
+                listed(label, command),
+                "{label} ({command:?}) isn't in the help"
+            );
         }
     }
 
@@ -5803,7 +6053,7 @@ mod tests {
             .collect();
         assert!(
             lines.iter().any(|line| line.contains(&format!(
-                "{:14}  mark Done; in the Done list, back to the Inbox",
+                "{:16}  mark Done; in the Done list, back to the Inbox",
                 "e"
             ))),
             "{lines:#?}"
@@ -5811,7 +6061,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Tab  Shift-Tab  complete a field's name")),
+                .any(|line| line
+                    .contains(&format!("{:16}  complete a field's name", "Tab  Shift-Tab"))),
             "{lines:#?}"
         );
         assert!(

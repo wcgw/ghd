@@ -94,7 +94,7 @@ either, different ones must all match. The details are in [the decision record](
 
 | Keys | What they do |
 |---|---|
-| `j` `k` `↓` `↑` | move to the next or previous notification |
+| `j` `k` `↓` `↑` `g` `G` | move to the next, previous, first or last notification |
 | `Ctrl-D` `Ctrl-U` | move half a page down or up |
 | `Space` `A` | select or not, and move down; all shown, or none |
 | `Tab` `Shift-Tab` | show the next or previous View |
@@ -111,7 +111,7 @@ either, different ones must all match. The details are in [the decision record](
 | `Esc` | clear the selection, or else the search |
 | `r` | fetch the Inbox now |
 | `?` | show these keys |
-| `q` `Ctrl-C` | quit |
+| `:q` `Ctrl-C` | quit |
 
 The mouse wheel scrolls the Preview, or the file on the Files screen, while it shows, and otherwise moves through the
 list. As ghd takes the mouse's clicks too, most terminals select text with Shift held.
