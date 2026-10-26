@@ -12,6 +12,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
+use super::history::History;
 use super::pane_search::PaneSearch;
 use super::{
     Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, Step, Wheel, counted,
@@ -135,10 +136,11 @@ impl Files {
         self.screen.as_ref()?.search.typed()
     }
 
-    /// Edits what's looked for in the selected file with `key`, as [`PaneSearch::type_key`] does.
-    pub(super) fn type_key(&mut self, key: KeyEvent) {
+    /// Edits what's looked for in the selected file with `key`, going through `history` too, as
+    /// [`PaneSearch::type_key`] does.
+    pub(super) fn type_key(&mut self, key: KeyEvent, history: &mut History) {
         if let Some(screen) = &mut self.screen {
-            screen.search.type_key(key, &mut screen.scroll);
+            screen.search.type_key(key, &mut screen.scroll, history);
         }
     }
 

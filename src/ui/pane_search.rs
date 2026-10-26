@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use super::history::{History, Recall};
 use super::{Scrolled, Step};
 use crate::theme::Theme;
 
@@ -51,6 +52,8 @@ struct Prompt {
     /// How far down the pane was scrolled when the prompt opened: what's typed is looked for from there, and the pane
     /// goes back there if the user cancels.
     scrolled_by: u16,
+    /// Where the user is in the searches entered before, while they go through them with Up and Down.
+    recall: Option<Recall>,
 }
 
 impl PaneSearch {
@@ -65,16 +68,22 @@ impl PaneSearch {
             text_before: self.text.clone(),
             current_before: self.current.clone(),
             scrolled_by: scroll.by,
+            recall: None,
         });
     }
 
     /// Edits what's looked for with `key`, on the pane `scroll` scrolls. A character adds to it and Backspace takes
-    /// the last one off, each time looking for it again from where the pane was when the prompt opened; Enter closes
-    /// the prompt, and Esc closes it, putting back what was looked for before and where the pane was.
-    pub(super) fn type_key(&mut self, key: KeyEvent, scroll: &mut Scrolled) {
-        let Some(scrolled_by) = self.prompt.as_ref().map(|prompt| prompt.scrolled_by) else {
+    /// the last one off, and Up and Down put in the searches entered before, from `history`, each time looking for
+    /// it again from where the pane was when the prompt opened; Enter closes the prompt, keeping what's looked for in
+    /// `history`, and Esc closes it, putting back what was looked for before and where the pane was.
+    pub(super) fn type_key(&mut self, key: KeyEvent, scroll: &mut Scrolled, history: &mut History) {
+        let Some(prompt) = &mut self.prompt else {
             return;
         };
+        let scrolled_by = prompt.scrolled_by;
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            prompt.recall = None;
+        }
         match key.code {
             KeyCode::Char(character)
                 if !key
@@ -86,7 +95,19 @@ impl PaneSearch {
             KeyCode::Backspace => {
                 self.text.pop();
             }
+            KeyCode::Up | KeyCode::Down => {
+                let step = if key.code == KeyCode::Up {
+                    Step::Previous
+                } else {
+                    Step::Next
+                };
+                let Some(text) = history.recall(&mut prompt.recall, &self.text, step) else {
+                    return;
+                };
+                self.text = text;
+            }
             KeyCode::Enter => {
+                history.add(&self.text);
                 self.prompt = None;
                 return;
             }

@@ -1,6 +1,7 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
 mod files;
+mod history;
 mod pane_search;
 
 use std::borrow::Cow;
@@ -44,6 +45,7 @@ use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
 use crate::theme::Theme;
 use crate::ui::files::{Files, Pressed};
+use crate::ui::history::{History, Recall};
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: u16 = 32;
@@ -569,20 +571,20 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
 const SELECTION_HELP: &str =
     ":select F or :unselect F what filter F matches; o, I, e act on all selected.";
 
-/// The keys that work differently in the search prompt, Tab and Shift-Tab on the command line too, as the help lists
-/// them after the commands.
+/// The keys that work differently in the search prompt, Tab, Shift-Tab, Up and Down on the command line too, as the
+/// help lists them after the commands.
 const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
     KeyHelp {
         keys: "Tab  Shift-Tab",
         does: "complete the word typed, or the next or previous one",
     },
     KeyHelp {
-        keys: "Enter",
-        does: "keep the search",
+        keys: "↑  ↓",
+        does: "go back or forth through those entered before",
     },
     KeyHelp {
-        keys: "Esc",
-        does: "put back the search there was before",
+        keys: "Enter  Esc",
+        does: "keep the search, or put back the one there was before",
     },
 ];
 
@@ -700,6 +702,10 @@ struct App {
     search_prompt: Option<SearchPrompt>,
     /// The command line, while it's open.
     command_line: Option<CommandLine>,
+    /// The searches entered before, of a View or in a file.
+    search_history: History,
+    /// The commands entered before.
+    command_history: History,
     /// The Selection, by thread: only ever threads the Inbox holds, whichever View shows them.
     selection: HashSet<ThreadId>,
     /// The help is shown over the View.
@@ -848,6 +854,8 @@ struct SearchPrompt {
     input_before: String,
     /// The ways to complete the word being typed, while the user goes through them with Tab and Shift-Tab.
     completion: Option<Completion>,
+    /// Where the user is in the searches entered before, while they go through them with Up and Down.
+    recall: Option<Recall>,
 }
 
 /// The command line, while it's open.
@@ -857,6 +865,8 @@ struct CommandLine {
     typed: String,
     /// The ways to complete what's typed, while the user goes through them with Tab and Shift-Tab.
     completion: Option<Completion>,
+    /// Where the user is in the commands entered before, while they go through them with Up and Down.
+    recall: Option<Recall>,
 }
 
 /// The commands completion offers on the command line, by their whole names: adding a command to
@@ -887,6 +897,21 @@ fn command_line_completions(
                 .collect()
         }
         Some(_) => Vec::new(),
+    }
+}
+
+/// Forgets the ways to complete what's typed in a prompt, and where the user is in what was entered before, unless
+/// `key` goes on through them: Tab and Shift-Tab through the one, Up and Down through the other.
+fn forget_going_through(
+    key: KeyEvent,
+    completion: &mut Option<Completion>,
+    recall: &mut Option<Recall>,
+) {
+    if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        *completion = None;
+    }
+    if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        *recall = None;
     }
 }
 
@@ -997,6 +1022,8 @@ impl App {
             search: Search::default(),
             search_prompt: None,
             command_line: None,
+            search_history: History::default(),
+            command_history: History::default(),
             selection: HashSet::new(),
             help_shown: false,
             rows_on_screen: 0,
@@ -1074,17 +1101,17 @@ impl App {
 
     /// Edits the Search in the prompt with `key`, the View on screen narrowing as it changes. A character adds to
     /// it and Backspace takes the last one off; Tab and Shift-Tab complete the word being typed, going through the
-    /// ways to complete it when pressed again; Enter closes the prompt, keeping the Search, and Esc closes it,
-    /// putting back the Search there was before.
+    /// ways to complete it when pressed again; Up and Down go back and forth through the searches entered before;
+    /// Enter closes the prompt, keeping the Search, and Esc closes it, putting back the Search there was before.
     fn type_search(&mut self, key: KeyEvent) {
-        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-            && let Some(prompt) = &mut self.search_prompt
-        {
-            prompt.completion = None;
+        if let Some(prompt) = &mut self.search_prompt {
+            forget_going_through(key, &mut prompt.completion, &mut prompt.recall);
         }
         match key.code {
             KeyCode::Tab => self.complete(Step::Next),
             KeyCode::BackTab => self.complete(Step::Previous),
+            KeyCode::Up => self.recall_search(Step::Previous),
+            KeyCode::Down => self.recall_search(Step::Next),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -1099,13 +1126,29 @@ impl App {
                 input.pop();
                 self.set_search(input);
             }
-            KeyCode::Enter => self.search_prompt = None,
+            KeyCode::Enter => {
+                self.search_history.add(&self.search_input);
+                self.search_prompt = None;
+            }
             KeyCode::Esc => {
                 if let Some(prompt) = self.search_prompt.take() {
                     self.set_search(prompt.input_before);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Puts the search entered before or after the one in the prompt in it, as [`History::recall`] goes through them.
+    fn recall_search(&mut self, step: Step) {
+        let Some(prompt) = &mut self.search_prompt else {
+            return;
+        };
+        if let Some(input) =
+            self.search_history
+                .recall(&mut prompt.recall, &self.search_input, step)
+        {
+            self.set_search(input);
         }
     }
 
@@ -1125,16 +1168,17 @@ impl App {
 
     /// Edits the command line with `key`, as in Vim: a character adds to it, and Backspace takes the last one off or,
     /// with nothing typed, closes it; Tab and Shift-Tab complete the command's name, or the qualifier being typed in
-    /// its Filter, going through the ways to complete it when pressed again; Enter closes it and carries out the
-    /// command typed, and Esc closes it. Returns what's left for `run` to do.
+    /// its Filter, going through the ways to complete it when pressed again; Up and Down go back and forth through
+    /// the commands entered before; Enter closes it and carries out the command typed, and Esc closes it. Returns
+    /// what's left for `run` to do.
     fn type_command(&mut self, key: KeyEvent) -> Option<Outcome> {
         let line = self.command_line.as_mut()?;
-        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            line.completion = None;
-        }
+        forget_going_through(key, &mut line.completion, &mut line.recall);
         match key.code {
             KeyCode::Tab => self.complete_command(Step::Next),
             KeyCode::BackTab => self.complete_command(Step::Previous),
+            KeyCode::Up => self.recall_command(Step::Previous),
+            KeyCode::Down => self.recall_command(Step::Next),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -1150,12 +1194,27 @@ impl App {
             KeyCode::Enter => {
                 let typed = mem::take(&mut line.typed);
                 self.command_line = None;
+                self.command_history.add(&typed);
                 return self.carry_out(&typed);
             }
             KeyCode::Esc => self.command_line = None,
             _ => {}
         }
         None
+    }
+
+    /// Puts the command entered before or after the one on the command line on it, as [`History::recall`] goes through
+    /// them.
+    fn recall_command(&mut self, step: Step) {
+        let Some(line) = &mut self.command_line else {
+            return;
+        };
+        if let Some(typed) = self
+            .command_history
+            .recall(&mut line.recall, &line.typed, step)
+        {
+            line.typed = typed;
+        }
     }
 
     /// Completes what's typed on the command line as [`App::complete`] does the Search.
@@ -1619,7 +1678,7 @@ impl App {
                 return None;
             }
             if self.files.typed().is_some() {
-                self.files.type_key(key);
+                self.files.type_key(key, &mut self.search_history);
                 return None;
             }
             if self.command_line.is_some() {
@@ -1787,6 +1846,7 @@ impl App {
                 self.search_prompt = Some(SearchPrompt {
                     input_before: self.search_input.clone(),
                     completion: None,
+                    recall: None,
                 });
             }
             Command::Clear => {
@@ -2544,7 +2604,7 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     lines.extend([
         Line::styled(SELECTION_HELP, theme.help_heading),
         Line::styled(
-            "In the search prompt (Tab and Shift-Tab after : too):",
+            "In the search prompt (Tab, Shift-Tab, ↑ and ↓ after : too):",
             theme.help_heading,
         ),
     ]);
@@ -4860,6 +4920,42 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_go_through_the_searches_in_a_file_and_of_a_view() {
+        let mut app = app_with_needles(&[40]);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+        // Back to the list, to search it, and to the files again.
+        app.press(key_named("Esc"));
+        app.press(key_named("Esc"));
+        assert!(!app.files.is_open());
+        app.execute(Command::Search);
+        type_text(&mut app, "polling");
+        type_key(&mut app, KeyCode::Enter);
+        app.press(key_named("f"));
+        assert!(app.files.is_open());
+        look_for(&mut app, "");
+
+        assert!(app.press(key_named("↑")).is_none());
+        assert_eq!(app.files.typed(), Some("polling"), "a View's");
+        app.press(key_named("↑"));
+        assert_eq!(app.files.typed(), Some("needle"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(file_pane(&lines).0.contains("Line 40 needle"), "{lines:#?}");
+        app.press(key_named("↓"));
+        app.press(key_named("↓"));
+        assert_eq!(app.files.typed(), Some(""), "what it held, past the newest");
+
+        app.press(key_named("↑"));
+        app.press(key_named("x"));
+        app.press(key_named("↑"));
+        assert_eq!(
+            app.files.typed(),
+            Some("polling"),
+            "from the newest again, once edited"
+        );
+    }
+
+    #[test]
     fn n_does_nothing_before_anything_is_looked_for() {
         let mut app = app_with_needles(&[40]);
 
@@ -6319,6 +6415,41 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_go_through_the_commands_entered_before() {
+        let mut app = app_with_states();
+        for command in ["bad", "select is:closed"] {
+            type_command_line(&mut app, command);
+            app.type_command(key_named("Enter"));
+        }
+        type_command_line(&mut app, "xyz");
+        app.type_command(key_named("Esc"));
+        type_command_line(&mut app, "");
+        let typed = |app: &App| app.command_line.as_ref().map(|line| line.typed.clone());
+
+        assert!(app.press(key_named("↑")).is_none());
+        assert_eq!(typed(&app).as_deref(), Some("select is:closed"));
+        assert_eq!(screen(&mut app)[4].trim_end(), ":select is:closed");
+        app.type_command(key_named("↑"));
+        assert_eq!(typed(&app).as_deref(), Some("bad"));
+        app.type_command(key_named("↓"));
+        app.type_command(key_named("↓"));
+        assert_eq!(
+            typed(&app).as_deref(),
+            Some(""),
+            "what it held, past the newest"
+        );
+
+        app.type_command(key_named("↑"));
+        type_on_command_line(&mut app, " -is:merged");
+        app.type_command(key_named("↑"));
+        assert_eq!(
+            typed(&app).as_deref(),
+            Some("select is:closed"),
+            "from the newest again, once edited"
+        );
+    }
+
+    #[test]
     fn keys_go_to_the_command_line_while_typing() {
         let mut app = app();
 
@@ -6465,6 +6596,37 @@ mod tests {
         assert_eq!(app.search_input, "poll");
         assert!(app.is_typing_search());
         assert_eq!(screen(&mut app)[4].trim_end(), "/poll");
+    }
+
+    #[test]
+    fn up_and_down_go_through_the_searches_entered_before() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "old");
+        type_key(&mut app, KeyCode::Enter);
+        app.execute(Command::Search);
+        for _ in 0.."old".len() {
+            type_key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "add");
+        type_key(&mut app, KeyCode::Enter);
+        app.execute(Command::Search);
+        type_text(&mut app, " cancelled");
+        type_key(&mut app, KeyCode::Esc);
+        app.execute(Command::Search);
+
+        assert!(app.press(key_named("↑")).is_none());
+        assert_eq!(
+            app.search_input, "old",
+            "past what the prompt holds, and what wasn't kept"
+        );
+        assert!(app.is_typing_search());
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+        type_key(&mut app, KeyCode::Up);
+        assert_eq!(app.search_input, "old", "nothing older");
+        type_key(&mut app, KeyCode::Down);
+        assert_eq!(app.search_input, "add", "what it held, past the newest");
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
     }
 
     #[test]
@@ -6648,7 +6810,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("put back the search there was before")),
+                .any(|line| line.contains("put back the one there was before")),
             "the last line: {lines:#?}"
         );
     }
