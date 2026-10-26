@@ -33,8 +33,9 @@ a trip to the browser.
 
   ![voight's Heatmap of a comment](docs/screenshots/heatmap.png)
 
-- **Triage**: mark notifications read (`I`) or Done (`e`), one at a time or a selection of them; search the View on
-  screen (`/`), show only what's unread (`u`), and look back at what's Done (`D`).
+- **Triage**: mark notifications read (`I`) or Done (`e`), one at a time or a selection of them, made by hand or
+  with a filter (`:select is:closed` selects what's merged or closed); search the View on screen (`/`), show only
+  what's unread (`u`), and look back at what's Done (`D`).
 
 ## Install
 
@@ -97,6 +98,7 @@ either, different ones must all match. The details are in [the decision record](
 | `j` `k` `↓` `↑` `g` `G` | move to the next, previous, first or last notification |
 | `Ctrl-D` `Ctrl-U` | move half a page down or up |
 | `Space` `A` | select or not, and move down; all shown, or none |
+| `:select` `:unselect` *filter* | select, or unselect, the notifications shown that the [filter](#configuration) matches; all shown, with no filter |
 | `Tab` `Shift-Tab` | show the next or previous View |
 | `1`–`9` | show a View by its place in the tabs |
 | `o` `Enter` | open in the browser, which marks read |

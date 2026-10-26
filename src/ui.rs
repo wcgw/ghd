@@ -31,6 +31,7 @@ use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::done::DoneMarks;
 use crate::fetched;
+use crate::filter::Filter;
 use crate::github::{GitHub, PreviewRequest};
 use crate::heatmap;
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
@@ -381,7 +382,7 @@ async fn fetch_preview(github: &GitHub, wanted: WantedPreview) -> PreviewFetched
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Quit,
-    /// Opens the command line, to type a command into as in Vim: `q` to quit.
+    /// Opens the command line, to type a command into as in Vim: `q` to quit, or `select` or `unselect` and a Filter.
     OpenCommandLine,
     /// Fetches the whole Inbox now, rather than at the next poll.
     Refresh,
@@ -563,8 +564,9 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     ),
 ];
 
-/// What the help says about acting on the Selection, after the commands.
-const SELECTION_HELP: &str = "With a selection, o, I and e act on all of it.";
+/// What the help says about making a Selection with a Filter, and acting on it, after the commands.
+const SELECTION_HELP: &str =
+    ":select F or :unselect F what filter F matches; o, I, e act on all selected.";
 
 /// The keys that work differently in the search prompt, as the help lists them after the commands.
 const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
@@ -1061,18 +1063,76 @@ impl App {
         None
     }
 
-    /// Carries out the command `typed` on the command line: Vim's for quitting, the only one so far; says so if it's
-    /// none. Returns what's left for `run` to do.
+    /// Carries out the command `typed` on the command line: Vim's for quitting, or `select` or `unselect` and a
+    /// Filter; says so if it's none. Returns what's left for `run` to do.
     fn carry_out(&mut self, typed: &str) -> Option<Outcome> {
-        match typed.trim() {
-            "" => None,
+        let typed = typed.trim();
+        let (name, argument) = typed.split_once(char::is_whitespace).unwrap_or((typed, ""));
+        match name {
+            "" => {}
             // ghd has nothing to write, nor other windows to close: they all just quit.
-            "q" | "quit" | "q!" | "quit!" | "qa" | "qall" | "qa!" | "qall!" => Some(Outcome::Quit),
-            typed => {
-                self.status = Some(StatusMessage::Error(format!("Not a command: {typed}")));
-                None
+            "q" | "quit" | "q!" | "quit!" | "qa" | "qall" | "qa!" | "qall!"
+                if argument.is_empty() =>
+            {
+                return Some(Outcome::Quit);
             }
+            // Saying how many it changed, not how many match: some may have been selected, or not, already.
+            "select" => {
+                if let Some(matching) = self.shown_matching(argument) {
+                    let before = self.selection.len();
+                    self.selection.extend(matching);
+                    let selected = self.selection.len() - before;
+                    self.status = Some(StatusMessage::Info(format!(
+                        "Selected {}",
+                        counted(selected as u64, "Notification")
+                    )));
+                }
+            }
+            "unselect" => {
+                if let Some(matching) = self.shown_matching(argument) {
+                    let before = self.selection.len();
+                    for thread in &matching {
+                        self.selection.remove(thread);
+                    }
+                    let unselected = before - self.selection.len();
+                    self.status = Some(StatusMessage::Info(format!(
+                        "Unselected {}",
+                        counted(unselected as u64, "Notification")
+                    )));
+                }
+            }
+            _ => self.status = Some(StatusMessage::Error(format!("Not a command: {typed}"))),
         }
+        None
+    }
+
+    /// The Notifications the View on screen shows that `filter` matches, all of them if it's empty. `None` if
+    /// `filter` isn't one, or while the Files screen is open, as the status line then says.
+    fn shown_matching(&mut self, filter: &str) -> Option<Vec<ThreadId>> {
+        if self.files.is_open() {
+            self.status = Some(StatusMessage::Info(
+                "Selecting is for the list, not the Files screen".to_owned(),
+            ));
+            return None;
+        }
+        let filter: Filter = match filter.parse() {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.status = Some(StatusMessage::Error(format!(
+                    "Not a filter: {}",
+                    error.problem()
+                )));
+                return None;
+            }
+        };
+        let on_screen = self.on_screen();
+        Some(
+            on_screen
+                .shown(&self.views[self.current])
+                .filter(|n| filter.matches(n, on_screen.states.get(n)))
+                .map(|n| n.thread)
+                .collect(),
+        )
     }
 
     /// The Subjects whose State to look up now: the ones the latest Inbox changed, once after it arrives. Empty
@@ -2609,7 +2669,6 @@ mod tests {
 
     use super::*;
     use crate::files::{ChangedFile, FileStatus, FileText};
-    use crate::filter::Filter;
     use crate::inbox::{ApiPaths, Reason, ThreadId};
     use crate::state::Known;
 
@@ -5834,6 +5893,136 @@ mod tests {
     }
 
     #[test]
+    fn a_command_is_the_whole_of_its_first_word() {
+        for typed in ["q all", "selected is:closed"] {
+            let mut app = app();
+            type_command_line(&mut app, typed);
+
+            assert!(app.type_command(key_named("Enter")).is_none(), "{typed}");
+
+            let lines = screen(&mut app);
+            assert!(
+                lines[4].starts_with(&format!("Not a command: {typed} ")),
+                "{lines:#?}"
+            );
+        }
+    }
+
+    /// [`app`], "Add polling" merged and "Old news" open.
+    fn app_with_states() -> App {
+        let mut app = app();
+        let asked = app.states_to_look_up();
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([
+                (ThreadId(1), SubjectState::Merged),
+                (ThreadId(2), SubjectState::Open),
+            ])),
+        });
+        app
+    }
+
+    /// Types `command` on the command line, and enters it.
+    fn enter_command(app: &mut App, command: &str) {
+        type_command_line(app, command);
+        assert!(app.type_command(key_named("Enter")).is_none(), "{command}");
+    }
+
+    #[test]
+    fn colon_select_adds_what_a_filter_matches_to_the_selection() {
+        let mut app = app_with_states();
+
+        enter_command(&mut app, "select is:closed");
+
+        assert_eq!(selected_titles(&app), ["Add polling"], "merged is closed");
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Selected 1 Notification "),
+            "{lines:#?}"
+        );
+
+        enter_command(&mut app, "select reason:subscribed");
+
+        assert_eq!(selected_titles(&app), ["Add polling", "Old news"], "added");
+
+        enter_command(&mut app, "select is:closed");
+
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Selected 0 Notifications "),
+            "none more: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn colon_unselect_takes_what_a_filter_matches_out_of_the_selection() {
+        let mut app = app_with_states();
+        app.press(key_named("A"));
+
+        enter_command(&mut app, "unselect -is:closed");
+
+        assert_eq!(selected_titles(&app), ["Add polling"]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Unselected 1 Notification "),
+            "{lines:#?}"
+        );
+
+        enter_command(&mut app, "unselect");
+
+        assert_eq!(selected_titles(&app), [] as [&str; 0]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Unselected 1 Notification "),
+            "only the one still selected: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn colon_select_picks_among_the_notifications_shown_all_with_no_filter() {
+        let mut app = app_with_states();
+        app.set_search("old".to_owned());
+
+        enter_command(&mut app, "select");
+
+        assert_eq!(selected_titles(&app), ["Old news"]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Selected 1 Notification "),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn what_isnt_a_filter_says_so_and_selects_nothing() {
+        let mut app = app_with_states();
+
+        enter_command(&mut app, "select is:closd");
+
+        assert_eq!(selected_titles(&app), [] as [&str; 0]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Not a filter: unknown `is:` value `closd` "),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn colon_select_does_nothing_on_the_files_screen() {
+        let mut app = app_with_files(changed_files());
+
+        enter_command(&mut app, "select");
+
+        assert!(app.files.is_open());
+        assert!(app.selection.is_empty());
+        assert!(
+            matches!(&app.status, Some(StatusMessage::Info(said)) if said.contains("not the Files screen")),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
     fn keys_go_to_the_command_line_while_typing() {
         let mut app = app();
 
@@ -6155,6 +6344,10 @@ mod tests {
                 .any(|line| line
                     .contains(&format!("{:16}  complete a field's name", "Tab  Shift-Tab"))),
             "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(SELECTION_HELP)),
+            "the widest line, whole: {lines:#?}"
         );
         assert!(
             lines

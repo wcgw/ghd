@@ -266,6 +266,13 @@ pub struct FilterError {
     problem: String,
 }
 
+impl FilterError {
+    /// What's wrong, as one line, without the filter it's in.
+    pub fn problem(&self) -> &str {
+        &self.problem
+    }
+}
+
 /// The problem, then the filter with the wrong part underlined on the next line.
 impl fmt::Display for FilterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
