@@ -5,6 +5,7 @@ mod pane_search;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::time::Duration;
 use std::{fmt, io, mem, panic};
 
@@ -573,7 +574,7 @@ const SELECTION_HELP: &str =
 const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
     KeyHelp {
         keys: "Tab  Shift-Tab",
-        does: "complete a name, or the next or previous one",
+        does: "complete the word typed, or the next or previous one",
     },
     KeyHelp {
         keys: "Enter",
@@ -864,8 +865,12 @@ const COMMAND_NAMES: [&str; 3] = ["quit", "select", "unselect"];
 
 /// The ways to complete what's typed on the command line, each as the whole of it completed, in the order to offer
 /// them: while its first word is typed, the commands that word could be the start of; after `select` or `unselect`,
-/// the qualifiers its last word could start, as [`filter::completions`] gives them. None otherwise.
-fn command_line_completions(typed: &str) -> Vec<String> {
+/// the qualifiers its last word could start, or their values that would match any of the Notifications `shown`, as
+/// [`filter::completions`] gives them. None otherwise.
+fn command_line_completions(
+    typed: &str,
+    shown: &[(&Notification, Option<SubjectState>)],
+) -> Vec<String> {
     let name_start = typed.len() - typed.trim_start().len();
     let (before, rest) = typed.split_at(name_start);
     match rest.split_once(char::is_whitespace) {
@@ -876,7 +881,7 @@ fn command_line_completions(typed: &str) -> Vec<String> {
             .collect(),
         Some((name @ ("select" | "unselect"), _)) => {
             let (command, filter) = typed.split_at(name_start + name.len());
-            filter::completions(filter)
+            filter::completions(filter, shown)
                 .into_iter()
                 .map(|completed| format!("{command}{completed}"))
                 .collect()
@@ -921,6 +926,36 @@ impl Completion {
             completion.insert(Self { inputs, at })
         };
         Some(completion.inputs[completion.at].clone())
+    }
+
+    /// The words to go through, as the status line shows them: the last word of each input.
+    fn words(&self) -> impl Iterator<Item = &str> {
+        self.inputs
+            .iter()
+            .map(|input| input.rsplit(char::is_whitespace).next().unwrap_or(input))
+    }
+
+    /// Which of the words the status line shows in `room` columns, a space after each: all of them if they fit, or
+    /// else the run of them that the one in the input is in, as many as fit with a `… ` before them and a `…` after.
+    fn shown(&self, room: usize) -> Range<usize> {
+        let widths: Vec<usize> = self.words().map(|word| word.chars().count() + 1).collect();
+        if widths.iter().sum::<usize>() <= room {
+            return 0..widths.len();
+        }
+        let room = room.saturating_sub("… …".chars().count());
+        let mut start = 0;
+        let mut used = 0;
+        for (index, width) in widths.iter().enumerate() {
+            if used + width > room && index > start {
+                if self.at < index {
+                    return start..index;
+                }
+                start = index;
+                used = 0;
+            }
+            used += width;
+        }
+        start..widths.len()
     }
 }
 
@@ -1125,12 +1160,19 @@ impl App {
 
     /// Completes what's typed on the command line as [`App::complete`] does the Search.
     fn complete_command(&mut self, step: Step) {
+        // Not `self.on_screen()`: it would borrow the command line too.
+        let on_screen = OnScreen::new(&self.inbox, self.showing_done, &self.search, &self.states);
+        let shown_view = &self.views[self.current];
         let Some(line) = &mut self.command_line else {
             return;
         };
         let typed = &line.typed;
         if let Some(completed) = Completion::complete(&mut line.completion, step, || {
-            command_line_completions(typed)
+            let shown: Vec<_> = on_screen
+                .shown(shown_view)
+                .map(|n| (n, on_screen.states.get(n)))
+                .collect();
+            command_line_completions(typed, &shown)
         }) {
             line.typed = completed;
         }
@@ -2225,18 +2267,27 @@ impl App {
             let width = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
             let mut spans = vec![Span::styled(typed, self.theme.prompt)];
-            // The completed words to go through, the one in the input highlighted.
+            // The completed words to go through, the one in the input highlighted, as many as fit.
             if let Some(completion) = completion {
+                let words: Vec<&str> = completion.words().collect();
+                // After the input and the two spaces before the words.
+                let room = usize::from(area.width).saturating_sub(usize::from(width) + 2);
+                let shown = completion.shown(room);
                 spans.push(Span::raw("  "));
-                for (index, input) in completion.inputs.iter().enumerate() {
-                    let word = input.rsplit(char::is_whitespace).next().unwrap_or(input);
+                if shown.start > 0 {
+                    spans.push(Span::styled("… ", self.theme.completion));
+                }
+                for index in shown.clone() {
                     let style = if index == completion.at {
                         self.theme.completion_current
                     } else {
                         self.theme.completion
                     };
-                    spans.push(Span::styled(word.to_owned(), style));
+                    spans.push(Span::styled(words[index].to_owned(), style));
                     spans.push(Span::raw(" "));
+                }
+                if shown.end < words.len() {
+                    spans.push(Span::styled("…", self.theme.completion));
                 }
             }
             frame.render_widget(Line::from(spans), area);
@@ -6100,11 +6151,14 @@ mod tests {
 
     #[test]
     fn command_line_completion_offers_commands_then_qualifiers() {
-        assert_eq!(command_line_completions(""), ["quit", "select", "unselect"]);
-        assert_eq!(command_line_completions("s"), ["select"]);
-        assert_eq!(command_line_completions(" u"), [" unselect"]);
         assert_eq!(
-            command_line_completions("select "),
+            command_line_completions("", &[]),
+            ["quit", "select", "unselect"]
+        );
+        assert_eq!(command_line_completions("s", &[]), ["select"]);
+        assert_eq!(command_line_completions(" u", &[]), [" unselect"]);
+        assert_eq!(
+            command_line_completions("select ", &[]),
             [
                 "select repo:",
                 "select org:",
@@ -6113,17 +6167,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            command_line_completions("unselect  is:closed -r"),
+            command_line_completions("unselect  is:closed -r", &[]),
             ["unselect  is:closed -repo:", "unselect  is:closed -reason:"]
         );
         for typed in ["x", "Sel", "selectx", "q ", "quit r", "select is:"] {
-            assert!(command_line_completions(typed).is_empty(), "{typed:?}");
+            assert!(command_line_completions(typed, &[]).is_empty(), "{typed:?}");
         }
     }
 
     #[test]
     fn every_command_completion_offers_is_one() {
-        for name in command_line_completions("") {
+        for name in command_line_completions("", &[]) {
             let mut app = app();
 
             app.carry_out(&name);
@@ -6186,6 +6240,82 @@ mod tests {
 
         assert!(app.command_line.is_some());
         assert_eq!(screen(&mut app)[4].trim_end(), ":q");
+    }
+
+    #[test]
+    fn tab_completes_a_qualifiers_values_from_the_notifications_shown() {
+        let mut app = app_with_states();
+        app.set_search("old".to_owned());
+        type_command_line(&mut app, "select is:");
+
+        app.type_command(key_named("Tab"));
+
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with(":select is:issue  is:issue is:read is:open "),
+            "only what Old news is: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn completions_that_dont_fit_show_a_page_at_a_time() {
+        // Each word, `repo:o/rN`, takes 10 columns with its space: 100 in all.
+        let completion = |at| Completion {
+            inputs: (0..10).map(|i| format!("select repo:o/r{i}")).collect(),
+            at,
+        };
+
+        assert_eq!(completion(0).shown(100), 0..10, "all fit");
+        assert_eq!(completion(0).shown(99), 0..9);
+        assert_eq!(completion(9).shown(99), 9..10);
+        // Three a page, with room for `… ` and `…`.
+        assert_eq!(completion(4).shown(33), 3..6);
+        assert_eq!(completion(9).shown(33), 9..10);
+        assert_eq!(
+            completion(2).shown(31),
+            2..4,
+            "two, as three and the `…`s don't fit"
+        );
+        assert_eq!(
+            completion(2).shown(5),
+            2..3,
+            "one a page, when even one doesn't fit"
+        );
+    }
+
+    #[test]
+    fn status_line_pages_through_completions_too_many_for_it() {
+        let mut app = inbox_view_only();
+        let template = notifications().remove(0);
+        app.fetched(fetched(
+            (0..12)
+                .map(|i| Notification {
+                    thread: ThreadId(100 + i),
+                    repository: format!("wcgw/repo-{i:02}"),
+                    ..template.clone()
+                })
+                .collect(),
+        ));
+        type_command_line(&mut app, "select repo:");
+
+        app.type_command(key_named("Tab"));
+
+        let line = screen(&mut app)[4].trim_end().to_owned();
+        assert!(
+            line.starts_with(":select repo:wcgw/repo-00  repo:wcgw/repo-00 ")
+                && line.ends_with('…'),
+            "{line}"
+        );
+        assert!(!line.contains("repo-11"), "{line}");
+
+        app.type_command(key_named("Shift-Tab"));
+
+        let line = screen(&mut app)[4].trim_end().to_owned();
+        assert!(
+            line.starts_with(":select repo:wcgw/repo-11  … ")
+                && line.ends_with("repo:wcgw/repo-11"),
+            "the last, round from the first: {line}"
+        );
     }
 
     #[test]
@@ -6507,7 +6637,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains(&format!("{:16}  complete a name", "Tab  Shift-Tab"))),
+                .any(|line| line
+                    .contains(&format!("{:16}  complete the word typed", "Tab  Shift-Tab"))),
             "{lines:#?}"
         );
         assert!(

@@ -1,6 +1,7 @@
 //! Filters: which Notifications a View shows, written in GitHub's inbox filter syntax with ghd's extensions (see
 //! `docs/adr/0001-filter-syntax.md`).
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::mem::discriminant;
 use std::ops::Range;
@@ -92,22 +93,80 @@ impl FromStr for Filter {
 /// it here.
 const QUALIFIERS: [&str; 4] = ["repo", "org", "is", "reason"];
 
+/// The `is:` values completion offers, in this order: one for each kind of Subject, read state and State. Adding one to
+/// [`Condition::parse_is`] means adding it here, unless it only stands for another.
+const IS_VALUES: [&str; 14] = [
+    "pr",
+    "issue",
+    "release",
+    "discussion",
+    "commit",
+    "check-suite",
+    "unread",
+    "read",
+    "open",
+    "draft",
+    "merged",
+    "closed",
+    "completed",
+    "not-planned",
+];
+
 /// The ways the last word of `input` can be completed, each as the whole input with that word completed, in the
-/// order to offer them: the qualifiers the word could be the start of, ignoring case, negated if it is. None when the
-/// word can't start one, as when it has a `:` already.
-pub fn completions(input: &str) -> Vec<String> {
+/// order to offer them, negated if the word is, ignoring case: while it has no `:`, the qualifiers it could be the
+/// start of; once it has, the values of its qualifier that its value could be the start of, and that would match any
+/// of the Notifications `shown`, each with its Subject's State if that's known.
+pub fn completions(input: &str, shown: &[(&Notification, Option<SubjectState>)]) -> Vec<String> {
     let word = input.rsplit(char::is_whitespace).next().unwrap_or_default();
     let before = &input[..input.len() - word.len()];
-    let (negation, word) = match word.strip_prefix('-') {
+    let (negation, term) = match word.strip_prefix('-') {
         Some(negated) => ("-", negated),
         None => ("", word),
     };
-    let word = word.to_ascii_lowercase();
-    QUALIFIERS
-        .iter()
-        .filter(|qualifier| qualifier.starts_with(&word))
-        .map(|qualifier| format!("{before}{negation}{qualifier}:"))
+    let Some((qualifier, value)) = term.split_once(':') else {
+        let term = term.to_ascii_lowercase();
+        return QUALIFIERS
+            .iter()
+            .filter(|qualifier| qualifier.starts_with(&term))
+            .map(|qualifier| format!("{before}{negation}{qualifier}:"))
+            .collect();
+    };
+    let value = value.to_ascii_lowercase();
+    values(qualifier, shown)
+        .into_iter()
+        .filter(|candidate| candidate.starts_with(&value))
+        .filter(|candidate| {
+            Condition::parse(qualifier, candidate).is_ok_and(|condition| {
+                shown
+                    .iter()
+                    .any(|&(notification, state)| condition.matches(notification, state))
+            })
+        })
+        .map(|candidate| format!("{before}{negation}{qualifier}:{candidate}"))
         .collect()
+}
+
+/// The values of `qualifier` that completion could offer, in order: `is:`'s own, or the ones the Notifications `shown`
+/// have, sorted. Some may match none of them, or not be values at all, as an unknown reason.
+fn values(qualifier: &str, shown: &[(&Notification, Option<SubjectState>)]) -> Vec<String> {
+    let of_shown = |value: fn(&Notification) -> String| {
+        shown
+            .iter()
+            .map(|&(notification, _)| value(notification))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    match qualifier {
+        "is" => IS_VALUES.map(str::to_owned).to_vec(),
+        "repo" => of_shown(|n| n.repository.to_ascii_lowercase()),
+        "org" => of_shown(|n| {
+            let owner = n.repository.split_once('/').map_or("", |(owner, _)| owner);
+            owner.to_ascii_lowercase()
+        }),
+        "reason" => of_shown(|n| n.reason.to_string()),
+        _ => Vec::new(),
+    }
 }
 
 /// What a single `qualifier:value` term asks of a Notification. Each variant is its own qualifier as far as
@@ -629,29 +688,21 @@ mod tests {
     #[test]
     fn completion_offers_the_qualifiers_a_word_could_start() {
         let qualifiers = ["repo:", "org:", "is:", "reason:"];
-        assert_eq!(completions(""), qualifiers);
-        assert_eq!(completions("r"), ["repo:", "reason:"]);
-        assert_eq!(completions("IS"), ["is:"]);
-        assert_eq!(completions("-r"), ["-repo:", "-reason:"]);
-        assert_eq!(completions("is:closed o"), ["is:closed org:"]);
+        assert_eq!(completions("", &[]), qualifiers);
+        assert_eq!(completions("r", &[]), ["repo:", "reason:"]);
+        assert_eq!(completions("IS", &[]), ["is:"]);
+        assert_eq!(completions("-r", &[]), ["-repo:", "-reason:"]);
+        assert_eq!(completions("is:closed o", &[]), ["is:closed org:"]);
         assert_eq!(
-            completions("is:closed "),
+            completions("is:closed ", &[]),
             qualifiers.map(|qualifier| format!("is:closed {qualifier}"))
         );
     }
 
     #[test]
     fn completion_offers_nothing_where_no_qualifier_can_start() {
-        for input in [
-            "is:",
-            "is:clo",
-            "-is:",
-            "x",
-            "-x",
-            "author",
-            "is:closed title",
-        ] {
-            assert!(completions(input).is_empty(), "{input:?}");
+        for input in ["x", "-x", "author", "is:closed title"] {
+            assert!(completions(input, &[]).is_empty(), "{input:?}");
         }
     }
 
@@ -664,9 +715,78 @@ mod tests {
             "reason:" => "mention",
             other => panic!("no value to try `{other}` with"),
         };
-        for qualifier in completions("") {
+        for qualifier in completions("", &[]) {
             let term = format!("{qualifier}{}", value(&qualifier));
             assert!(term.parse::<Filter>().is_ok(), "{term}");
+        }
+    }
+
+    #[test]
+    fn every_is_value_completion_could_offer_is_understood() {
+        for value in IS_VALUES {
+            let term = format!("is:{value}");
+            assert!(term.parse::<Filter>().is_ok(), "{term}");
+        }
+    }
+
+    #[test]
+    fn completion_offers_the_values_that_would_match_what_is_shown() {
+        let merged = notification("wcgw/ghd", Reason::ReviewRequested);
+        let open = Notification {
+            thread: ThreadId(2),
+            subject_kind: SubjectKind::Issue,
+            unread: false,
+            ..notification("Cel-Rust/cel-rust", Reason::Subscribed)
+        };
+        let shown = [
+            (&merged, Some(SubjectState::Merged)),
+            (&open, Some(SubjectState::Open)),
+        ];
+
+        assert_eq!(
+            completions("is:", &shown),
+            [
+                "is:pr",
+                "is:issue",
+                "is:unread",
+                "is:read",
+                "is:open",
+                "is:merged",
+                "is:closed"
+            ]
+        );
+        assert_eq!(
+            completions("is:", &shown[..1]),
+            ["is:pr", "is:unread", "is:merged", "is:closed"],
+            "only what's shown"
+        );
+        assert_eq!(completions("-is:CL", &shown), ["-is:closed"]);
+        assert_eq!(
+            completions("is:closed repo:", &shown),
+            [
+                "is:closed repo:cel-rust/cel-rust",
+                "is:closed repo:wcgw/ghd"
+            ]
+        );
+        assert_eq!(completions("org:", &shown), ["org:cel-rust", "org:wcgw"]);
+        assert_eq!(
+            completions("reason:", &shown),
+            ["reason:review-requested", "reason:subscribed"]
+        );
+    }
+
+    #[test]
+    fn completion_offers_no_value_that_would_match_nothing() {
+        let unknown = notification("wcgw/ghd", Reason::Other("brand_new".to_owned()));
+        let shown = [(&unknown, None)];
+
+        assert_eq!(
+            completions("is:", &shown),
+            ["is:pr", "is:unread"],
+            "no State known"
+        );
+        for input in ["reason:", "author:", "is:x", "repo:*", "IS:"] {
+            assert!(completions(input, &shown).is_empty(), "{input:?}");
         }
     }
 }

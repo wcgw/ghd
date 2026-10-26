@@ -115,8 +115,9 @@ either, different ones must all match. The details are in [the decision record](
 | `?` | show these keys |
 | `:q` `Ctrl-C` | quit |
 
-In the search prompt and on the command line, `Tab` and `Shift-Tab` complete the name being typed, a search's field,
-a command or a filter's qualifier, and go through the ways to complete it when pressed again.
+In the search prompt and on the command line, `Tab` and `Shift-Tab` complete the word being typed: a search's field,
+a command, a filter's qualifier or, after one, its values that would select some of the notifications shown. Pressed
+again, they go through the ways to complete it.
 
 The mouse wheel scrolls the Preview, or the file on the Files screen, while it shows, and otherwise moves through the
 list. As ghd takes the mouse's clicks too, most terminals select text with Shift held.
