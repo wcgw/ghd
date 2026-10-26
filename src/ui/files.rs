@@ -12,9 +12,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 
+use super::history::History;
 use super::pane_search::PaneSearch;
 use super::{
     Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, Step, Wheel, counted,
+    move_within,
 };
 use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
@@ -53,6 +55,16 @@ struct Screen {
     /// doesn't know. Drawing highlights a file as far down as it shows, which only drawing knows, and otherwise only
     /// reads the screen.
     highlighting: RefCell<HashMap<(Showing, String), Option<Highlighting>>>,
+}
+
+impl Screen {
+    /// The pull request's Changed files in `fetched`; `None` until they're fetched, or if they couldn't be.
+    fn files<'a>(&self, fetched: &'a ChangedFiles) -> Option<&'a [ChangedFile]> {
+        match fetched.list(self.notification.thread, self.notification.updated_at)? {
+            Fetched::Done(list) => Some(list),
+            Fetched::Fetching | Fetched::Failed(_) => None,
+        }
+    }
 }
 
 /// How a Changed file shows: whole, or as its diff.
@@ -124,10 +136,11 @@ impl Files {
         self.screen.as_ref()?.search.typed()
     }
 
-    /// Edits what's looked for in the selected file with `key`, as [`PaneSearch::type_key`] does.
-    pub(super) fn type_key(&mut self, key: KeyEvent) {
+    /// Edits what's looked for in the selected file with `key`, going through `history` too, as
+    /// [`PaneSearch::type_key`] does.
+    pub(super) fn type_key(&mut self, key: KeyEvent, history: &mut History) {
         if let Some(screen) = &mut self.screen {
-            screen.search.type_key(key, &mut screen.scroll);
+            screen.search.type_key(key, &mut screen.scroll, history);
         }
     }
 
@@ -138,12 +151,25 @@ impl Files {
         let Some(screen) = &mut self.screen else {
             return Pressed::Nothing;
         };
+        let files = screen.files(&self.fetched).map_or(0, <[ChangedFile]>::len);
+        let file = screen.cursor.selected();
+        let half_page = (screen.rows / 2).max(1);
         match command {
             Command::Quit => return Pressed::Quit,
-            Command::Down => screen.cursor.select_next(),
-            Command::Up => screen.cursor.select_previous(),
-            Command::HalfPageDown => screen.cursor.scroll_down_by((screen.rows / 2).max(1)),
-            Command::HalfPageUp => screen.cursor.scroll_up_by((screen.rows / 2).max(1)),
+            Command::Down => move_within(&mut screen.cursor, files, TableState::select_next),
+            Command::Up => move_within(&mut screen.cursor, files, TableState::select_previous),
+            Command::First => move_within(&mut screen.cursor, files, TableState::select_first),
+            Command::Last => move_within(&mut screen.cursor, files, TableState::select_last),
+            Command::HalfPageDown => {
+                move_within(&mut screen.cursor, files, |cursor| {
+                    cursor.scroll_down_by(half_page);
+                });
+            }
+            Command::HalfPageUp => {
+                move_within(&mut screen.cursor, files, |cursor| {
+                    cursor.scroll_up_by(half_page);
+                });
+            }
             Command::ScrollPreviewDown => {
                 screen.scroll.half_down();
                 return Pressed::Nothing;
@@ -187,10 +213,11 @@ impl Files {
                 self.screen = None;
                 return Pressed::Nothing;
             }
-            // What acts on Notifications; `?` and `H` never reach here, the app around it showing the help and the
-            // Heatmap itself.
+            // What acts on Notifications; `?`, `H` and `:` never reach here, the app around it showing the help, the
+            // Heatmap and the command line itself.
             Command::Help
             | Command::ToggleHeatmap
+            | Command::OpenCommandLine
             | Command::ToggleSelected
             | Command::SelectAllShown
             | Command::NextView
@@ -202,9 +229,12 @@ impl Files {
             | Command::ToggleUnreadOnly
             | Command::TogglePreview => return Pressed::Nothing,
         }
-        // Another file, or another way to show it: from its top, what's looked for looked for in it.
-        screen.scroll.by = 0;
-        screen.search.lose_place();
+        // Another file, or another way to show it: from its top, what's looked for looked for in it. Moving no further,
+        // at either end, leaves the file as it is.
+        if command == Command::ToggleWholeFiles || screen.cursor.selected() != file {
+            screen.scroll.by = 0;
+            screen.search.lose_place();
+        }
         Pressed::Nothing
     }
 
@@ -228,25 +258,14 @@ impl Files {
     /// The Changed file selected; `None` while the screen is closed, or its files aren't fetched yet.
     fn selected(&self) -> Option<&ChangedFile> {
         let screen = self.screen.as_ref()?;
-        let Fetched::Done(list) = self
-            .fetched
-            .list(screen.notification.thread, screen.notification.updated_at)?
-        else {
-            return None;
-        };
-        list.get(screen.cursor.selected()?)
+        screen.files(&self.fetched)?.get(screen.cursor.selected()?)
     }
 
     /// The lines the list takes to show every Changed file, its border included; `None` while it shows a message in
     /// their place: the screen closed, the files not fetched yet, or none.
     pub(super) fn lines_listing_all(&self) -> Option<u16> {
         let screen = self.screen.as_ref()?;
-        let Fetched::Done(list) = self
-            .fetched
-            .list(screen.notification.thread, screen.notification.updated_at)?
-        else {
-            return None;
-        };
+        let list = screen.files(&self.fetched)?;
         if list.is_empty() {
             return None;
         }

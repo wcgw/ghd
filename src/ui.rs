@@ -1,10 +1,12 @@
 //! The terminal UI: the Views as tabs, the one on screen listing its Notifications.
 
 mod files;
+mod history;
 mod pane_search;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::time::Duration;
 use std::{fmt, io, mem, panic};
 
@@ -31,6 +33,7 @@ use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::done::DoneMarks;
 use crate::fetched;
+use crate::filter::{self, Filter};
 use crate::github::{GitHub, PreviewRequest};
 use crate::heatmap;
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
@@ -42,6 +45,7 @@ use crate::search::{self, Search};
 use crate::state::{Lookup, States, SubjectState};
 use crate::theme::Theme;
 use crate::ui::files::{Files, Pressed};
+use crate::ui::history::{History, Recall};
 
 /// Widest the repository column gets, in terminal cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: u16 = 32;
@@ -381,10 +385,16 @@ async fn fetch_preview(github: &GitHub, wanted: WantedPreview) -> PreviewFetched
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Quit,
+    /// Opens the command line, to type a command into as in Vim: `q` to quit, or `select` or `unselect` and a Filter.
+    OpenCommandLine,
     /// Fetches the whole Inbox now, rather than at the next poll.
     Refresh,
     Down,
     Up,
+    /// Moves the cursor to the first row of the list.
+    First,
+    /// Moves the cursor to the last row of the list.
+    Last,
     /// Moves the cursor down by half the rows the list shows.
     HalfPageDown,
     /// Moves the cursor up by half the rows the list shows.
@@ -436,10 +446,10 @@ enum Command {
 /// it to a line: the help tests check that every key the keymap knows is on one, and does what its line says.
 const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     (
-        &[Command::Down, Command::Up],
+        &[Command::Down, Command::Up, Command::First, Command::Last],
         KeyHelp {
-            keys: "j  k  ↓  ↑",
-            does: "move to the next or previous Notification",
+            keys: "j  k  ↓  ↑  g  G",
+            does: "move to the next, previous, first or last Notification",
         },
     ),
     (
@@ -549,30 +559,32 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
     ),
     // On one line, so that the help fits a 24-line terminal.
     (
-        &[Command::Help, Command::Quit],
+        &[Command::Help, Command::OpenCommandLine, Command::Quit],
         KeyHelp {
-            keys: "?  q  Ctrl-C",
+            keys: "?  :q  Ctrl-C",
             does: "show these keys; quit",
         },
     ),
 ];
 
-/// What the help says about acting on the Selection, after the commands.
-const SELECTION_HELP: &str = "With a selection, o, I and e act on all of it.";
+/// What the help says about making a Selection with a Filter, and acting on it, after the commands.
+const SELECTION_HELP: &str =
+    ":select F or :unselect F what filter F matches; o, I, e act on all selected.";
 
-/// The keys that work differently in the search prompt, as the help lists them after the commands.
+/// The keys that work differently in the search prompt, Tab, Shift-Tab, Up and Down on the command line too, as the
+/// help lists them after the commands.
 const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
     KeyHelp {
         keys: "Tab  Shift-Tab",
-        does: "complete a field's name, or the next or previous one",
+        does: "complete the word typed, or the next or previous one",
     },
     KeyHelp {
-        keys: "Enter",
-        does: "keep the search",
+        keys: "↑  ↓",
+        does: "go back or forth through those entered before",
     },
     KeyHelp {
-        keys: "Esc",
-        does: "put back the search there was before",
+        keys: "Enter  Esc",
+        does: "keep the search, or put back the one there was before",
     },
 ];
 
@@ -593,10 +605,12 @@ fn command_for(key: KeyEvent) -> Option<Command> {
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Command::HalfPageUp)
         }
-        KeyCode::Char('q') => Some(Command::Quit),
+        KeyCode::Char(':') => Some(Command::OpenCommandLine),
         KeyCode::Char('r') => Some(Command::Refresh),
         KeyCode::Char('j') | KeyCode::Down => Some(Command::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Command::Up),
+        KeyCode::Char('g') => Some(Command::First),
+        KeyCode::Char('G') => Some(Command::Last),
         KeyCode::Char(' ') => Some(Command::ToggleSelected),
         KeyCode::Char('A') => Some(Command::SelectAllShown),
         KeyCode::Tab => Some(Command::NextView),
@@ -622,9 +636,18 @@ fn command_for(key: KeyEvent) -> Option<Command> {
     }
 }
 
-/// Whether `key` is Ctrl-C, which quits even while the user types a Search.
+/// Whether `key` is Ctrl-C, which quits even while the user types into a prompt.
 fn is_interrupt(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Moves `cursor` with `moving`, no further than the last of `rows` rows (the first, if there are none). The table
+/// would only bring a cursor past the end back when it's next drawn: until then, the row at the cursor would be none.
+fn move_within(cursor: &mut TableState, rows: usize, moving: impl FnOnce(&mut TableState)) {
+    moving(cursor);
+    if let Some(row) = cursor.selected() {
+        cursor.select(Some(row.min(rows.saturating_sub(1))));
+    }
 }
 
 /// A one-line message at the bottom of the screen.
@@ -677,6 +700,12 @@ struct App {
     search: Search,
     /// The prompt in the status line, while the user types a Search.
     search_prompt: Option<SearchPrompt>,
+    /// The command line, while it's open.
+    command_line: Option<CommandLine>,
+    /// The searches entered before, of a View or in a file.
+    search_history: History,
+    /// The commands entered before.
+    command_history: History,
     /// The Selection, by thread: only ever threads the Inbox holds, whichever View shows them.
     selection: HashSet<ThreadId>,
     /// The help is shown over the View.
@@ -825,14 +854,134 @@ struct SearchPrompt {
     input_before: String,
     /// The ways to complete the word being typed, while the user goes through them with Tab and Shift-Tab.
     completion: Option<Completion>,
+    /// Where the user is in the searches entered before, while they go through them with Up and Down.
+    recall: Option<Recall>,
+}
+
+/// The command line, while it's open.
+#[derive(Default)]
+struct CommandLine {
+    /// What's typed on it, after `:`.
+    typed: String,
+    /// The ways to complete what's typed, while the user goes through them with Tab and Shift-Tab.
+    completion: Option<Completion>,
+    /// Where the user is in the commands entered before, while they go through them with Up and Down.
+    recall: Option<Recall>,
+}
+
+/// The commands completion offers on the command line, by their whole names: adding a command to
+/// [`App::carry_out`] means adding it here.
+const COMMAND_NAMES: [&str; 3] = ["quit", "select", "unselect"];
+
+/// The ways to complete what's typed on the command line, each as the whole of it completed, in the order to offer
+/// them: while its first word is typed, the commands that word could be the start of; after `select` or `unselect`,
+/// the qualifiers its last word could start, or their values that would match any of the Notifications `shown`, as
+/// [`filter::completions`] gives them. None otherwise.
+fn command_line_completions(
+    typed: &str,
+    shown: &[(&Notification, Option<SubjectState>)],
+) -> Vec<String> {
+    let name_start = typed.len() - typed.trim_start().len();
+    let (before, rest) = typed.split_at(name_start);
+    match rest.split_once(char::is_whitespace) {
+        None => COMMAND_NAMES
+            .iter()
+            .filter(|name| name.starts_with(rest))
+            .map(|name| format!("{before}{name}"))
+            .collect(),
+        Some((name @ ("select" | "unselect"), _)) => {
+            let (command, filter) = typed.split_at(name_start + name.len());
+            filter::completions(filter, shown)
+                .into_iter()
+                .map(|completed| format!("{command}{completed}"))
+                .collect()
+        }
+        Some(_) => Vec::new(),
+    }
+}
+
+/// Forgets the ways to complete what's typed in a prompt, and where the user is in what was entered before, unless
+/// `key` goes on through them: Tab and Shift-Tab through the one, Up and Down through the other.
+fn forget_going_through(
+    key: KeyEvent,
+    completion: &mut Option<Completion>,
+    recall: &mut Option<Recall>,
+) {
+    if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        *completion = None;
+    }
+    if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        *recall = None;
+    }
 }
 
 /// The ways to complete the word being typed, and the one in the input now.
 struct Completion {
-    /// Each a whole input, as [`search::completions`] gives them; never empty.
+    /// Each the whole input, completed one way; never empty.
     inputs: Vec<String>,
     /// Index into `inputs`.
     at: usize,
+}
+
+impl Completion {
+    /// Completes the word being typed with the first (`Step::Next`) or last of the ways `ways` gives to, or goes on
+    /// to the next or previous way if `completion` holds the ones the user is going through already. Returns the
+    /// whole input completed; `None` if the word can't be completed.
+    fn complete(
+        completion: &mut Option<Self>,
+        step: Step,
+        ways: impl FnOnce() -> Vec<String>,
+    ) -> Option<String> {
+        let completion = if let Some(completion) = completion {
+            let count = completion.inputs.len();
+            completion.at = match step {
+                Step::Next => (completion.at + 1) % count,
+                Step::Previous => (completion.at + count - 1) % count,
+            };
+            completion
+        } else {
+            let inputs = ways();
+            if inputs.is_empty() {
+                return None;
+            }
+            let at = match step {
+                Step::Next => 0,
+                Step::Previous => inputs.len() - 1,
+            };
+            completion.insert(Self { inputs, at })
+        };
+        Some(completion.inputs[completion.at].clone())
+    }
+
+    /// The words to go through, as the status line shows them: the last word of each input.
+    fn words(&self) -> impl Iterator<Item = &str> {
+        self.inputs
+            .iter()
+            .map(|input| input.rsplit(char::is_whitespace).next().unwrap_or(input))
+    }
+
+    /// Which of the words the status line shows in `room` columns, a space after each: all of them if they fit, or
+    /// else the run of them that the one in the input is in, as many as fit with a `… ` before them and a `…` after.
+    fn shown(&self, room: usize) -> Range<usize> {
+        let widths: Vec<usize> = self.words().map(|word| word.chars().count() + 1).collect();
+        if widths.iter().sum::<usize>() <= room {
+            return 0..widths.len();
+        }
+        let room = room.saturating_sub("… …".chars().count());
+        let mut start = 0;
+        let mut used = 0;
+        for (index, width) in widths.iter().enumerate() {
+            if used + width > room && index > start {
+                if self.at < index {
+                    return start..index;
+                }
+                start = index;
+                used = 0;
+            }
+            used += width;
+        }
+        start..widths.len()
+    }
 }
 
 /// Which way to go through a list: Tab and Shift-Tab through the completions, n and N through where what's looked for
@@ -872,6 +1021,9 @@ impl App {
             search_input: String::new(),
             search: Search::default(),
             search_prompt: None,
+            command_line: None,
+            search_history: History::default(),
+            command_history: History::default(),
             selection: HashSet::new(),
             help_shown: false,
             rows_on_screen: 0,
@@ -949,17 +1101,17 @@ impl App {
 
     /// Edits the Search in the prompt with `key`, the View on screen narrowing as it changes. A character adds to
     /// it and Backspace takes the last one off; Tab and Shift-Tab complete the word being typed, going through the
-    /// ways to complete it when pressed again; Enter closes the prompt, keeping the Search, and Esc closes it,
-    /// putting back the Search there was before.
+    /// ways to complete it when pressed again; Up and Down go back and forth through the searches entered before;
+    /// Enter closes the prompt, keeping the Search, and Esc closes it, putting back the Search there was before.
     fn type_search(&mut self, key: KeyEvent) {
-        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-            && let Some(prompt) = &mut self.search_prompt
-        {
-            prompt.completion = None;
+        if let Some(prompt) = &mut self.search_prompt {
+            forget_going_through(key, &mut prompt.completion, &mut prompt.recall);
         }
         match key.code {
             KeyCode::Tab => self.complete(Step::Next),
             KeyCode::BackTab => self.complete(Step::Previous),
+            KeyCode::Up => self.recall_search(Step::Previous),
+            KeyCode::Down => self.recall_search(Step::Next),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -974,7 +1126,10 @@ impl App {
                 input.pop();
                 self.set_search(input);
             }
-            KeyCode::Enter => self.search_prompt = None,
+            KeyCode::Enter => {
+                self.search_history.add(&self.search_input);
+                self.search_prompt = None;
+            }
             KeyCode::Esc => {
                 if let Some(prompt) = self.search_prompt.take() {
                     self.set_search(prompt.input_before);
@@ -984,32 +1139,174 @@ impl App {
         }
     }
 
-    /// Completes the word being typed with the first (`Step::Next`) or last way to, or goes on to the next or
-    /// previous way if the user is going through them already. Does nothing if the word can't be completed.
+    /// Puts the search entered before or after the one in the prompt in it, as [`History::recall`] goes through them.
+    fn recall_search(&mut self, step: Step) {
+        let Some(prompt) = &mut self.search_prompt else {
+            return;
+        };
+        if let Some(input) =
+            self.search_history
+                .recall(&mut prompt.recall, &self.search_input, step)
+        {
+            self.set_search(input);
+        }
+    }
+
+    /// Completes the word being typed in the Search with the first (`Step::Next`) or last way to, or goes on to the
+    /// next or previous way if the user is going through them already. Does nothing if the word can't be completed.
     fn complete(&mut self, step: Step) {
         let Some(prompt) = &mut self.search_prompt else {
             return;
         };
-        let completion = if let Some(completion) = &mut prompt.completion {
-            let count = completion.inputs.len();
-            completion.at = match step {
-                Step::Next => (completion.at + 1) % count,
-                Step::Previous => (completion.at + count - 1) % count,
-            };
-            completion
-        } else {
-            let inputs = search::completions(&self.search_input);
-            let at = match step {
-                Step::Next => 0,
-                Step::Previous => inputs.len().saturating_sub(1),
-            };
-            if inputs.is_empty() {
-                return;
+        let input = &self.search_input;
+        if let Some(completed) =
+            Completion::complete(&mut prompt.completion, step, || search::completions(input))
+        {
+            self.set_search(completed);
+        }
+    }
+
+    /// Edits the command line with `key`, as in Vim: a character adds to it, and Backspace takes the last one off or,
+    /// with nothing typed, closes it; Tab and Shift-Tab complete the command's name, or the qualifier being typed in
+    /// its Filter, going through the ways to complete it when pressed again; Up and Down go back and forth through
+    /// the commands entered before; Enter closes it and carries out the command typed, and Esc closes it. Returns
+    /// what's left for `run` to do.
+    fn type_command(&mut self, key: KeyEvent) -> Option<Outcome> {
+        let line = self.command_line.as_mut()?;
+        forget_going_through(key, &mut line.completion, &mut line.recall);
+        match key.code {
+            KeyCode::Tab => self.complete_command(Step::Next),
+            KeyCode::BackTab => self.complete_command(Step::Previous),
+            KeyCode::Up => self.recall_command(Step::Previous),
+            KeyCode::Down => self.recall_command(Step::Next),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                line.typed.push(character);
             }
-            prompt.completion.insert(Completion { inputs, at })
+            KeyCode::Backspace => {
+                if line.typed.pop().is_none() {
+                    self.command_line = None;
+                }
+            }
+            KeyCode::Enter => {
+                let typed = mem::take(&mut line.typed);
+                self.command_line = None;
+                self.command_history.add(&typed);
+                return self.carry_out(&typed);
+            }
+            KeyCode::Esc => self.command_line = None,
+            _ => {}
+        }
+        None
+    }
+
+    /// Puts the command entered before or after the one on the command line on it, as [`History::recall`] goes through
+    /// them.
+    fn recall_command(&mut self, step: Step) {
+        let Some(line) = &mut self.command_line else {
+            return;
         };
-        let input = completion.inputs[completion.at].clone();
-        self.set_search(input);
+        if let Some(typed) = self
+            .command_history
+            .recall(&mut line.recall, &line.typed, step)
+        {
+            line.typed = typed;
+        }
+    }
+
+    /// Completes what's typed on the command line as [`App::complete`] does the Search.
+    fn complete_command(&mut self, step: Step) {
+        // Not `self.on_screen()`: it would borrow the command line too.
+        let on_screen = OnScreen::new(&self.inbox, self.showing_done, &self.search, &self.states);
+        let shown_view = &self.views[self.current];
+        let Some(line) = &mut self.command_line else {
+            return;
+        };
+        let typed = &line.typed;
+        if let Some(completed) = Completion::complete(&mut line.completion, step, || {
+            let shown: Vec<_> = on_screen
+                .shown(shown_view)
+                .map(|n| (n, on_screen.states.get(n)))
+                .collect();
+            command_line_completions(typed, &shown)
+        }) {
+            line.typed = completed;
+        }
+    }
+
+    /// Carries out the command `typed` on the command line: Vim's for quitting, or `select` or `unselect` and a
+    /// Filter; says so if it's none. Returns what's left for `run` to do.
+    fn carry_out(&mut self, typed: &str) -> Option<Outcome> {
+        let typed = typed.trim();
+        let (name, argument) = typed.split_once(char::is_whitespace).unwrap_or((typed, ""));
+        match name {
+            "" => {}
+            // ghd has nothing to write, nor other windows to close: they all just quit.
+            "q" | "quit" | "q!" | "quit!" | "qa" | "qall" | "qa!" | "qall!"
+                if argument.is_empty() =>
+            {
+                return Some(Outcome::Quit);
+            }
+            // Saying how many it changed, not how many match: some may have been selected, or not, already.
+            "select" => {
+                if let Some(matching) = self.shown_matching(argument) {
+                    let before = self.selection.len();
+                    self.selection.extend(matching);
+                    let selected = self.selection.len() - before;
+                    self.status = Some(StatusMessage::Info(format!(
+                        "Selected {}",
+                        counted(selected as u64, "Notification")
+                    )));
+                }
+            }
+            "unselect" => {
+                if let Some(matching) = self.shown_matching(argument) {
+                    let before = self.selection.len();
+                    for thread in &matching {
+                        self.selection.remove(thread);
+                    }
+                    let unselected = before - self.selection.len();
+                    self.status = Some(StatusMessage::Info(format!(
+                        "Unselected {}",
+                        counted(unselected as u64, "Notification")
+                    )));
+                }
+            }
+            _ => self.status = Some(StatusMessage::Error(format!("Not a command: {typed}"))),
+        }
+        None
+    }
+
+    /// The Notifications the View on screen shows that `filter` matches, all of them if it's empty. `None` if
+    /// `filter` isn't one, or while the Files screen is open, as the status line then says.
+    fn shown_matching(&mut self, filter: &str) -> Option<Vec<ThreadId>> {
+        if self.files.is_open() {
+            self.status = Some(StatusMessage::Info(
+                "Selecting is for the list, not the Files screen".to_owned(),
+            ));
+            return None;
+        }
+        let filter: Filter = match filter.parse() {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.status = Some(StatusMessage::Error(format!(
+                    "Not a filter: {}",
+                    error.problem()
+                )));
+                return None;
+            }
+        };
+        let on_screen = self.on_screen();
+        Some(
+            on_screen
+                .shown(&self.views[self.current])
+                .filter(|n| filter.matches(n, on_screen.states.get(n)))
+                .map(|n| n.thread)
+                .collect(),
+        )
     }
 
     /// The Subjects whose State to look up now: the ones the latest Inbox changed, once after it arrives. Empty
@@ -1348,6 +1645,12 @@ impl App {
         self.move_cursors(cursors);
     }
 
+    /// Moves the cursor of the View on screen with `moving`, no further than the last row it shows.
+    fn move_cursor(&mut self, moving: impl FnOnce(&mut TableState)) {
+        let rows = self.on_screen().shown(&self.views[self.current]).count();
+        move_within(&mut self.views[self.current].cursor, rows, moving);
+    }
+
     /// Selects in each View the Notification of the thread at the View's index in `threads`, if the View shows it.
     fn move_cursors(&mut self, threads: Vec<Option<ThreadId>>) {
         // Not `self.on_screen()`: it would borrow the Views too.
@@ -1361,36 +1664,34 @@ impl App {
         }
     }
 
-    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search, or
-    /// what to look for in a file, every key but Ctrl-C goes to the prompt; otherwise the key's command is carried out
-    /// on screen. Returns what's left for `run` to do.
+    /// Takes in a key press: while the help is shown, any key but Ctrl-C closes it; while the user types a Search,
+    /// what to look for in a file or a command, every key but Ctrl-C goes to the prompt; otherwise the key's command
+    /// is carried out on screen. Returns what's left for `run` to do.
     fn press(&mut self, key: KeyEvent) -> Option<Outcome> {
-        if self.help_shown && !is_interrupt(key) {
-            self.help_shown = false;
-            return None;
-        }
-        if self.is_typing_search() && !is_interrupt(key) {
-            self.type_search(key);
-            return None;
-        }
-        if self.files.typed().is_some() && !is_interrupt(key) {
-            self.files.type_key(key);
-            return None;
+        if !is_interrupt(key) {
+            if self.help_shown {
+                self.help_shown = false;
+                return None;
+            }
+            if self.is_typing_search() {
+                self.type_search(key);
+                return None;
+            }
+            if self.files.typed().is_some() {
+                self.files.type_key(key, &mut self.search_history);
+                return None;
+            }
+            if self.command_line.is_some() {
+                return self.type_command(key);
+            }
         }
         let command = command_for(key)?;
         if self.files.is_open() {
             // The help goes over the Files screen, as over anything else; the Heatmap shades a file as it does a
-            // Preview.
-            match command {
-                Command::Help => {
-                    self.help_shown = true;
-                    return None;
-                }
-                Command::ToggleHeatmap => {
-                    self.toggle_heatmap();
-                    return None;
-                }
-                _ => {}
+            // Preview; and the command line is the same on any screen.
+            if let Command::Help | Command::ToggleHeatmap | Command::OpenCommandLine = command {
+                self.execute(command);
+                return None;
             }
             let pressed = self.files.press(command);
             return self.pressed_in_files(pressed);
@@ -1492,26 +1793,28 @@ impl App {
         reason = "the arms that do nothing here do nothing for different reasons, which each one says"
     )]
     fn execute(&mut self, command: Command) -> Vec<Change> {
-        // Moving the cursor past either end is corrected when the table is next drawn.
         match command {
             // Nothing to do on screen: `press` hands these to `run`.
             Command::Quit | Command::Refresh => {}
-            Command::Down => self.views[self.current].cursor.select_next(),
-            Command::Up => self.views[self.current].cursor.select_previous(),
+            Command::OpenCommandLine => self.command_line = Some(CommandLine::default()),
+            Command::Down => self.move_cursor(TableState::select_next),
+            Command::Up => self.move_cursor(TableState::select_previous),
+            Command::First => self.move_cursor(TableState::select_first),
+            Command::Last => self.move_cursor(TableState::select_last),
             Command::HalfPageDown => {
                 let half_page = (self.rows_on_screen / 2).max(1);
-                self.views[self.current].cursor.scroll_down_by(half_page);
+                self.move_cursor(|cursor| cursor.scroll_down_by(half_page));
             }
             Command::HalfPageUp => {
                 let half_page = (self.rows_on_screen / 2).max(1);
-                self.views[self.current].cursor.scroll_up_by(half_page);
+                self.move_cursor(|cursor| cursor.scroll_up_by(half_page));
             }
             Command::ToggleSelected => {
                 if let Some(thread) = self.at_cursor().map(|n| n.thread) {
                     if !self.selection.remove(&thread) {
                         self.selection.insert(thread);
                     }
-                    self.views[self.current].cursor.select_next();
+                    self.move_cursor(TableState::select_next);
                 }
             }
             Command::SelectAllShown => {
@@ -1543,6 +1846,7 @@ impl App {
                 self.search_prompt = Some(SearchPrompt {
                     input_before: self.search_input.clone(),
                     completion: None,
+                    recall: None,
                 });
             }
             Command::Clear => {
@@ -2008,29 +2312,42 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        // The prompt of a Search, or of what's looked for in a file: only a Search's has completions.
-        let prompt = match (&self.search_prompt, self.files.typed()) {
-            (Some(prompt), _) => Some((self.search_input.as_str(), prompt.completion.as_ref())),
-            (None, Some(typed)) => Some((typed, None)),
-            (None, None) => None,
+        // The prompt of a Search, of what's looked for in a file, or the command line, after the key that opened it:
+        // only what's looked for in a file has no completions.
+        let prompt = match (&self.search_prompt, self.files.typed(), &self.command_line) {
+            (Some(prompt), _, _) => {
+                Some(('/', self.search_input.as_str(), prompt.completion.as_ref()))
+            }
+            (None, Some(typed), _) => Some(('/', typed, None)),
+            (None, None, Some(line)) => Some((':', line.typed.as_str(), line.completion.as_ref())),
+            (None, None, None) => None,
         };
-        if let Some((typed, completion)) = prompt {
-            let typed = format!("/{typed}");
+        if let Some((opened_by, typed, completion)) = prompt {
+            let typed = format!("{opened_by}{typed}");
             let width = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
             frame.set_cursor_position(Position::new(area.x.saturating_add(width), area.y));
             let mut spans = vec![Span::styled(typed, self.theme.prompt)];
-            // The completed words to go through, the one in the input highlighted.
+            // The completed words to go through, the one in the input highlighted, as many as fit.
             if let Some(completion) = completion {
+                let words: Vec<&str> = completion.words().collect();
+                // After the input and the two spaces before the words.
+                let room = usize::from(area.width).saturating_sub(usize::from(width) + 2);
+                let shown = completion.shown(room);
                 spans.push(Span::raw("  "));
-                for (index, input) in completion.inputs.iter().enumerate() {
-                    let word = input.rsplit(char::is_whitespace).next().unwrap_or(input);
+                if shown.start > 0 {
+                    spans.push(Span::styled("… ", self.theme.completion));
+                }
+                for index in shown.clone() {
                     let style = if index == completion.at {
                         self.theme.completion_current
                     } else {
                         self.theme.completion
                     };
-                    spans.push(Span::styled(word.to_owned(), style));
+                    spans.push(Span::styled(words[index].to_owned(), style));
                     spans.push(Span::raw(" "));
+                }
+                if shown.end < words.len() {
+                    spans.push(Span::styled("…", self.theme.completion));
                 }
             }
             frame.render_widget(Line::from(spans), area);
@@ -2286,7 +2603,10 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     // No blank line before these: with it, the help wouldn't fit a 24-line terminal.
     lines.extend([
         Line::styled(SELECTION_HELP, theme.help_heading),
-        Line::styled("In the search prompt:", theme.help_heading),
+        Line::styled(
+            "In the search prompt (Tab, Shift-Tab, ↑ and ↓ after : too):",
+            theme.help_heading,
+        ),
     ]);
     lines.extend(SEARCH_PROMPT_HELP.iter().map(line));
 
@@ -2536,7 +2856,6 @@ mod tests {
 
     use super::*;
     use crate::files::{ChangedFile, FileStatus, FileText};
-    use crate::filter::Filter;
     use crate::inbox::{ApiPaths, Reason, ThreadId};
     use crate::state::Known;
 
@@ -2723,7 +3042,17 @@ mod tests {
         assert_eq!(press(KeyCode::Enter, none), Some(Command::Open));
         assert_eq!(press(KeyCode::Char('j'), none), Some(Command::Down));
         assert_eq!(press(KeyCode::Up, none), Some(Command::Up));
-        assert_eq!(press(KeyCode::Char('q'), none), Some(Command::Quit));
+        assert_eq!(press(KeyCode::Char('g'), none), Some(Command::First));
+        assert_eq!(
+            press(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            Some(Command::Last)
+        );
+        // Vim's `:q` quits, not `q`.
+        assert_eq!(press(KeyCode::Char('q'), none), None);
+        assert_eq!(
+            press(KeyCode::Char(':'), KeyModifiers::SHIFT),
+            Some(Command::OpenCommandLine)
+        );
         assert_eq!(press(KeyCode::Char('r'), none), Some(Command::Refresh));
         assert_eq!(press(KeyCode::Char('/'), none), Some(Command::Search));
         assert_eq!(press(KeyCode::Esc, none), Some(Command::Clear));
@@ -3172,6 +3501,32 @@ mod tests {
         app.execute(Command::Down);
         app.note_cursor(since);
         assert_eq!(pane(&app).0, 0, "the next Notification's from its top");
+    }
+
+    #[test]
+    fn moving_on_from_the_last_row_keeps_the_preview_where_it_is() {
+        let (mut app, since) = app_previewing();
+        app.press(key_named("G"));
+        app.note_cursor(since);
+        let body: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+        let shown = Body::Markdown(body.join("\n"));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(shown)),
+        );
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        let by = |app: &App| app.preview.as_ref().expect("open").scroll.by;
+        let scrolled = by(&app);
+        assert!(scrolled > 0);
+
+        // Not drawn in between: `run` notes the cursor before it draws.
+        for key in ["j", "Ctrl-D", "Space"] {
+            app.press(key_named(key));
+            app.note_cursor(since);
+            assert_eq!(by(&app), scrolled, "{key} on the last row");
+        }
     }
 
     /// The Preview of "Add polling" with its description and two long comments, opening on the first.
@@ -4321,6 +4676,41 @@ mod tests {
     }
 
     #[test]
+    fn moving_no_further_keeps_the_files_place() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
+        // Its only file, the first and the last.
+        let mut app = app_with_files(vec![changed("long.txt", FileStatus::Added, Some(&patch))]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        let scrolled = app.files.scrolled_by();
+        assert!(scrolled > 0);
+
+        for key in ["j", "Ctrl-D", "G", "k", "Ctrl-U", "g"] {
+            app.press(key_named(key));
+            assert_eq!(app.files.scrolled_by(), scrolled, "{key} on the only file");
+        }
+    }
+
+    #[test]
+    fn w_shows_the_file_from_its_top() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -1,0 +1,60 @@\n{}", long.join("\n"));
+        let mut app = app_with_files(vec![changed(
+            "long.txt",
+            FileStatus::Modified,
+            Some(&patch),
+        )]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        assert!(app.files.scrolled_by() > 0);
+
+        app.press(key_named("w"));
+
+        assert_eq!(app.files.scrolled_by(), 0);
+    }
+
+    #[test]
     fn wheel_scrolls_the_file_on_the_files_screen() {
         let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
         let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
@@ -4530,6 +4920,42 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_go_through_the_searches_in_a_file_and_of_a_view() {
+        let mut app = app_with_needles(&[40]);
+        look_for(&mut app, "needle");
+        app.press(key_named("Enter"));
+        // Back to the list, to search it, and to the files again.
+        app.press(key_named("Esc"));
+        app.press(key_named("Esc"));
+        assert!(!app.files.is_open());
+        app.execute(Command::Search);
+        type_text(&mut app, "polling");
+        type_key(&mut app, KeyCode::Enter);
+        app.press(key_named("f"));
+        assert!(app.files.is_open());
+        look_for(&mut app, "");
+
+        assert!(app.press(key_named("↑")).is_none());
+        assert_eq!(app.files.typed(), Some("polling"), "a View's");
+        app.press(key_named("↑"));
+        assert_eq!(app.files.typed(), Some("needle"));
+        let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        assert!(file_pane(&lines).0.contains("Line 40 needle"), "{lines:#?}");
+        app.press(key_named("↓"));
+        app.press(key_named("↓"));
+        assert_eq!(app.files.typed(), Some(""), "what it held, past the newest");
+
+        app.press(key_named("↑"));
+        app.press(key_named("x"));
+        app.press(key_named("↑"));
+        assert_eq!(
+            app.files.typed(),
+            Some("polling"),
+            "from the newest again, once edited"
+        );
+    }
+
+    #[test]
     fn n_does_nothing_before_anything_is_looked_for() {
         let mut app = app_with_needles(&[40]);
 
@@ -4670,8 +5096,8 @@ mod tests {
     fn keys_go_to_the_files_prompt_while_typing() {
         let mut app = app_with_needles(&[]);
 
-        // Not quitting, nor the next file, nor back.
-        look_for(&mut app, "qjf");
+        // Not the command line, nor the next file, nor back.
+        look_for(&mut app, ":jf");
 
         assert!(app.files.is_open());
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
@@ -4679,13 +5105,13 @@ mod tests {
             lines.iter().any(|line| line.starts_with("┌ long.txt")),
             "{lines:#?}"
         );
-        assert!(lines[lines.len() - 1].starts_with("/qjf "), "{lines:#?}");
+        assert!(lines[lines.len() - 1].starts_with("/:jf "), "{lines:#?}");
 
         // Nor half a page down.
         assert!(app.press(key_named("Ctrl-D")).is_none());
 
         let lines = screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
-        assert!(lines[lines.len() - 1].starts_with("/qjf "), "{lines:#?}");
+        assert!(lines[lines.len() - 1].starts_with("/:jf "), "{lines:#?}");
         assert!(matches!(
             app.press(key_named("Ctrl-C")),
             Some(Outcome::Quit)
@@ -4828,6 +5254,50 @@ mod tests {
                 )
                 .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn g_and_shift_g_go_to_the_first_and_last_file() {
+        let files = changed_files();
+        let mut app = app_with_files(files.clone());
+        let url_of = |file: &ChangedFile| {
+            Some(format!(
+                "https://github.com/wcgw/ghd/pull/1/files#{}",
+                file.anchor()
+            ))
+        };
+
+        app.press(key_named("G"));
+
+        // At once, not only once drawn: fetching goes by the selected file before that.
+        assert_eq!(app.files.selected_url(), url_of(&files[3]));
+
+        app.press(key_named("g"));
+
+        assert_eq!(app.files.selected_url(), url_of(&files[0]));
+    }
+
+    #[test]
+    fn moving_before_the_files_arrive_stays_on_the_first() {
+        let files = changed_files();
+        let mut app = app_with_a_pull_request();
+        app.press(key_named("f"));
+        let wanted = app.files.list_to_fetch().expect("fetches the files");
+
+        app.press(key_named("j"));
+        app.files.took_list(files::WasFetched {
+            thread: wanted.thread,
+            as_of: wanted.as_of,
+            files: Ok(files.clone()),
+        });
+
+        assert_eq!(
+            app.files.selected_url(),
+            Some(format!(
+                "https://github.com/wcgw/ghd/pull/1/files#{}",
+                files[0].anchor()
+            ))
         );
     }
 
@@ -5077,9 +5547,37 @@ mod tests {
 
         app.press(key_named("Ctrl-D"));
         app.press(key_named("Ctrl-D"));
-        screen(&mut app);
 
+        // At once, not only once drawn.
         assert_eq!(cursor_title(&app), Some("Notification 6"));
+    }
+
+    #[test]
+    fn g_and_shift_g_go_to_the_first_and_last_row() {
+        let mut app = app_with_many(30, 10);
+
+        app.press(key_named("G"));
+
+        // At once, not only once drawn: the Preview goes by the Notification at the cursor before that.
+        assert_eq!(cursor_title(&app), Some("Notification 29"));
+        let lines = screen_of(&mut app, 13);
+        assert!(lines[10].contains("Notification 29"), "{lines:#?}");
+
+        app.press(key_named("g"));
+
+        assert_eq!(cursor_title(&app), Some("Notification 0"));
+        let lines = screen_of(&mut app, 13);
+        assert!(lines[1].contains("Notification 0"), "{lines:#?}");
+    }
+
+    #[test]
+    fn shift_g_goes_to_the_last_row_shown() {
+        let mut app = app_with_many(30, 10);
+        app.set_search("1".to_owned());
+
+        app.press(key_named("G"));
+
+        assert_eq!(cursor_title(&app), Some("Notification 21"));
     }
 
     #[test]
@@ -5524,7 +6022,7 @@ mod tests {
         let none = KeyModifiers::NONE;
 
         assert!(press(&mut app, KeyCode::Char('/'), none).is_none());
-        for character in ['q', 'e', 'r', '/'] {
+        for character in [':', 'e', 'r', '/'] {
             assert!(
                 press(&mut app, KeyCode::Char(character), none).is_none(),
                 "{character}"
@@ -5552,6 +6050,452 @@ mod tests {
         let outcome = app.press(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert!(matches!(outcome, Some(Outcome::Quit)));
+    }
+
+    /// Opens the command line with `:` and types `text` on it, each key press leaving nothing for `run` to do.
+    fn type_command_line(app: &mut App, text: &str) {
+        for character in format!(":{text}").chars() {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert!(app.press(key).is_none(), "{character}");
+        }
+    }
+
+    // Enter goes to the command line itself in these tests: pressed with it closed, it would open a browser.
+
+    #[test]
+    fn colon_q_quits_as_in_vim() {
+        for command in [
+            "q", "quit", "q!", "quit!", "qa", "qall", "qa!", "qall!", " q ",
+        ] {
+            let mut app = app();
+            type_command_line(&mut app, command);
+
+            let lines = screen(&mut app);
+            assert!(lines[4].starts_with(&format!(":{command}")), "{lines:#?}");
+            assert!(
+                matches!(app.type_command(key_named("Enter")), Some(Outcome::Quit)),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn colon_q_quits_from_the_files_screen_too() {
+        let mut app = app_with_files(changed_files());
+
+        type_command_line(&mut app, "q");
+
+        assert!(app.files.is_open());
+        assert!(matches!(
+            app.type_command(key_named("Enter")),
+            Some(Outcome::Quit)
+        ));
+    }
+
+    #[test]
+    fn what_isnt_a_command_says_so() {
+        let mut app = app();
+        type_command_line(&mut app, "bad");
+
+        assert!(app.type_command(key_named("Enter")).is_none());
+
+        assert!(app.command_line.is_none());
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with("Not a command: bad "), "{lines:#?}");
+    }
+
+    #[test]
+    fn nothing_typed_on_the_command_line_does_nothing() {
+        let mut app = app();
+        type_command_line(&mut app, " ");
+
+        assert!(app.type_command(key_named("Enter")).is_none());
+
+        assert!(app.command_line.is_none());
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn a_command_is_the_whole_of_its_first_word() {
+        for typed in ["q all", "selected is:closed"] {
+            let mut app = app();
+            type_command_line(&mut app, typed);
+
+            assert!(app.type_command(key_named("Enter")).is_none(), "{typed}");
+
+            let lines = screen(&mut app);
+            assert!(
+                lines[4].starts_with(&format!("Not a command: {typed} ")),
+                "{lines:#?}"
+            );
+        }
+    }
+
+    /// [`app`], "Add polling" merged and "Old news" open.
+    fn app_with_states() -> App {
+        let mut app = app();
+        let asked = app.states_to_look_up();
+        app.states_looked_up(LookedUp {
+            asked,
+            found: Ok(HashMap::from([
+                (ThreadId(1), SubjectState::Merged),
+                (ThreadId(2), SubjectState::Open),
+            ])),
+        });
+        app
+    }
+
+    /// Types `command` on the command line, and enters it.
+    fn enter_command(app: &mut App, command: &str) {
+        type_command_line(app, command);
+        assert!(app.type_command(key_named("Enter")).is_none(), "{command}");
+    }
+
+    #[test]
+    fn colon_select_adds_what_a_filter_matches_to_the_selection() {
+        let mut app = app_with_states();
+
+        enter_command(&mut app, "select is:closed");
+
+        assert_eq!(selected_titles(&app), ["Add polling"], "merged is closed");
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Selected 1 Notification "),
+            "{lines:#?}"
+        );
+
+        enter_command(&mut app, "select reason:subscribed");
+
+        assert_eq!(selected_titles(&app), ["Add polling", "Old news"], "added");
+
+        enter_command(&mut app, "select is:closed");
+
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Selected 0 Notifications "),
+            "none more: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn colon_unselect_takes_what_a_filter_matches_out_of_the_selection() {
+        let mut app = app_with_states();
+        app.press(key_named("A"));
+
+        enter_command(&mut app, "unselect -is:closed");
+
+        assert_eq!(selected_titles(&app), ["Add polling"]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Unselected 1 Notification "),
+            "{lines:#?}"
+        );
+
+        enter_command(&mut app, "unselect");
+
+        assert_eq!(selected_titles(&app), [] as [&str; 0]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Unselected 1 Notification "),
+            "only the one still selected: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn colon_select_picks_among_the_notifications_shown_all_with_no_filter() {
+        let mut app = app_with_states();
+        app.set_search("old".to_owned());
+
+        enter_command(&mut app, "select");
+
+        assert_eq!(selected_titles(&app), ["Old news"]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Selected 1 Notification "),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn what_isnt_a_filter_says_so_and_selects_nothing() {
+        let mut app = app_with_states();
+
+        enter_command(&mut app, "select is:closd");
+
+        assert_eq!(selected_titles(&app), [] as [&str; 0]);
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with("Not a filter: unknown `is:` value `closd` "),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn colon_select_does_nothing_on_the_files_screen() {
+        let mut app = app_with_files(changed_files());
+
+        enter_command(&mut app, "select");
+
+        assert!(app.files.is_open());
+        assert!(app.selection.is_empty());
+        assert!(
+            matches!(&app.status, Some(StatusMessage::Info(said)) if said.contains("not the Files screen")),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn command_line_completion_offers_commands_then_qualifiers() {
+        assert_eq!(
+            command_line_completions("", &[]),
+            ["quit", "select", "unselect"]
+        );
+        assert_eq!(command_line_completions("s", &[]), ["select"]);
+        assert_eq!(command_line_completions(" u", &[]), [" unselect"]);
+        assert_eq!(
+            command_line_completions("select ", &[]),
+            [
+                "select repo:",
+                "select org:",
+                "select is:",
+                "select reason:"
+            ]
+        );
+        assert_eq!(
+            command_line_completions("unselect  is:closed -r", &[]),
+            ["unselect  is:closed -repo:", "unselect  is:closed -reason:"]
+        );
+        for typed in ["x", "Sel", "selectx", "q ", "quit r", "select is:"] {
+            assert!(command_line_completions(typed, &[]).is_empty(), "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn every_command_completion_offers_is_one() {
+        for name in command_line_completions("", &[]) {
+            let mut app = app();
+
+            app.carry_out(&name);
+
+            assert!(
+                !matches!(&app.status, Some(StatusMessage::Error(said)) if said.starts_with("Not a command")),
+                "{name}"
+            );
+        }
+    }
+
+    /// Types `text` on the open command line.
+    fn type_on_command_line(app: &mut App, text: &str) {
+        for character in text.chars() {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert!(app.type_command(key).is_none(), "{character}");
+        }
+    }
+
+    #[test]
+    fn tab_completes_on_the_command_line_as_in_the_search_prompt() {
+        let mut app = app_with_states();
+        type_command_line(&mut app, "s");
+
+        assert!(app.press(key_named("Tab")).is_none());
+        assert_eq!(app.current, 0, "Tab completes rather than switching Views");
+        assert_eq!(screen(&mut app)[4].trim_end(), ":select  select");
+
+        type_on_command_line(&mut app, " is:closed ");
+        assert_eq!(
+            screen(&mut app)[4].trim_end(),
+            ":select is:closed",
+            "done going through them"
+        );
+        app.type_command(key_named("Shift-Tab"));
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with(":select is:closed reason:  repo: org: is: reason: "),
+            "from the last: {lines:#?}"
+        );
+        app.type_command(key_named("Tab"));
+        assert_eq!(
+            app.command_line.as_ref().map(|line| line.typed.as_str()),
+            Some("select is:closed repo:"),
+            "wraps around"
+        );
+        app.type_command(key_named("Shift-Tab"));
+        type_on_command_line(&mut app, "review-requested");
+
+        assert!(app.type_command(key_named("Enter")).is_none());
+        assert_eq!(selected_titles(&app), ["Add polling"]);
+    }
+
+    #[test]
+    fn tab_with_nothing_to_complete_on_the_command_line_changes_nothing() {
+        let mut app = app();
+        type_command_line(&mut app, "q ");
+
+        app.type_command(key_named("Tab"));
+
+        assert!(app.command_line.is_some());
+        assert_eq!(screen(&mut app)[4].trim_end(), ":q");
+    }
+
+    #[test]
+    fn tab_completes_a_qualifiers_values_from_the_notifications_shown() {
+        let mut app = app_with_states();
+        app.set_search("old".to_owned());
+        type_command_line(&mut app, "select is:");
+
+        app.type_command(key_named("Tab"));
+
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with(":select is:issue  is:issue is:read is:open "),
+            "only what Old news is: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn completions_that_dont_fit_show_a_page_at_a_time() {
+        // Each word, `repo:o/rN`, takes 10 columns with its space: 100 in all.
+        let completion = |at| Completion {
+            inputs: (0..10).map(|i| format!("select repo:o/r{i}")).collect(),
+            at,
+        };
+
+        assert_eq!(completion(0).shown(100), 0..10, "all fit");
+        assert_eq!(completion(0).shown(99), 0..9);
+        assert_eq!(completion(9).shown(99), 9..10);
+        // Three a page, with room for `… ` and `…`.
+        assert_eq!(completion(4).shown(33), 3..6);
+        assert_eq!(completion(9).shown(33), 9..10);
+        assert_eq!(
+            completion(2).shown(31),
+            2..4,
+            "two, as three and the `…`s don't fit"
+        );
+        assert_eq!(
+            completion(2).shown(5),
+            2..3,
+            "one a page, when even one doesn't fit"
+        );
+    }
+
+    #[test]
+    fn status_line_pages_through_completions_too_many_for_it() {
+        let mut app = inbox_view_only();
+        let template = notifications().remove(0);
+        app.fetched(fetched(
+            (0..12)
+                .map(|i| Notification {
+                    thread: ThreadId(100 + i),
+                    repository: format!("wcgw/repo-{i:02}"),
+                    ..template.clone()
+                })
+                .collect(),
+        ));
+        type_command_line(&mut app, "select repo:");
+
+        app.type_command(key_named("Tab"));
+
+        let line = screen(&mut app)[4].trim_end().to_owned();
+        assert!(
+            line.starts_with(":select repo:wcgw/repo-00  repo:wcgw/repo-00 ")
+                && line.ends_with('…'),
+            "{line}"
+        );
+        assert!(!line.contains("repo-11"), "{line}");
+
+        app.type_command(key_named("Shift-Tab"));
+
+        let line = screen(&mut app)[4].trim_end().to_owned();
+        assert!(
+            line.starts_with(":select repo:wcgw/repo-11  … ")
+                && line.ends_with("repo:wcgw/repo-11"),
+            "the last, round from the first: {line}"
+        );
+    }
+
+    #[test]
+    fn up_and_down_go_through_the_commands_entered_before() {
+        let mut app = app_with_states();
+        for command in ["bad", "select is:closed"] {
+            type_command_line(&mut app, command);
+            app.type_command(key_named("Enter"));
+        }
+        type_command_line(&mut app, "xyz");
+        app.type_command(key_named("Esc"));
+        type_command_line(&mut app, "");
+        let typed = |app: &App| app.command_line.as_ref().map(|line| line.typed.clone());
+
+        assert!(app.press(key_named("↑")).is_none());
+        assert_eq!(typed(&app).as_deref(), Some("select is:closed"));
+        assert_eq!(screen(&mut app)[4].trim_end(), ":select is:closed");
+        app.type_command(key_named("↑"));
+        assert_eq!(typed(&app).as_deref(), Some("bad"));
+        app.type_command(key_named("↓"));
+        app.type_command(key_named("↓"));
+        assert_eq!(
+            typed(&app).as_deref(),
+            Some(""),
+            "what it held, past the newest"
+        );
+
+        app.type_command(key_named("↑"));
+        type_on_command_line(&mut app, " -is:merged");
+        app.type_command(key_named("↑"));
+        assert_eq!(
+            typed(&app).as_deref(),
+            Some("select is:closed"),
+            "from the newest again, once edited"
+        );
+    }
+
+    #[test]
+    fn keys_go_to_the_command_line_while_typing() {
+        let mut app = app();
+
+        // Not the next Notification, nor marking Done, nor a Search, nor the help.
+        type_command_line(&mut app, "je/?");
+
+        assert_eq!(cursor_title(&app), Some("Add polling"));
+        assert!(!app.is_typing_search());
+        assert!(!app.help_shown);
+        let lines = screen(&mut app);
+        assert_eq!(titles(&lines), ["Add polling", "Old news"]);
+        assert!(lines[4].starts_with(":je/? "), "{lines:#?}");
+
+        // Nor half a page down, nor a `d`.
+        assert!(app.press(key_named("Ctrl-D")).is_none());
+
+        assert_eq!(cursor_title(&app), Some("Add polling"));
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with(":je/? "), "{lines:#?}");
+        assert!(matches!(
+            app.press(key_named("Ctrl-C")),
+            Some(Outcome::Quit)
+        ));
+    }
+
+    #[test]
+    fn esc_or_backspace_with_nothing_typed_closes_the_command_line() {
+        let mut app = app();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+
+        type_command_line(&mut app, "q");
+        assert!(app.press(key_named("Esc")).is_none());
+
+        assert!(app.press(key_named("j")).is_none());
+        assert_eq!(cursor_title(&app), Some("Old news"), "moves again");
+
+        type_command_line(&mut app, "q");
+        assert!(app.press(backspace).is_none());
+
+        let lines = screen(&mut app);
+        assert!(lines[4].starts_with(": "), "still open: {lines:#?}");
+
+        assert!(app.press(backspace).is_none());
+
+        assert!(app.press(key_named("k")).is_none());
+        assert_eq!(cursor_title(&app), Some("Add polling"), "moves again");
     }
 
     #[test]
@@ -5655,6 +6599,37 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_go_through_the_searches_entered_before() {
+        let mut app = app();
+        app.execute(Command::Search);
+        type_text(&mut app, "old");
+        type_key(&mut app, KeyCode::Enter);
+        app.execute(Command::Search);
+        for _ in 0.."old".len() {
+            type_key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "add");
+        type_key(&mut app, KeyCode::Enter);
+        app.execute(Command::Search);
+        type_text(&mut app, " cancelled");
+        type_key(&mut app, KeyCode::Esc);
+        app.execute(Command::Search);
+
+        assert!(app.press(key_named("↑")).is_none());
+        assert_eq!(
+            app.search_input, "old",
+            "past what the prompt holds, and what wasn't kept"
+        );
+        assert!(app.is_typing_search());
+        assert_eq!(titles(&screen(&mut app)), ["Old news"]);
+        type_key(&mut app, KeyCode::Up);
+        assert_eq!(app.search_input, "old", "nothing older");
+        type_key(&mut app, KeyCode::Down);
+        assert_eq!(app.search_input, "add", "what it held, past the newest");
+        assert_eq!(titles(&screen(&mut app)), ["Add polling"]);
+    }
+
+    #[test]
     fn cursor_stays_put_while_the_search_still_shows_it() {
         let mut app = app();
         app.execute(Command::Down);
@@ -5705,6 +6680,8 @@ mod tests {
                 continue;
             }
             for label in help.keys.split_whitespace() {
+                // A command is typed after the key that opens the command line.
+                let label = if label.starts_with(':') { ":" } else { label };
                 let command = command_for(key_named(label)).expect("a known key");
                 assert!(
                     commands.contains(&command),
@@ -5716,11 +6693,17 @@ mod tests {
 
     #[test]
     fn help_lists_every_command() {
-        let listed = |command: Command| {
-            COMMAND_HELP.iter().any(|(commands, _)| {
+        // On a line for its command, named in that line's keys.
+        let listed = |label: &str, command: Command| {
+            COMMAND_HELP.iter().any(|(commands, help)| {
                 commands
                     .iter()
                     .any(|listed| mem::discriminant(listed) == mem::discriminant(&command))
+                    && help.keys.split_whitespace().any(|name| {
+                        // As the help names some keys: `1` in `1–9`, and `:` with the command typed after it.
+                        name.split('–').next() == Some(label)
+                            || (label == ":" && name.starts_with(':'))
+                    })
             })
         };
         for label in [
@@ -5738,6 +6721,8 @@ mod tests {
             "k",
             "↓",
             "↑",
+            "g",
+            "G",
             "Tab",
             "Shift-Tab",
             "1",
@@ -5751,13 +6736,16 @@ mod tests {
             "Esc",
             "r",
             "?",
-            "q",
+            ":",
             "Ctrl-C",
             "Ctrl-D",
             "Ctrl-U",
         ] {
             let command = command_for(key_named(label)).expect("a known key");
-            assert!(listed(command), "{command:?} isn't in the help");
+            assert!(
+                listed(label, command),
+                "{label} ({command:?}) isn't in the help"
+            );
         }
     }
 
@@ -5803,7 +6791,7 @@ mod tests {
             .collect();
         assert!(
             lines.iter().any(|line| line.contains(&format!(
-                "{:14}  mark Done; in the Done list, back to the Inbox",
+                "{:16}  mark Done; in the Done list, back to the Inbox",
                 "e"
             ))),
             "{lines:#?}"
@@ -5811,13 +6799,18 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Tab  Shift-Tab  complete a field's name")),
+                .any(|line| line
+                    .contains(&format!("{:16}  complete the word typed", "Tab  Shift-Tab"))),
             "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(SELECTION_HELP)),
+            "the widest line, whole: {lines:#?}"
         );
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("put back the search there was before")),
+                .any(|line| line.contains("put back the one there was before")),
             "the last line: {lines:#?}"
         );
     }
@@ -6034,10 +7027,15 @@ mod tests {
         assert_eq!(cursor_title(&app), Some("Old news"), "moved down");
         app.press(key_named("Space"));
         assert_eq!(selected_titles(&app), ["Add polling", "Old news"]);
+        assert_eq!(
+            cursor_title(&app),
+            Some("Old news"),
+            "no further than the last"
+        );
 
         app.press(key_named("k"));
         app.press(key_named("Space"));
-        assert_eq!(selected_titles(&app), ["Add polling"], "unselected");
+        assert_eq!(selected_titles(&app), ["Old news"], "unselected");
     }
 
     #[test]
