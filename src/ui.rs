@@ -635,6 +635,15 @@ fn is_interrupt(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// Moves `cursor` with `moving`, no further than the last of `rows` rows (the first, if there are none). The table
+/// would only bring a cursor past the end back when it's next drawn: until then, the row at the cursor would be none.
+fn move_within(cursor: &mut TableState, rows: usize, moving: impl FnOnce(&mut TableState)) {
+    moving(cursor);
+    if let Some(row) = cursor.selected() {
+        cursor.select(Some(row.min(rows.saturating_sub(1))));
+    }
+}
+
 /// A one-line message at the bottom of the screen.
 #[derive(Debug)]
 enum StatusMessage {
@@ -1402,6 +1411,12 @@ impl App {
         self.move_cursors(cursors);
     }
 
+    /// Moves the cursor of the View on screen with `moving`, no further than the last row it shows.
+    fn move_cursor(&mut self, moving: impl FnOnce(&mut TableState)) {
+        let rows = self.on_screen().shown(&self.views[self.current]).count();
+        move_within(&mut self.views[self.current].cursor, rows, moving);
+    }
+
     /// Selects in each View the Notification of the thread at the View's index in `threads`, if the View shows it.
     fn move_cursors(&mut self, threads: Vec<Option<ThreadId>>) {
         // Not `self.on_screen()`: it would borrow the Views too.
@@ -1544,36 +1559,28 @@ impl App {
         reason = "the arms that do nothing here do nothing for different reasons, which each one says"
     )]
     fn execute(&mut self, command: Command) -> Vec<Change> {
-        // Moving the cursor past either end is corrected when the table is next drawn.
         match command {
             // Nothing to do on screen: `press` hands these to `run`.
             Command::Quit | Command::Refresh => {}
             Command::OpenCommandLine => self.command_line = Some(String::new()),
-            Command::Down => self.views[self.current].cursor.select_next(),
-            Command::Up => self.views[self.current].cursor.select_previous(),
-            Command::First => self.views[self.current].cursor.select_first(),
-            Command::Last => {
-                // Not past the end, as `select_last` leaves it until the next draw: before that, the Preview would
-                // take it for no Notification.
-                let shown = self.on_screen().shown(&self.views[self.current]).count();
-                self.views[self.current]
-                    .cursor
-                    .select(Some(shown.saturating_sub(1)));
-            }
+            Command::Down => self.move_cursor(TableState::select_next),
+            Command::Up => self.move_cursor(TableState::select_previous),
+            Command::First => self.move_cursor(TableState::select_first),
+            Command::Last => self.move_cursor(TableState::select_last),
             Command::HalfPageDown => {
                 let half_page = (self.rows_on_screen / 2).max(1);
-                self.views[self.current].cursor.scroll_down_by(half_page);
+                self.move_cursor(|cursor| cursor.scroll_down_by(half_page));
             }
             Command::HalfPageUp => {
                 let half_page = (self.rows_on_screen / 2).max(1);
-                self.views[self.current].cursor.scroll_up_by(half_page);
+                self.move_cursor(|cursor| cursor.scroll_up_by(half_page));
             }
             Command::ToggleSelected => {
                 if let Some(thread) = self.at_cursor().map(|n| n.thread) {
                     if !self.selection.remove(&thread) {
                         self.selection.insert(thread);
                     }
-                    self.views[self.current].cursor.select_next();
+                    self.move_cursor(TableState::select_next);
                 }
             }
             Command::SelectAllShown => {
@@ -3250,6 +3257,32 @@ mod tests {
         assert_eq!(pane(&app).0, 0, "the next Notification's from its top");
     }
 
+    #[test]
+    fn moving_on_from_the_last_row_keeps_the_preview_where_it_is() {
+        let (mut app, since) = app_previewing();
+        app.press(key_named("G"));
+        app.note_cursor(since);
+        let body: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+        let shown = Body::Markdown(body.join("\n"));
+        fetch_preview_at(
+            &mut app,
+            since + PREVIEW_REST,
+            Ok(add_polling_preview(shown)),
+        );
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        let by = |app: &App| app.preview.as_ref().expect("open").scroll.by;
+        let scrolled = by(&app);
+        assert!(scrolled > 0);
+
+        // Not drawn in between: `run` notes the cursor before it draws.
+        for key in ["j", "Ctrl-D", "Space"] {
+            app.press(key_named(key));
+            app.note_cursor(since);
+            assert_eq!(by(&app), scrolled, "{key} on the last row");
+        }
+    }
+
     /// The Preview of "Add polling" with its description and two long comments, opening on the first.
     fn add_polling_discussed() -> Preview {
         let long = |first: &str| {
@@ -4397,6 +4430,41 @@ mod tests {
     }
 
     #[test]
+    fn moving_no_further_keeps_the_files_place() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
+        // Its only file, the first and the last.
+        let mut app = app_with_files(vec![changed("long.txt", FileStatus::Added, Some(&patch))]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        let scrolled = app.files.scrolled_by();
+        assert!(scrolled > 0);
+
+        for key in ["j", "Ctrl-D", "G", "k", "Ctrl-U", "g"] {
+            app.press(key_named(key));
+            assert_eq!(app.files.scrolled_by(), scrolled, "{key} on the only file");
+        }
+    }
+
+    #[test]
+    fn w_shows_the_file_from_its_top() {
+        let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
+        let patch = format!("@@ -1,0 +1,60 @@\n{}", long.join("\n"));
+        let mut app = app_with_files(vec![changed(
+            "long.txt",
+            FileStatus::Modified,
+            Some(&patch),
+        )]);
+        screen_of(&mut app, PREVIEW_SCREEN_HEIGHT);
+        app.press(key_named("J"));
+        assert!(app.files.scrolled_by() > 0);
+
+        app.press(key_named("w"));
+
+        assert_eq!(app.files.scrolled_by(), 0);
+    }
+
+    #[test]
     fn wheel_scrolls_the_file_on_the_files_screen() {
         let long: Vec<String> = (0..60).map(|i| format!("+Line {i}")).collect();
         let patch = format!("@@ -0,0 +1,60 @@\n{}", long.join("\n"));
@@ -4929,6 +4997,29 @@ mod tests {
     }
 
     #[test]
+    fn moving_before_the_files_arrive_stays_on_the_first() {
+        let files = changed_files();
+        let mut app = app_with_a_pull_request();
+        app.press(key_named("f"));
+        let wanted = app.files.list_to_fetch().expect("fetches the files");
+
+        app.press(key_named("j"));
+        app.files.took_list(files::WasFetched {
+            thread: wanted.thread,
+            as_of: wanted.as_of,
+            files: Ok(files.clone()),
+        });
+
+        assert_eq!(
+            app.files.selected_url(),
+            Some(format!(
+                "https://github.com/wcgw/ghd/pull/1/files#{}",
+                files[0].anchor()
+            ))
+        );
+    }
+
+    #[test]
     fn voight_assesses_new_markdown_files_only() {
         let mut app = app_with_files(changed_files());
         app.assessments = Some(Assessments::default());
@@ -5174,8 +5265,8 @@ mod tests {
 
         app.press(key_named("Ctrl-D"));
         app.press(key_named("Ctrl-D"));
-        screen(&mut app);
 
+        // At once, not only once drawn.
         assert_eq!(cursor_title(&app), Some("Notification 6"));
     }
 
@@ -6285,10 +6376,15 @@ mod tests {
         assert_eq!(cursor_title(&app), Some("Old news"), "moved down");
         app.press(key_named("Space"));
         assert_eq!(selected_titles(&app), ["Add polling", "Old news"]);
+        assert_eq!(
+            cursor_title(&app),
+            Some("Old news"),
+            "no further than the last"
+        );
 
         app.press(key_named("k"));
         app.press(key_named("Space"));
-        assert_eq!(selected_titles(&app), ["Add polling"], "unselected");
+        assert_eq!(selected_titles(&app), ["Old news"], "unselected");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 use super::pane_search::PaneSearch;
 use super::{
     Assessable, Command, PREVIEW_MIN_HEIGHT, Scrolled, StatusMessage, Step, Wheel, counted,
+    move_within,
 };
 use crate::assessment::{self, Window};
 use crate::fetched::Fetched;
@@ -148,19 +149,25 @@ impl Files {
         let Some(screen) = &mut self.screen else {
             return Pressed::Nothing;
         };
+        let files = screen.files(&self.fetched).map_or(0, <[ChangedFile]>::len);
+        let file = screen.cursor.selected();
+        let half_page = (screen.rows / 2).max(1);
         match command {
             Command::Quit => return Pressed::Quit,
-            Command::Down => screen.cursor.select_next(),
-            Command::Up => screen.cursor.select_previous(),
-            Command::First => screen.cursor.select_first(),
-            Command::Last => {
-                // Not past the end, as `select_last` leaves it until the next draw: before that, fetching would take
-                // it for no file.
-                let count = screen.files(&self.fetched).map_or(0, <[ChangedFile]>::len);
-                screen.cursor.select(Some(count.saturating_sub(1)));
+            Command::Down => move_within(&mut screen.cursor, files, TableState::select_next),
+            Command::Up => move_within(&mut screen.cursor, files, TableState::select_previous),
+            Command::First => move_within(&mut screen.cursor, files, TableState::select_first),
+            Command::Last => move_within(&mut screen.cursor, files, TableState::select_last),
+            Command::HalfPageDown => {
+                move_within(&mut screen.cursor, files, |cursor| {
+                    cursor.scroll_down_by(half_page);
+                });
             }
-            Command::HalfPageDown => screen.cursor.scroll_down_by((screen.rows / 2).max(1)),
-            Command::HalfPageUp => screen.cursor.scroll_up_by((screen.rows / 2).max(1)),
+            Command::HalfPageUp => {
+                move_within(&mut screen.cursor, files, |cursor| {
+                    cursor.scroll_up_by(half_page);
+                });
+            }
             Command::ScrollPreviewDown => {
                 screen.scroll.half_down();
                 return Pressed::Nothing;
@@ -220,9 +227,12 @@ impl Files {
             | Command::ToggleUnreadOnly
             | Command::TogglePreview => return Pressed::Nothing,
         }
-        // Another file, or another way to show it: from its top, what's looked for looked for in it.
-        screen.scroll.by = 0;
-        screen.search.lose_place();
+        // Another file, or another way to show it: from its top, what's looked for looked for in it. Moving no further,
+        // at either end, leaves the file as it is.
+        if command == Command::ToggleWholeFiles || screen.cursor.selected() != file {
+            screen.scroll.by = 0;
+            screen.search.lose_place();
+        }
         Pressed::Nothing
     }
 
