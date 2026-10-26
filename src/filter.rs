@@ -88,6 +88,28 @@ impl FromStr for Filter {
     }
 }
 
+/// The qualifiers ghd understands, in the order completion offers them: adding one to [`Condition::parse`] means adding
+/// it here.
+const QUALIFIERS: [&str; 4] = ["repo", "org", "is", "reason"];
+
+/// The ways the last word of `input` can be completed, each as the whole input with that word completed, in the
+/// order to offer them: the qualifiers the word could be the start of, ignoring case, negated if it is. None when the
+/// word can't start one, as when it has a `:` already.
+pub fn completions(input: &str) -> Vec<String> {
+    let word = input.rsplit(char::is_whitespace).next().unwrap_or_default();
+    let before = &input[..input.len() - word.len()];
+    let (negation, word) = match word.strip_prefix('-') {
+        Some(negated) => ("-", negated),
+        None => ("", word),
+    };
+    let word = word.to_ascii_lowercase();
+    QUALIFIERS
+        .iter()
+        .filter(|qualifier| qualifier.starts_with(&word))
+        .map(|qualifier| format!("{before}{negation}{qualifier}:"))
+        .collect()
+}
+
 /// What a single `qualifier:value` term asks of a Notification. Each variant is its own qualifier as far as
 /// repeating goes; `is:` is three of them, because a Subject's kind, its read state and its State are unrelated.
 #[derive(Debug, Clone)]
@@ -602,5 +624,49 @@ mod tests {
              org:wcgw reason:review-requestd\n  \
              \x20               ^^^^^^^^^^^^^^^"
         );
+    }
+
+    #[test]
+    fn completion_offers_the_qualifiers_a_word_could_start() {
+        let qualifiers = ["repo:", "org:", "is:", "reason:"];
+        assert_eq!(completions(""), qualifiers);
+        assert_eq!(completions("r"), ["repo:", "reason:"]);
+        assert_eq!(completions("IS"), ["is:"]);
+        assert_eq!(completions("-r"), ["-repo:", "-reason:"]);
+        assert_eq!(completions("is:closed o"), ["is:closed org:"]);
+        assert_eq!(
+            completions("is:closed "),
+            qualifiers.map(|qualifier| format!("is:closed {qualifier}"))
+        );
+    }
+
+    #[test]
+    fn completion_offers_nothing_where_no_qualifier_can_start() {
+        for input in [
+            "is:",
+            "is:clo",
+            "-is:",
+            "x",
+            "-x",
+            "author",
+            "is:closed title",
+        ] {
+            assert!(completions(input).is_empty(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn every_qualifier_completion_offers_is_understood() {
+        let value = |qualifier: &str| match qualifier {
+            "repo:" => "wcgw/ghd",
+            "org:" => "wcgw",
+            "is:" => "pr",
+            "reason:" => "mention",
+            other => panic!("no value to try `{other}` with"),
+        };
+        for qualifier in completions("") {
+            let term = format!("{qualifier}{}", value(&qualifier));
+            assert!(term.parse::<Filter>().is_ok(), "{term}");
+        }
     }
 }

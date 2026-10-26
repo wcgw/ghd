@@ -31,7 +31,7 @@ use crate::change::{Change, RecentChanges, Reply, send};
 use crate::config::View;
 use crate::done::DoneMarks;
 use crate::fetched;
-use crate::filter::Filter;
+use crate::filter::{self, Filter};
 use crate::github::{GitHub, PreviewRequest};
 use crate::heatmap;
 use crate::inbox::{Inbox, Listing, Notification, SubjectKind, ThreadId};
@@ -568,11 +568,12 @@ const COMMAND_HELP: [(&[Command], KeyHelp); 17] = [
 const SELECTION_HELP: &str =
     ":select F or :unselect F what filter F matches; o, I, e act on all selected.";
 
-/// The keys that work differently in the search prompt, as the help lists them after the commands.
+/// The keys that work differently in the search prompt, Tab and Shift-Tab on the command line too, as the help lists
+/// them after the commands.
 const SEARCH_PROMPT_HELP: [KeyHelp; 3] = [
     KeyHelp {
         keys: "Tab  Shift-Tab",
-        does: "complete a field's name, or the next or previous one",
+        does: "complete a name, or the next or previous one",
     },
     KeyHelp {
         keys: "Enter",
@@ -696,8 +697,8 @@ struct App {
     search: Search,
     /// The prompt in the status line, while the user types a Search.
     search_prompt: Option<SearchPrompt>,
-    /// What's typed on the command line, after `:`, while it's open.
-    command_line: Option<String>,
+    /// The command line, while it's open.
+    command_line: Option<CommandLine>,
     /// The Selection, by thread: only ever threads the Inbox holds, whichever View shows them.
     selection: HashSet<ThreadId>,
     /// The help is shown over the View.
@@ -848,12 +849,79 @@ struct SearchPrompt {
     completion: Option<Completion>,
 }
 
+/// The command line, while it's open.
+#[derive(Default)]
+struct CommandLine {
+    /// What's typed on it, after `:`.
+    typed: String,
+    /// The ways to complete what's typed, while the user goes through them with Tab and Shift-Tab.
+    completion: Option<Completion>,
+}
+
+/// The commands completion offers on the command line, by their whole names: adding a command to
+/// [`App::carry_out`] means adding it here.
+const COMMAND_NAMES: [&str; 3] = ["quit", "select", "unselect"];
+
+/// The ways to complete what's typed on the command line, each as the whole of it completed, in the order to offer
+/// them: while its first word is typed, the commands that word could be the start of; after `select` or `unselect`,
+/// the qualifiers its last word could start, as [`filter::completions`] gives them. None otherwise.
+fn command_line_completions(typed: &str) -> Vec<String> {
+    let name_start = typed.len() - typed.trim_start().len();
+    let (before, rest) = typed.split_at(name_start);
+    match rest.split_once(char::is_whitespace) {
+        None => COMMAND_NAMES
+            .iter()
+            .filter(|name| name.starts_with(rest))
+            .map(|name| format!("{before}{name}"))
+            .collect(),
+        Some((name @ ("select" | "unselect"), _)) => {
+            let (command, filter) = typed.split_at(name_start + name.len());
+            filter::completions(filter)
+                .into_iter()
+                .map(|completed| format!("{command}{completed}"))
+                .collect()
+        }
+        Some(_) => Vec::new(),
+    }
+}
+
 /// The ways to complete the word being typed, and the one in the input now.
 struct Completion {
-    /// Each a whole input, as [`search::completions`] gives them; never empty.
+    /// Each the whole input, completed one way; never empty.
     inputs: Vec<String>,
     /// Index into `inputs`.
     at: usize,
+}
+
+impl Completion {
+    /// Completes the word being typed with the first (`Step::Next`) or last of the ways `ways` gives to, or goes on
+    /// to the next or previous way if `completion` holds the ones the user is going through already. Returns the
+    /// whole input completed; `None` if the word can't be completed.
+    fn complete(
+        completion: &mut Option<Self>,
+        step: Step,
+        ways: impl FnOnce() -> Vec<String>,
+    ) -> Option<String> {
+        let completion = if let Some(completion) = completion {
+            let count = completion.inputs.len();
+            completion.at = match step {
+                Step::Next => (completion.at + 1) % count,
+                Step::Previous => (completion.at + count - 1) % count,
+            };
+            completion
+        } else {
+            let inputs = ways();
+            if inputs.is_empty() {
+                return None;
+            }
+            let at = match step {
+                Step::Next => 0,
+                Step::Previous => inputs.len() - 1,
+            };
+            completion.insert(Self { inputs, at })
+        };
+        Some(completion.inputs[completion.at].clone())
+    }
 }
 
 /// Which way to go through a list: Tab and Shift-Tab through the completions, n and N through where what's looked for
@@ -1006,54 +1074,46 @@ impl App {
         }
     }
 
-    /// Completes the word being typed with the first (`Step::Next`) or last way to, or goes on to the next or
-    /// previous way if the user is going through them already. Does nothing if the word can't be completed.
+    /// Completes the word being typed in the Search with the first (`Step::Next`) or last way to, or goes on to the
+    /// next or previous way if the user is going through them already. Does nothing if the word can't be completed.
     fn complete(&mut self, step: Step) {
         let Some(prompt) = &mut self.search_prompt else {
             return;
         };
-        let completion = if let Some(completion) = &mut prompt.completion {
-            let count = completion.inputs.len();
-            completion.at = match step {
-                Step::Next => (completion.at + 1) % count,
-                Step::Previous => (completion.at + count - 1) % count,
-            };
-            completion
-        } else {
-            let inputs = search::completions(&self.search_input);
-            let at = match step {
-                Step::Next => 0,
-                Step::Previous => inputs.len().saturating_sub(1),
-            };
-            if inputs.is_empty() {
-                return;
-            }
-            prompt.completion.insert(Completion { inputs, at })
-        };
-        let input = completion.inputs[completion.at].clone();
-        self.set_search(input);
+        let input = &self.search_input;
+        if let Some(completed) =
+            Completion::complete(&mut prompt.completion, step, || search::completions(input))
+        {
+            self.set_search(completed);
+        }
     }
 
     /// Edits the command line with `key`, as in Vim: a character adds to it, and Backspace takes the last one off or,
-    /// with nothing typed, closes it; Enter closes it and carries out the command typed, and Esc closes it. Returns
-    /// what's left for `run` to do.
+    /// with nothing typed, closes it; Tab and Shift-Tab complete the command's name, or the qualifier being typed in
+    /// its Filter, going through the ways to complete it when pressed again; Enter closes it and carries out the
+    /// command typed, and Esc closes it. Returns what's left for `run` to do.
     fn type_command(&mut self, key: KeyEvent) -> Option<Outcome> {
-        let typed = self.command_line.as_mut()?;
+        let line = self.command_line.as_mut()?;
+        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            line.completion = None;
+        }
         match key.code {
+            KeyCode::Tab => self.complete_command(Step::Next),
+            KeyCode::BackTab => self.complete_command(Step::Previous),
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                typed.push(character);
+                line.typed.push(character);
             }
             KeyCode::Backspace => {
-                if typed.pop().is_none() {
+                if line.typed.pop().is_none() {
                     self.command_line = None;
                 }
             }
             KeyCode::Enter => {
-                let typed = mem::take(typed);
+                let typed = mem::take(&mut line.typed);
                 self.command_line = None;
                 return self.carry_out(&typed);
             }
@@ -1061,6 +1121,19 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Completes what's typed on the command line as [`App::complete`] does the Search.
+    fn complete_command(&mut self, step: Step) {
+        let Some(line) = &mut self.command_line else {
+            return;
+        };
+        let typed = &line.typed;
+        if let Some(completed) = Completion::complete(&mut line.completion, step, || {
+            command_line_completions(typed)
+        }) {
+            line.typed = completed;
+        }
     }
 
     /// Carries out the command `typed` on the command line: Vim's for quitting, or `select` or `unselect` and a
@@ -1622,7 +1695,7 @@ impl App {
         match command {
             // Nothing to do on screen: `press` hands these to `run`.
             Command::Quit | Command::Refresh => {}
-            Command::OpenCommandLine => self.command_line = Some(String::new()),
+            Command::OpenCommandLine => self.command_line = Some(CommandLine::default()),
             Command::Down => self.move_cursor(TableState::select_next),
             Command::Up => self.move_cursor(TableState::select_previous),
             Command::First => self.move_cursor(TableState::select_first),
@@ -2138,13 +2211,13 @@ impl App {
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         // The prompt of a Search, of what's looked for in a file, or the command line, after the key that opened it:
-        // only a Search's has completions.
+        // only what's looked for in a file has no completions.
         let prompt = match (&self.search_prompt, self.files.typed(), &self.command_line) {
             (Some(prompt), _, _) => {
                 Some(('/', self.search_input.as_str(), prompt.completion.as_ref()))
             }
             (None, Some(typed), _) => Some(('/', typed, None)),
-            (None, None, Some(typed)) => Some((':', typed.as_str(), None)),
+            (None, None, Some(line)) => Some((':', line.typed.as_str(), line.completion.as_ref())),
             (None, None, None) => None,
         };
         if let Some((opened_by, typed, completion)) = prompt {
@@ -2419,7 +2492,10 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     // No blank line before these: with it, the help wouldn't fit a 24-line terminal.
     lines.extend([
         Line::styled(SELECTION_HELP, theme.help_heading),
-        Line::styled("In the search prompt:", theme.help_heading),
+        Line::styled(
+            "In the search prompt (Tab and Shift-Tab after : too):",
+            theme.help_heading,
+        ),
     ]);
     lines.extend(SEARCH_PROMPT_HELP.iter().map(line));
 
@@ -6023,6 +6099,96 @@ mod tests {
     }
 
     #[test]
+    fn command_line_completion_offers_commands_then_qualifiers() {
+        assert_eq!(command_line_completions(""), ["quit", "select", "unselect"]);
+        assert_eq!(command_line_completions("s"), ["select"]);
+        assert_eq!(command_line_completions(" u"), [" unselect"]);
+        assert_eq!(
+            command_line_completions("select "),
+            [
+                "select repo:",
+                "select org:",
+                "select is:",
+                "select reason:"
+            ]
+        );
+        assert_eq!(
+            command_line_completions("unselect  is:closed -r"),
+            ["unselect  is:closed -repo:", "unselect  is:closed -reason:"]
+        );
+        for typed in ["x", "Sel", "selectx", "q ", "quit r", "select is:"] {
+            assert!(command_line_completions(typed).is_empty(), "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn every_command_completion_offers_is_one() {
+        for name in command_line_completions("") {
+            let mut app = app();
+
+            app.carry_out(&name);
+
+            assert!(
+                !matches!(&app.status, Some(StatusMessage::Error(said)) if said.starts_with("Not a command")),
+                "{name}"
+            );
+        }
+    }
+
+    /// Types `text` on the open command line.
+    fn type_on_command_line(app: &mut App, text: &str) {
+        for character in text.chars() {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert!(app.type_command(key).is_none(), "{character}");
+        }
+    }
+
+    #[test]
+    fn tab_completes_on_the_command_line_as_in_the_search_prompt() {
+        let mut app = app_with_states();
+        type_command_line(&mut app, "s");
+
+        assert!(app.press(key_named("Tab")).is_none());
+        assert_eq!(app.current, 0, "Tab completes rather than switching Views");
+        assert_eq!(screen(&mut app)[4].trim_end(), ":select  select");
+
+        type_on_command_line(&mut app, " is:closed ");
+        assert_eq!(
+            screen(&mut app)[4].trim_end(),
+            ":select is:closed",
+            "done going through them"
+        );
+        app.type_command(key_named("Shift-Tab"));
+        let lines = screen(&mut app);
+        assert!(
+            lines[4].starts_with(":select is:closed reason:  repo: org: is: reason: "),
+            "from the last: {lines:#?}"
+        );
+        app.type_command(key_named("Tab"));
+        assert_eq!(
+            app.command_line.as_ref().map(|line| line.typed.as_str()),
+            Some("select is:closed repo:"),
+            "wraps around"
+        );
+        app.type_command(key_named("Shift-Tab"));
+        type_on_command_line(&mut app, "review-requested");
+
+        assert!(app.type_command(key_named("Enter")).is_none());
+        assert_eq!(selected_titles(&app), ["Add polling"]);
+    }
+
+    #[test]
+    fn tab_with_nothing_to_complete_on_the_command_line_changes_nothing() {
+        let mut app = app();
+        type_command_line(&mut app, "q ");
+
+        app.type_command(key_named("Tab"));
+
+        assert!(app.command_line.is_some());
+        assert_eq!(screen(&mut app)[4].trim_end(), ":q");
+    }
+
+    #[test]
     fn keys_go_to_the_command_line_while_typing() {
         let mut app = app();
 
@@ -6341,8 +6507,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line
-                    .contains(&format!("{:16}  complete a field's name", "Tab  Shift-Tab"))),
+                .any(|line| line.contains(&format!("{:16}  complete a name", "Tab  Shift-Tab"))),
             "{lines:#?}"
         );
         assert!(
