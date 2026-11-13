@@ -8,7 +8,7 @@ use pulldown_cmark::{Event, Options as ParseOptions, Parser, Tag, TagEnd};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use wcgw_kit::doc;
-use wcgw_kit::hl::{Group, Theme};
+use wcgw_kit::hl::Theme;
 use wcgw_kit_text::{CellSize, Options, Styles};
 
 use crate::assessment::Window;
@@ -63,7 +63,7 @@ pub struct Drawing<T> {
 /// code is rewritten, as a terminal can't draw it: comments are dropped, `<br>` breaks the line, `<img>` shows its
 /// description, and any other tag is dropped for its text, so a `<details>` block shows open, its `<summary>` on a
 /// line of its own.
-pub fn draw<T>(
+pub fn draw<T: Clone>(
     markdown: &str,
     look: &Look,
     width: u16,
@@ -73,32 +73,22 @@ pub fn draw<T>(
     let rewritten = Rewritten::of(markdown);
     let mut document = wcgw_kit_text::Document::markdown(&rewritten.text, &look.styles);
     document.highlight_code(|language, code| highlighted(language?, code, look));
-    let mut lines = document
-        .render(&Options {
-            width,
-            cell: CellSize::default(),
-            pixel_ratio: 1.0,
-            max_picture_rows: 0,
-            pictures: &[],
-        })
-        .lines;
-    let sources = sources(&lines, &rewritten, markdown);
-    let urls: Vec<String> = document
-        .links()
-        .iter()
-        .map(|link| link.url.clone())
-        .collect();
-    // Found by their styles, before the Heatmap changes them.
-    let links: Vec<Vec<(Range<usize>, String)>> = lines
-        .iter()
-        .map(|line| link_marks(line, &urls, &look.styles))
-        .collect();
-    heatmap::shade(&mut lines, &rewritten.text, heat, &look.heat);
-    let lines = lines
-        .into_iter()
-        .zip(links)
-        .map(|(line, links)| kit_line(&line, &links, &link))
-        .collect();
+    let rendering = document.render(&Options {
+        width,
+        cell: CellSize::default(),
+        pixel_ratio: 1.0,
+        max_picture_rows: 0,
+        pictures: &[],
+    });
+    let sources = sources(&rendering.lines, &rewritten, markdown);
+    let mut lines = wcgw_kit_text::kit::linked_lines(
+        &document,
+        &rendering,
+        |_| String::new(),
+        |_, found| Some(link(&found.url)),
+    );
+    // After the links, found by the styles shading changes.
+    heatmap::shade_doc(&mut lines, &rewritten.text, heat, &look.heat);
     Drawing { lines, sources }
 }
 
@@ -142,77 +132,6 @@ fn sources(lines: &[Line<'static>], rewritten: &Rewritten, markdown: &str) -> Ve
             })
         })
         .collect()
-}
-
-/// The links on `line`, by their byte ranges in its text: each link's number, `[3]`, and its text just before it,
-/// with the address of `links` it numbers.
-fn link_marks(
-    line: &Line<'static>,
-    links: &[String],
-    styles: &Styles,
-) -> Vec<(Range<usize>, String)> {
-    let mut found = Vec::new();
-    let mut at = 0;
-    let mut previous: Option<Range<usize>> = None;
-    for span in &line.spans {
-        let range = at..at + span.content.len();
-        at = range.end;
-        let number = span
-            .content
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-            .and_then(|number| number.parse::<usize>().ok());
-        match number.and_then(|number| links.get(number.checked_sub(1)?)) {
-            Some(url) if span.style == styles.link_number => {
-                let start = previous.take().map_or(range.start, |text| text.start);
-                found.push((start..range.end, url.clone()));
-            }
-            _ => previous = Some(range),
-        }
-    }
-    found
-}
-
-/// `line` as a kit line, in its own colours, its `links` referring to what `link` makes of their address.
-fn kit_line<T>(
-    line: &Line<'static>,
-    links: &[(Range<usize>, String)],
-    link: &impl Fn(&str) -> T,
-) -> doc::Line<T> {
-    let mut cuts: Vec<usize> = links
-        .iter()
-        .flat_map(|(range, _)| [range.start, range.end])
-        .collect();
-    cuts.sort_unstable();
-    let mut spans = Vec::with_capacity(line.spans.len());
-    let mut at = 0;
-    for span in &line.spans {
-        let style = line.style.patch(span.style);
-        let text = span.content.as_ref();
-        let end = at + text.len();
-        let mut from = at;
-        for cut in cuts
-            .iter()
-            .copied()
-            .filter(|&cut| at < cut && cut < end)
-            .chain([end])
-        {
-            if cut <= from || !text.is_char_boundary(cut - at) || !text.is_char_boundary(from - at)
-            {
-                continue;
-            }
-            let piece = doc::Span::new(&text[from - at..cut - at], Group::NORMAL).with_style(style);
-            spans.push(
-                match links.iter().find(|(range, _)| range.contains(&from)) {
-                    Some((_, url)) => piece.with_target(link(url)),
-                    None => piece,
-                },
-            );
-            from = cut;
-        }
-        at = end;
-    }
-    doc::Line::Text(spans)
 }
 
 /// Whether `markdown` mentions `handle`, a login (`octocat`) or a team (`github/docs`), as GitHub notifies for:
@@ -404,6 +323,7 @@ fn attribute<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
 #[cfg(test)]
 mod tests {
     use ratatui::style::Color;
+    use wcgw_kit::hl::Group;
 
     use super::*;
 
@@ -605,6 +525,55 @@ mod tests {
                 (".", None),
             ]
         );
+    }
+
+    #[test]
+    fn a_link_wrapped_across_lines_refers_to_its_address_whole() {
+        let drawn = draw(
+            "Read [the long guide to everything there is](https://guide.example).",
+            &look(),
+            30,
+            &[],
+            str::to_owned,
+        );
+
+        let linked: Vec<&str> = spans(&drawn.lines)
+            .filter(|span| span.target.as_deref() == Some("https://guide.example"))
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(drawn.lines.len() >= 2, "{:?}", lines_of(&drawn.lines));
+        assert_eq!(
+            linked.concat().replace(' ', ""),
+            "thelongguidetoeverythingthereis[1]"
+        );
+    }
+
+    #[test]
+    fn shading_keeps_links() {
+        let markdown = "See [the docs](https://docs.example) now.";
+        let assessed = as_github_shows(markdown);
+        let windows = [Window {
+            range: 0..assessed.len(),
+            share: 1.0,
+        }];
+        let heat = Heat {
+            llm: ratatui::style::Style::new().bg(Color::Red),
+            ..Heat::default()
+        };
+
+        let drawn = draw(
+            markdown,
+            &Look { heat, ..look() },
+            60,
+            &windows,
+            str::to_owned,
+        );
+
+        let docs = spans(&drawn.lines)
+            .find(|span| span.text == "the docs")
+            .expect("the link's text");
+        assert_eq!(docs.target.as_deref(), Some("https://docs.example"));
+        assert_eq!(docs.style.and_then(|style| style.bg), Some(Color::Red));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use wcgw_kit::doc;
 
 use crate::assessment::Window;
 use crate::drawn::Finder;
@@ -47,6 +48,81 @@ impl Heat {
 /// What each line draws is found in `text` in order, span by span. What isn't found nearby, like a list's markers or
 /// a table's borders, is shaded as the text before it on its line, or else as the text after it.
 pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], heat: &Heat) {
+    shade_spans(
+        lines.iter_mut().map(|line| &mut line.spans),
+        text,
+        windows,
+        heat,
+    );
+}
+
+/// As [`shade`], for a kit buffer's `lines`: what's cut keeps its group and its target.
+pub fn shade_doc<T: Clone>(
+    lines: &mut [doc::Line<T>],
+    text: &str,
+    windows: &[Window],
+    heat: &Heat,
+) {
+    shade_spans(
+        lines.iter_mut().filter_map(|line| match line {
+            doc::Line::Text(spans) => Some(spans),
+            doc::Line::Image { .. } => None,
+        }),
+        text,
+        windows,
+        heat,
+    );
+}
+
+/// A span of a line, as shading cuts and colours it.
+trait Piece: Sized {
+    /// Its text.
+    fn content(&self) -> &str;
+    /// The same span, of `content` instead.
+    fn with_content(&self, content: String) -> Self;
+    /// The same span, in `style` over its own.
+    fn patched(self, style: Style) -> Self;
+}
+
+impl Piece for Span<'static> {
+    fn content(&self) -> &str {
+        &self.content
+    }
+
+    fn with_content(&self, content: String) -> Self {
+        Span::styled(content, self.style)
+    }
+
+    fn patched(self, style: Style) -> Self {
+        self.patch_style(style)
+    }
+}
+
+impl<T: Clone> Piece for doc::Span<T> {
+    fn content(&self) -> &str {
+        &self.text
+    }
+
+    fn with_content(&self, content: String) -> Self {
+        Self {
+            text: content,
+            ..self.clone()
+        }
+    }
+
+    fn patched(self, style: Style) -> Self {
+        let own = self.style.unwrap_or_default().patch(style);
+        self.with_style(own)
+    }
+}
+
+/// Shades the spans of each line of `lines`, as [`shade`] says.
+fn shade_spans<'l, P: Piece + 'l>(
+    lines: impl Iterator<Item = &'l mut Vec<P>>,
+    text: &str,
+    windows: &[Window],
+    heat: &Heat,
+) {
     if windows.is_empty()
         || windows
             .iter()
@@ -55,20 +131,20 @@ pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], heat: 
         return;
     }
     let mut finder = Finder::new(text);
-    for line in lines {
+    for spans in lines {
         finder.next_line();
-        let mut pieces = Vec::with_capacity(line.spans.len());
-        for span in line.spans.drain(..) {
-            match finder.find(&span.content) {
+        let mut pieces = Vec::with_capacity(spans.len());
+        for span in spans.drain(..) {
+            match finder.find(span.content()) {
                 Some(start) => cut(span, start, windows, &mut pieces),
                 None => pieces.push((span, Place::Added)),
             }
         }
         place_added(&mut pieces);
-        line.spans = pieces
+        *spans = pieces
             .into_iter()
             .map(|(span, place)| match place {
-                Place::Found(Some(share)) => span.patch_style(heat.style(share)),
+                Place::Found(Some(share)) => span.patched(heat.style(share)),
                 Place::Found(None) | Place::Added => span,
             })
             .collect();
@@ -86,13 +162,8 @@ enum Place {
 
 /// Pushes `span`, found at `start` in the text, onto `pieces`: cut where `windows` start or end in it, each piece placed
 /// in its window, if any.
-fn cut(
-    span: Span<'static>,
-    start: usize,
-    windows: &[Window],
-    pieces: &mut Vec<(Span<'static>, Place)>,
-) {
-    let end = start + span.content.len();
+fn cut<P: Piece>(span: P, start: usize, windows: &[Window], pieces: &mut Vec<(P, Place)>) {
+    let end = start + span.content().len();
     let mut from = start;
     while from < end {
         let next = windows.partition_point(|window| window.range.end <= from);
@@ -108,15 +179,15 @@ fn cut(
             return;
         }
         // The windows are of the text, so they start and end between characters.
-        let piece = span.content[from - start..to - start].to_owned();
-        pieces.push((Span::styled(piece, span.style), Place::Found(share)));
+        let piece = span.content()[from - start..to - start].to_owned();
+        pieces.push((span.with_content(piece), Place::Found(share)));
         from = to;
     }
 }
 
 /// Places what the drawing added to a line as the piece found before it, or else after it; outside any window if
 /// nothing on the line was found.
-fn place_added(pieces: &mut [(Span<'static>, Place)]) {
+fn place_added<P>(pieces: &mut [(P, Place)]) {
     let mut before = None;
     for (_, place) in pieces.iter_mut() {
         match *place {
