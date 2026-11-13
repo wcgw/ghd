@@ -94,13 +94,16 @@ pub(super) fn add(kit: &mut Kit) {
             }
         }),
         Command::<Ghd>::new("yanklink", 5, |ghd, kit, _| {
-            let url = ghd
-                .subject_url(kit)
-                .ok_or_else(|| "No Notification under the cursor".to_owned())?;
+            let url = match kit.target_under_cursor() {
+                Some(Target::Url(url)) => url,
+                _ => ghd
+                    .subject_url(kit)
+                    .ok_or_else(|| "No link nor Notification under the cursor".to_owned())?,
+            };
             kit.info(format!("Yanked {url}"));
             Ok(vec![Effect::Copy(url)])
         })
-        .help("yank the link :browse opens"),
+        .help("yank the link under the cursor, else the one :browse opens"),
         Command::<Ghd>::new("clear", 3, |ghd, kit, _| {
             ghd.clear(kit);
             Ok(Vec::new())

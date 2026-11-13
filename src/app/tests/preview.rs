@@ -171,6 +171,11 @@ fn markdown_is_rendered_its_code_highlighted_and_its_links_followed() {
     app.press("gg/the docs<CR>");
     let effects = app.press("gx");
     assert_eq!(opened(&effects), ["https://docs.example.com"]);
+    let effects = app.press("gy");
+    assert!(
+        effects.contains(&Effect::Copy("https://docs.example.com".to_owned())),
+        "gy yanks what gx opens: {effects:?}"
+    );
     let effects = app.press("<CR>");
     assert_eq!(
         opened(&effects),

@@ -111,7 +111,7 @@ them. ghd adds these, each running a command `:map` can rebind:
 |---|---|---|
 | `<CR>` `gX` | `:open` `:browse` | open in the browser, which marks read; `<CR>` follows a link too |
 | `gx` | `:browse link` | open the link under the cursor |
-| `gy` | `:yanklink` | yank the link `gX` opens |
+| `gy` | `:yanklink` | yank the link under the cursor, else the one `gX` opens |
 | `I` | `:read` | mark read |
 | `a` | `:done` | mark Done; in the Done list, back to the Inbox |
 | `D` | `:donelist` | show the Done list, or the Inbox again |
