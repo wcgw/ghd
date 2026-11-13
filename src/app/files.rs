@@ -54,6 +54,8 @@ pub(super) struct Files {
     list_fetching: bool,
     /// A whole file's fetch is under way; there's never more than one.
     text_fetching: bool,
+    /// Where the hunks of the file shown start, as lines of its buffer: what `]h` and `[h` go to.
+    hunks: Vec<usize>,
 }
 
 /// A Changed file as it shows: of which pull request, its contents path, and whole or as its diff.
@@ -553,6 +555,7 @@ impl Ghd {
             return;
         }
         let lines = self.file_lines(kit, thread, file, showing, width);
+        self.files.hunks = hunk_starts(&lines);
         let shown = kit.buffer_mut(buffer);
         shown.set_winbar(Some(vec![(format!(" {} ", file.path), Group::WIN_BAR)]));
         shown
@@ -902,6 +905,26 @@ fn gutter_changes(
 }
 
 /// What the gutter shows of a line the pull request did `change` to, and the space after it.
+/// Where `lines`' hunks start, as gitsigns' `]h` goes: the first of each run of lines added, changed or removed,
+/// in a diff or in a whole file's gutter.
+fn hunk_starts(lines: &[Line<Target>]) -> Vec<usize> {
+    let changed = |line: &Line<Target>| {
+        matches!(line, Line::Text(spans) if spans.first().is_some_and(|span| {
+            [Group::ADDED, Group::CHANGED, Group::REMOVED].contains(&span.group)
+        }))
+    };
+    let mut starts = Vec::new();
+    let mut before = false;
+    for (index, line) in lines.iter().enumerate() {
+        let now = changed(line);
+        if now && !before {
+            starts.push(index);
+        }
+        before = now;
+    }
+    starts
+}
+
 fn gutter_mark(change: Option<LineChange>) -> Span<Target> {
     match change {
         Some(LineChange::Added) => Span::new("\u{258e} ", Group::ADDED),
@@ -913,6 +936,44 @@ fn gutter_mark(change: Option<LineChange>) -> Span<Target> {
 }
 
 impl Ghd {
+    /// `:hunk` (`]h`), `:hunk previous` (`[h`): the next hunk of the file shown on the Files screen, or the one before,
+    /// as gitsigns' in the author's Neovim.
+    pub(super) fn hunk(&mut self, kit: &mut Kit, next: bool) -> Result<Effects, String> {
+        let window = self
+            .files
+            .window()
+            .ok_or_else(|| "Hunks are the Files screen's".to_owned())?;
+        let at = kit
+            .window_cursor(window)
+            .and_then(Cursor::line_in_block)
+            .filter(|(block, _)| **block == BlockKey::new("file"))
+            .map(|(_, line)| line);
+        let hunks = &self.files.hunks;
+        let to = if next {
+            hunks
+                .iter()
+                .copied()
+                .find(|&start| at.is_none_or(|at| start > at))
+        } else {
+            hunks
+                .iter()
+                .copied()
+                .rev()
+                .find(|&start| at.is_some_and(|at| start < at))
+        };
+        let to = to.ok_or_else(|| {
+            if next {
+                "No hunk after this"
+            } else {
+                "No hunk before this"
+            }
+            .to_owned()
+        })?;
+        kit.focus_window(window);
+        kit.set_cursor(window, Cursor::on_line("file", to));
+        Ok(Vec::new())
+    }
+
     /// What the Files screen shows that voight would assess: the file at the cursor, if it's Markdown shown whole.
     pub(super) fn file_assessable(&self, kit: &Kit) -> Option<(assessment::Key, String)> {
         let screen = self.files.screen.as_ref()?;

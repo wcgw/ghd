@@ -328,6 +328,30 @@ fn slash_searches_the_file_shown() {
 }
 
 #[test]
+fn brackets_h_go_through_the_file_s_hunks_as_gitsigns() {
+    let mut files = changed_files();
+    files[1].patch = Some(
+        "@@ -1,5 +1,5 @@\n fn a() {}\n-old\n+new\n fn b() {}\n fn c() {}\n-gone\n+here".to_owned(),
+    );
+    let mut app = app_with_files(files);
+    app.press("j");
+    let row = |app: &App| usize::from(app.screen().cursor.1);
+
+    app.press("]h");
+    assert_eq!(row(&app), row_of(&app, "-old"), "the first run of changes");
+    app.press("]h");
+    assert_eq!(
+        row(&app),
+        row_of(&app, "-gone"),
+        "the next, past lines unchanged"
+    );
+    app.press("]h");
+    assert!(shows(&app, "No hunk after this"), "{:#?}", rows(&app));
+    app.press("[h");
+    assert_eq!(row(&app), row_of(&app, "-old"));
+}
+
+#[test]
 fn closing_the_file_window_leaves_the_files_and_the_preview() {
     let mut app = app();
     app.press("p");

@@ -78,6 +78,19 @@ pub(super) fn add(kit: &mut Kit) {
         .help("the pull request's Changed files, or the list again"),
         Command::<Ghd>::new("whole", 3, |ghd, _, _| ghd.toggle_whole())
             .help("on the Files screen, files whole, or as their diffs again"),
+        Command::<Ghd>::new("hunk", 2, |ghd, kit, line| match line.args {
+            "" | "next" => ghd.hunk(kit, true),
+            "previous" => ghd.hunk(kit, false),
+            args => Err(format!("E475: Invalid argument: {args}")),
+        })
+        .help("on the Files screen, the file's next hunk; with previous, the one before")
+        .complete(|_, _, before, _| {
+            if before.is_empty() {
+                vec!["next".to_owned(), "previous".to_owned()]
+            } else {
+                Vec::new()
+            }
+        }),
         Command::<Ghd>::new("browse", 3, |ghd, kit, line| match line.args {
             "" => Ok(ghd.browse_subject(kit)),
             "link" => ghd.browse_link(kit),

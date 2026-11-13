@@ -122,6 +122,7 @@ them. ghd adds these, each running a command `:map` can rebind:
 | `<Esc>` | `:clear` | hide the search's matches, or clear the selection, or else the filter; leave the Files screen |
 | `p` | `:preview` | show or hide the Preview |
 | `gf` `<leader>w` | `:files` `:whole` | a pull request's files; files whole, or their diffs |
+| `]h` `[h` | `:hunk` `:hunk previous` | the file's next hunk, or the one before, as gitsigns' |
 | `<leader>h` | `:voight heatmap` | voight's Heatmap; `:voight on` and `off` start and stop it |
 | `gt` `gT` `<leader>1`–`9` | `:bnext` `:bprevious` `:buffer` | show the next, previous, or nth View |
 | `<C-l>` | `:edit!` | fetch the Inbox now, and the Preview or the files shown |
