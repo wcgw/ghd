@@ -264,6 +264,21 @@ fn filter_narrows_every_view_until_cleared() {
 }
 
 #[test]
+fn esc_hides_the_search_s_matches_before_the_selection() {
+    let mut app = app();
+    app.press("A");
+    app.press("/polling<CR>");
+
+    app.press("<Esc>");
+    assert!(
+        statusline(&app).contains("selected"),
+        "the search's matches go first, as the kit's <Esc>"
+    );
+    app.press("<Esc>");
+    assert!(!statusline(&app).contains("selected"));
+}
+
+#[test]
 fn esc_clears_the_selection_before_the_filter() {
     let mut app = app();
     app.press(":filter is:read<CR>");

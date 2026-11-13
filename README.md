@@ -119,7 +119,7 @@ them. ghd adds these, each running a command `:map` can rebind:
 | `x` `A` | `:toggle` `:toggle!` | select or not, and move down; all shown, or none |
 | | `:select` `:unselect` *filter* | select, or unselect, what the [filter](#configuration) matches in the View; all shown, with no filter |
 | `<leader>ff` | `:filter` *filter* | narrow whichever View is on screen to what the filter matches; all again, with no filter |
-| `<Esc>` | `:clear` | clear the selection, or else the filter; leave the Files screen |
+| `<Esc>` | `:clear` | hide the search's matches, or clear the selection, or else the filter; leave the Files screen |
 | `p` | `:preview` | show or hide the Preview |
 | `gf` `<leader>w` | `:files` `:whole` | a pull request's files; files whole, or their diffs |
 | `<leader>h` | `:voight heatmap` | voight's Heatmap; `:voight on` and `off` start and stop it |

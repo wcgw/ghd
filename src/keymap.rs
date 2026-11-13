@@ -22,7 +22,12 @@ const DEFAULTS: [(&str, &str, &str, Topic); 21] = [
     ("D", "donelist", "toggle the Done list", TRIAGE),
     ("u", "unreadonly", "toggle unread only", TRIAGE),
     ("A", "toggle!", "select all shown, or none", TRIAGE),
-    ("<Esc>", "clear", "clear selection or filter", TRIAGE),
+    (
+        "<Esc>",
+        "clear",
+        "clear the search, selection or filter",
+        TRIAGE,
+    ),
     ("<leader>1", "buffer 1", "View 1", Topic::BUFFERS),
     ("<leader>2", "buffer 2", "View 2", Topic::BUFFERS),
     ("<leader>3", "buffer 3", "View 3", Topic::BUFFERS),

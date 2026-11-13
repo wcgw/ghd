@@ -106,7 +106,7 @@ pub(super) fn add(kit: &mut Kit) {
             ghd.clear(kit);
             Ok(Vec::new())
         })
-        .help("clear the Selection, or else the filter; on the Files screen, back to the list"),
+        .help("hide the search's matches, or clear the Selection, or else the filter; on the Files screen, back to the list"),
     ];
     for command in commands {
         kit.add_command(command);
@@ -215,8 +215,12 @@ impl Ghd {
         self.render_views(kit);
     }
 
-    /// `:clear` (`<Esc>`): clears the Selection, or else the filter; on the Files screen, goes back to the list.
+    /// `:clear` (`<Esc>`): hides the search's matches, as the kit's `<Esc>` does; else clears the Selection, or else
+    /// the filter; on the Files screen, goes back to the list.
     fn clear(&mut self, kit: &mut Kit) {
+        if kit.nohlsearch() {
+            return;
+        }
         if self.files.is_open() {
             self.leave_files(kit);
         } else if !self.selection.is_empty() {
