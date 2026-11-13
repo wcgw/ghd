@@ -5,41 +5,53 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
+# The checks every wcgw app runs, as wcgw-kit does: format, lints as errors and tests on Linux, against the
+# locked dependencies; a build on macOS, which is best effort.
 jobs:
-  # ghd's own code, without voight: fast, and what every change touches.
-  check:
-    name: Format, lints and tests
+  lint:
+    name: Format and lints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Lints
-        run: cargo clippy --all-targets --no-default-features
-      - name: Tests
-        run: cargo test --no-default-features
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # voight is optional: the app builds, and its lints and tests pass, without it too.
+      - name: Lints without voight
+        run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
+      # On the fork of candle that has its wgpu backend: the build most likely to break.
+      - name: Lints with wgpu
+        run: cargo clippy --workspace --all-targets --locked --features wgpu -- -D warnings
 
-  # With voight, whose candle dependencies are slow to build and are what breaks: a build only, no tests, as its
-  # model isn't fetched here.
-  voight:
-    name: Build with voight
+  test:
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Lints
-        run: cargo clippy --all-targets
-      # On the fork of candle that has its wgpu backend: the build most likely to break.
-      - name: Lints with wgpu
-        run: cargo clippy --all-targets --features wgpu
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Tests without voight
+        run: cargo test --workspace --locked --no-default-features
+
+  macos:
+    name: Build on macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --locked
