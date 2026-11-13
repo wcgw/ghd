@@ -1,10 +1,11 @@
 //! A View's buffer: one block per Notification, its columns aligned and laid out for the window's width (`nowrap`,
 //! the plan's D3), so that the cursor stays on its Notification as the list changes around it.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use ratatui::style::{Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use wcgw_kit::doc::{BlockKey, Content, Line, Span};
+use wcgw_kit::jiff::Timestamp;
 
 use super::Target;
 use crate::hl::{self, Group, Theme};
@@ -259,23 +260,13 @@ pub(super) fn clip(spans: Vec<Span<Target>>, width: usize) -> Line<Target> {
     Line::Text(clipped)
 }
 
-/// How long before `now` the moment `then` was, in at most three characters: `now`, `5m`, `3h`, `2d`, `6w`, `2y`.
-/// Each unit is truncated, not rounded. A `then` after `now` (clock skew) counts as `now`.
+/// How long before `now` the moment `then` was, as every wcgw app says it in a column: `now`, `5m`, `3h`, `2d`,
+/// `6w`, `2y` (the kit's `when::ago`).
 pub(super) fn age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let elapsed = now.signed_duration_since(then);
-    if elapsed < TimeDelta::minutes(1) {
-        "now".to_owned()
-    } else if elapsed < TimeDelta::hours(1) {
-        format!("{}m", elapsed.num_minutes())
-    } else if elapsed < TimeDelta::days(1) {
-        format!("{}h", elapsed.num_hours())
-    } else if elapsed < TimeDelta::weeks(1) {
-        format!("{}d", elapsed.num_days())
-    } else if elapsed < TimeDelta::days(365) {
-        format!("{}w", elapsed.num_weeks())
-    } else {
-        format!("{}y", elapsed.num_days() / 365)
-    }
+    let at = |time: DateTime<Utc>| {
+        Timestamp::from_millisecond(time.timestamp_millis()).unwrap_or_default()
+    };
+    wcgw_kit::when::ago(at(then), at(now))
 }
 
 /// `style` with nothing but its background, to lay under text in groups of its own.
@@ -288,6 +279,8 @@ pub(super) fn background(style: Style) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeDelta;
+
     use super::*;
 
     #[test]
