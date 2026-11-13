@@ -6,6 +6,7 @@ use wcgw_kit::shell::{Command, Segment, Side};
 
 use super::{Effect, Effects, Ghd, Io, Kit};
 use crate::assessment::{self, Assessed, Readiness};
+use crate::hl::{self, Group};
 use crate::keymap::{Mode, VOIGHT};
 
 /// What `:voight` takes.
@@ -24,9 +25,16 @@ pub(super) fn install(kit: &mut Kit) {
                 }
             }),
     );
-    kit.add_segment(Segment::new(Side::Right, 20, |ghd: &Ghd, _| {
-        ghd.voight_label()
-    }));
+    // One segment for each group the label is drawn in: voight's own, or while the Heatmap shows, the colour its
+    // Assessment shades the text with, the nearest of three.
+    for group in [hl::VOIGHT, hl::HEAT_HUMAN, hl::HEAT_EVEN, hl::HEAT_LLM] {
+        kit.add_segment(
+            Segment::new(Side::Right, 20, move |ghd: &Ghd, _| {
+                ghd.voight_label().filter(|_| ghd.voight_group() == group)
+            })
+            .with_group(group),
+        );
+    }
     kit.keymap_mut().bind(
         &[Mode::Normal],
         "<leader>h",
@@ -111,6 +119,19 @@ impl Ghd {
         }
     }
 
+    /// The group voight's label is drawn in: the Heatmap's nearest to its Assessment while the Heatmap shows, else
+    /// voight's own.
+    fn voight_group(&self) -> Group {
+        match self.assessment_on_screen() {
+            Some(assessment) if self.heatmap => match assessment.share {
+                share if share < 0.25 => hl::HEAT_HUMAN,
+                share if share < 0.75 => hl::HEAT_EVEN,
+                _ => hl::HEAT_LLM,
+            },
+            _ => hl::VOIGHT,
+        }
+    }
+
     /// The Assessment of the text on screen, once made.
     fn assessment_on_screen(&self) -> Option<&assessment::Assessment> {
         match self.assessments.as_ref()?.get(self.assessable.as_ref()?)? {
@@ -147,7 +168,7 @@ impl Ghd {
 
     /// Notes what on screen voight would assess, and asks for its Assessment once voight is ready and assessing
     /// nothing else.
-    pub(super) fn assess(&mut self, kit: &mut Kit) -> Effects {
+    pub(super) fn assess(&mut self, kit: &Kit) -> Effects {
         if self.assessments.is_none() {
             self.assessable = None;
             return Vec::new();

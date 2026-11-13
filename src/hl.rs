@@ -24,6 +24,12 @@ pub const AGE: Group = Group::new("GhdAge");
 pub const MESSAGE: Group = Group::new("GhdMessage");
 /// What went wrong, said in place of a list or a Preview.
 pub const ERROR: Group = Group::new("GhdError");
+/// The filter typed, in the statusline.
+pub const FILTER: Group = Group::new("GhdFilter");
+/// "fetching…", in the statusline.
+pub const FETCHING: Group = Group::new("GhdFetching");
+/// voight's Assessment, in the statusline, while the Heatmap doesn't show.
+pub const VOIGHT: Group = Group::new("GhdVoight");
 /// A hint, such as why a mention couldn't be looked for.
 pub const HINT: Group = Group::new("GhdHint");
 /// A Preview's title.
@@ -70,7 +76,7 @@ pub const HEAT_EVEN: Group = Group::new("VoightHeatEven");
 pub const HEAT_LLM: Group = Group::new("VoightHeatLlm");
 
 /// ghd's groups and the groups they are drawn as when a colorscheme says nothing of them.
-const GROUPS: [(Group, Group); 35] = [
+const GROUPS: [(Group, Group); 38] = [
     (UNREAD, Group::BOLD),
     (READ, Group::COMMENT),
     (SELECTED, Group::VISUAL),
@@ -81,6 +87,9 @@ const GROUPS: [(Group, Group); 35] = [
     (AGE, Group::COMMENT),
     (MESSAGE, Group::COMMENT),
     (ERROR, Group::ERROR_MSG),
+    (FILTER, Group::DIAGNOSTIC_WARN),
+    (FETCHING, Group::DIAGNOSTIC_INFO),
+    (VOIGHT, Group::STATEMENT),
     (HINT, Group::NON_TEXT),
     (PREVIEW_TITLE, Group::TITLE),
     (CI_PASSING, Group::DIAGNOSTIC_OK),
@@ -121,6 +130,9 @@ hi GhdReason guifg=#c099ff
 hi GhdAge guifg=#737aa2
 hi GhdMessage gui=italic guifg=#636da6
 hi GhdError guifg=#ff757f
+hi GhdFilter guifg=#ffc777
+hi GhdFetching gui=italic guifg=#65bcff
+hi GhdVoight guifg=#c099ff
 hi GhdHint guifg=#545c7e
 hi GhdPreviewTitle gui=bold guifg=#c8d3f5
 hi GhdCiPassing guifg=#c3e88d

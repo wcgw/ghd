@@ -24,7 +24,7 @@ fn rows_line_up_in_columns() {
 fn views_are_buffers_in_the_tabline() {
     let mut app = app();
 
-    assert_eq!(rows(&app)[0], " Inbox  Reviews  Read");
+    assert_eq!(rows(&app)[0], " Inbox (1)  Reviews (1)  Read (0)");
 
     app.press("gt");
     assert!(shows(&app, "Add polling"));
@@ -267,20 +267,20 @@ fn states_are_looked_up_once_the_inbox_arrives() {
 }
 
 #[test]
-fn statusline_counts_whats_unread_in_the_view() {
+fn tabs_count_whats_unread_in_each_view_or_whats_done() {
     let mut app = app();
 
-    assert!(
-        statusline(&app).contains("1 unread"),
-        "{}",
-        statusline(&app)
+    assert_eq!(rows(&app)[0], " Inbox (1)  Reviews (1)  Read (0)");
+
+    app.press("x");
+    app.press("D");
+    assert_eq!(
+        rows(&app)[0],
+        " Inbox (1)  Reviews (1)  Read (0)",
+        "Done, in the Done list"
     );
-    app.press("<leader>3");
-    assert!(
-        statusline(&app).contains("0 unread"),
-        "{}",
-        statusline(&app)
-    );
+    app.press("D");
+    assert_eq!(rows(&app)[0], " Inbox (0)  Reviews (0)  Read (0)");
 }
 
 #[test]
@@ -328,4 +328,56 @@ fn segments_go_least_important_first_when_the_line_is_short() {
 
     assert!(line.contains("Done list"), "{line:?}");
     assert!(!line.contains("fetching…"), "{line:?}");
+}
+
+#[test]
+fn a_view_in_a_vsplit_is_laid_out_for_its_window() {
+    let mut app = app();
+
+    app.press(":vsplit<CR>");
+
+    // The window on the left, which the other, a cell narrower, shares the buffer with.
+    let left: Vec<String> = rows(&app)
+        .iter()
+        .map(|row| row.split('│').next().unwrap_or_default().to_owned())
+        .collect();
+    assert!(left[1].ends_with("review-requested now"), "{left:#?}");
+    assert!(
+        left[2].ends_with("subscribed        2d"),
+        "nothing wraps: {left:#?}"
+    );
+}
+
+#[test]
+fn every_views_cursor_comes_back_from_a_snapshot() {
+    let mut app = app();
+    app.press("j");
+    app.press("<leader>3");
+    let snapshot = app.app.snapshot(Utc::now()).expect("an Inbox");
+    assert_eq!(snapshot.view, "Read");
+
+    let (ghd, kit) = Ghd::restored(views(), false, Some(snapshot));
+    let mut restored = Harness::new(ghd, kit, 80, 24);
+    assert_eq!(cursor_title(&mut restored).as_deref(), Some("Old news"));
+
+    restored.press("<leader>1");
+
+    assert_eq!(
+        cursor_title(&mut restored).as_deref(),
+        Some("Old news"),
+        "the Inbox's too"
+    );
+}
+
+#[test]
+fn a_narrow_window_cuts_the_repository_before_the_title() {
+    let mut app = app_with(views(), false, 50, 24);
+    let mut long = notifications();
+    long[0].repository = "an-organization/with-a-long-repository".to_owned();
+    app.send(fetched(long));
+
+    let row = &rows(&app)[row_of(&app, "an-orga…")];
+
+    assert!(row.contains("Add polling"), "{row:?}");
+    assert!(row.ends_with("review-requested now"), "{row:?}");
 }

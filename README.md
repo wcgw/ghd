@@ -11,9 +11,9 @@ a trip to the browser.
 ghd is built on [wcgw-kit](https://github.com/wcgw/wcgw-kit), so it feels like Neovim: Vim's motions, `:` commands
 with completion and history, `:map`, `:help`, highlight groups and colorschemes, windows, and which-key.
 
-- **Views**: buffers you define, in the tabline, each showing the notifications its filter matches, in GitHub's inbox
-  filter syntax (`org:cel-rust`, `reason:review-requested`, `is:pr is:unread`, …). The built-in Inbox View shows them
-  all.
+- **Views**: buffers you define, in the tabline with how many they show are unread, each showing the notifications
+  its filter matches, in GitHub's inbox filter syntax (`org:cel-rust`, `reason:review-requested`, `is:pr is:unread`,
+  …). The built-in Inbox View shows them all.
 - **Preview**: `p` opens a window below the list showing what the notification at the cursor is about: its number,
   title, state, author and labels, then its description and its comments, the ones that mention you marked. It opens
   on the comment the notification is about, or the description you're asked to review; `]]` and `[[` step through

@@ -44,11 +44,11 @@ const DEFAULTS: [(&str, &str, &str, Topic); 26] = [
     ("<leader>?", "help", "help", Topic::SEARCHING),
 ];
 
-/// ghd's default maps that go on past a command, as a user's would: `s` selects and moves down, `<leader>f` starts
-/// typing a filter. Run as `:nnoremap` lines when ghd starts, before `init.vim`, which may change them.
-pub const MAPS: [&str; 2] = [
-    "nnoremap s :toggle<CR>j",
-    "nnoremap <leader>f :filter<Space>",
+/// ghd's defaults that go on past a command: `s` selects and moves down, `<leader>f` starts typing a filter. Keys,
+/// the keys they stand for, what which-key says of them, and their `:help` topic.
+const KEYS: [(&str, &str, &str, Topic); 2] = [
+    ("s", ":toggle<CR>j", "select or not, and down", TRIAGE),
+    ("<leader>f", ":filter<Space>", "filter the View", TRIAGE),
 ];
 
 /// The kit's bindings and ghd's.
@@ -57,6 +57,9 @@ pub fn keymap() -> Keymap {
     let mut keymap = Keymap::new();
     for (notation, command, description, topic) in DEFAULTS {
         keymap.bind(&[Mode::Normal], notation, command, description, topic);
+    }
+    for (notation, keys, description, topic) in KEYS {
+        keymap.bind_keys(&[Mode::Normal], notation, keys, description, topic);
     }
     keymap
 }

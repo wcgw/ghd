@@ -274,3 +274,18 @@ fn markdown_files_shown_whole_are_assessed() {
         statusline(&app)
     );
 }
+
+#[test]
+fn the_label_takes_the_heatmaps_colour_while_it_shows() {
+    let (mut app, effects) = assessing("Some prose to assess.", true);
+    let (key, text) = asked(&effects).expect("asked");
+    app.send(assessed(key, &text, 1.0));
+    assert_eq!(style_of(&app, "voight 100%").fg, style(&app, hl::VOIGHT).fg);
+
+    app.press("<leader>h");
+
+    assert_eq!(
+        style_of(&app, "voight 100%").bg,
+        style(&app, hl::HEAT_LLM).bg
+    );
+}

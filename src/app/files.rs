@@ -1,18 +1,18 @@
 //! The Files screen: a pull request's Changed files in the list's window, the one at its cursor in the window below,
 //! whole or as its diff.
 //!
-//! Each pull request's list and each file, as it shows, gets a buffer of its own, so that coming back to one finds it
-//! where it was left; a file shown for the first time shows from its top.
+//! The list and the file have a buffer each; another pull request's list shows from its first file, and another file
+//! from its top.
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthStr;
 use wcgw_kit::BufferId;
-use wcgw_kit::doc::{BlockKey, Content, Cursor, Document, Line, Span};
+use wcgw_kit::doc::{BlockKey, Content, Cursor, Document, Layout, Line, Span};
 use wcgw_kit::shell::{Placement, Size, WindowId};
 
-use super::{Effect, Effects, Ghd, Io, Kit, PREVIEW_MIN_HEIGHT, Target, counted, in_window, list};
+use super::{Effect, Effects, Ghd, Io, Kit, PREVIEW_MIN_HEIGHT, Target, counted, list};
 use crate::assessment;
 use crate::fetched::Fetched;
 use crate::files::{ChangedFile, ChangedFiles, FileStatus, FileText, LineChange};
@@ -40,19 +40,35 @@ enum Showing {
 #[derive(Debug, Default)]
 pub(super) struct Files {
     screen: Option<Screen>,
-    /// Each pull request's list of files.
-    lists: HashMap<ThreadId, BufferId>,
-    /// Each file shown, as it shows, by its pull request and contents path.
-    drawn: HashMap<(ThreadId, String, Showing), FileDrawing>,
-    /// The buffer saying why there's no file to show.
-    placeholder: Option<BufferId>,
+    /// The list's buffer and the file's, once the screen first opened.
+    buffers: Option<(BufferId, BufferId)>,
+    /// Each file's highlighting so far, as it shows, by its pull request and contents path; `None` for one in a
+    /// language ghd doesn't know, or Markdown, which is highlighted as it's drawn.
+    highlighting: HashMap<FileKey, Option<Highlighting>>,
+    /// What the list was drawn for last: the pull request, whether its files had arrived and how many, the width.
+    list_drawn: Option<(ThreadId, u8, usize, u16)>,
+    /// What the file's buffer was drawn for last.
+    file_drawn: Option<FileDrawn>,
     fetched: ChangedFiles,
     /// A list's fetch is under way; there's never more than one.
     list_fetching: bool,
     /// A whole file's fetch is under way; there's never more than one.
     text_fetching: bool,
-    /// How many buffers were made, to name the next.
-    made: usize,
+}
+
+/// A Changed file as it shows: of which pull request, its contents path, and whole or as its diff.
+type FileKey = (ThreadId, String, Showing);
+
+/// What the file's buffer was drawn for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileDrawn {
+    /// The file; `None` for what's said in its place.
+    file: Option<FileKey>,
+    /// The width, the Heatmap's version, whether its text arrived, and how many lines were highlighted.
+    width: u16,
+    heat: u64,
+    text: u8,
+    highlighted: usize,
 }
 
 /// The Files screen while it's open: which pull request it is of, and where it shows.
@@ -61,26 +77,12 @@ struct Screen {
     /// The pull request's Notification, as it was when the screen opened.
     notification: Notification,
     request: FilesRequest,
-    /// The list's buffer.
-    list: BufferId,
     /// The window below, where files show.
     window: WindowId,
     /// The window was the Preview's, to give back.
     lent: bool,
     /// How the files that can show either way show; a new one always shows whole, and a removed one as its diff.
     showing: Showing,
-    /// What the list was drawn for: whether its files had arrived, and how many.
-    list_stamp: Option<(u8, usize)>,
-}
-
-/// A file's buffer, its highlighting so far, and what it was drawn for.
-#[derive(Debug)]
-struct FileDrawing {
-    buffer: BufferId,
-    /// `None` for a file in a language ghd doesn't know, or Markdown, which is highlighted as it's drawn.
-    highlighting: Option<Highlighting>,
-    /// The width, the Heatmap's version, whether its text arrived, and how many lines were highlighted.
-    stamp: Option<(u16, u64, u8, usize)>,
 }
 
 impl Files {
@@ -103,10 +105,9 @@ impl Files {
     pub(super) fn forget(&mut self) -> Option<ThreadId> {
         let thread = self.screen.as_ref()?.notification.thread;
         self.fetched.forget(thread);
-        self.drawn.retain(|(of, ..), _| *of != thread);
-        if let Some(screen) = &mut self.screen {
-            screen.list_stamp = None;
-        }
+        self.highlighting.retain(|(of, ..), _| *of != thread);
+        self.list_drawn = None;
+        self.file_drawn = None;
         Some(thread)
     }
 
@@ -209,39 +210,29 @@ impl Ghd {
             ));
             return;
         }
-        let thread = notification.thread;
-        let list = if let Some(&list) = self.files.lists.get(&thread) {
-            list
-        } else {
-            let number = notification
-                .subject_url
-                .rsplit('/')
-                .next()
-                .unwrap_or_default();
-            let list = kit.add_buffer(format!("files #{number}"), Document::new(), false);
-            self.files.lists.insert(thread, list);
-            list
-        };
-        let placeholder = self.files_placeholder(kit);
+        let (list, file) = *self.files.buffers.get_or_insert_with(|| {
+            (
+                kit.add_buffer("files", Document::new(), false),
+                kit.add_buffer("file", Document::new(), false),
+            )
+        });
         let (window, lent) = if let Some(window) = self.preview.lend() {
             (window, true)
         } else {
-            let window = in_window(kit, self.list_window, |kit| {
-                kit.open_window(Placement::Below, Size::Percent(75), placeholder)
-            })
-            .unwrap_or_else(|| kit.current_window());
-            (window, false)
+            kit.focus_window(self.list_window);
+            (
+                kit.open_window(Placement::Below, Size::Percent(75), file),
+                false,
+            )
         };
         kit.focus_window(self.list_window);
         kit.show_buffer(list);
         self.files.screen = Some(Screen {
             notification,
             request,
-            list,
             window,
             lent,
             showing: Showing::Diff,
-            list_stamp: None,
         });
     }
 
@@ -285,21 +276,17 @@ impl Ghd {
     }
 
     /// The Changed file at the cursor of the Files screen's list, by its place in the list.
-    fn selected_file(&self, kit: &mut Kit) -> Option<usize> {
-        let screen = self.files.screen.as_ref()?;
-        let thread = screen.notification.thread;
-        in_window(kit, self.list_window, |kit| {
-            match kit.targets_under_cursor()[1] {
-                Some(Target::File(of, index)) if *of == thread => Some(*index),
-                _ => None,
-            }
-        })
-        .flatten()
+    fn selected_file(&self, kit: &Kit) -> Option<usize> {
+        let thread = self.files.screen.as_ref()?.notification.thread;
+        match kit.targets_in(self.list_window)[1] {
+            Some(Target::File(of, index)) if *of == thread => Some(*index),
+            _ => None,
+        }
     }
 
     /// Where GitHub shows the Changed file at the cursor: in the pull request's "Files changed" tab, at the file; or
     /// the tab itself while the files aren't fetched; and the pull request's thread, which opening it marks read.
-    pub(super) fn selected_file_url(&self, kit: &mut Kit) -> Option<(String, ThreadId)> {
+    pub(super) fn selected_file_url(&self, kit: &Kit) -> Option<(String, ThreadId)> {
         let screen = self.files.screen.as_ref()?;
         let page = &screen.notification.subject_url;
         let file = self
@@ -312,26 +299,20 @@ impl Ghd {
         Some((url, screen.notification.thread))
     }
 
-    /// The buffer saying why there's no file to show.
-    fn files_placeholder(&mut self, kit: &mut Kit) -> BufferId {
-        if let Some(placeholder) = self.files.placeholder {
-            return placeholder;
-        }
-        let placeholder = kit.add_buffer("file", Document::new(), false);
-        self.files.placeholder = Some(placeholder);
-        placeholder
-    }
-
     /// Brings the Files screen up to date: the list as fetched, the file at its cursor below, fetching what they
     /// need.
     pub(super) fn sync_files(&mut self, kit: &mut Kit) -> Effects {
-        let Some(screen) = &self.files.screen else {
+        let (Some(screen), Some((list, file))) = (&self.files.screen, self.files.buffers) else {
             return Vec::new();
         };
-        if kit.window_buffer(self.list_window) != Some(screen.list) {
+        if kit.window_buffer(self.list_window) != Some(list) {
             // The list's window shows something else now: the user went elsewhere.
             self.leave_files(kit);
             return Vec::new();
+        }
+        if kit.window_buffer(screen.window) != Some(file) {
+            // The Preview's window, lent.
+            kit.show_buffer_in(screen.window, file);
         }
         let mut effects = self.files_to_fetch();
         self.draw_list(kit);
@@ -421,16 +402,24 @@ impl Ghd {
         let Some(screen) = &self.files.screen else {
             return;
         };
+        let Some((list, _)) = self.files.buffers else {
+            return;
+        };
         let n = &screen.notification;
         let fetched = self.files.fetched.list(n.thread, n.updated_at);
-        let stamp = match fetched {
-            None | Some(Fetched::Fetching) => (0, 0),
-            Some(Fetched::Failed(_)) => (1, 0),
-            Some(Fetched::Done(list)) => (2, list.len()),
+        let width = kit.text_width(list);
+        let drawn = match fetched {
+            None | Some(Fetched::Fetching) => (n.thread, 0, 0, width),
+            Some(Fetched::Failed(_)) => (n.thread, 1, 0, width),
+            Some(Fetched::Done(files)) => (n.thread, 2, files.len(), width),
         };
-        if screen.list_stamp == Some(stamp) {
+        if self.files.list_drawn == Some(drawn) {
             return;
         }
+        let another = self
+            .files
+            .list_drawn
+            .is_none_or(|before| before.0 != n.thread);
         let number = n.subject_url.rsplit('/').next().unwrap_or_default();
         let mut winbar = vec![
             (format!(" #{number} "), hl::AGE),
@@ -456,16 +445,16 @@ impl Ghd {
                     (" ".to_owned(), Group::WIN_BAR),
                     (format!("\u{2212}{removed} "), Group::REMOVED),
                 ]);
-                file_rows(n.thread, files, kit.size().0)
+                file_rows(n.thread, files, width)
             }
         };
-        let list = screen.list;
         let shown = kit.buffer_mut(list);
         shown.set_winbar(Some(winbar));
         shown.doc_mut().set_blocks(blocks);
-        if let Some(screen) = &mut self.files.screen {
-            screen.list_stamp = Some(stamp);
+        if another {
+            kit.set_cursor(self.list_window, Cursor::new());
         }
+        self.files.list_drawn = Some(drawn);
     }
 
     /// Gives the list no more rows than it takes to show every file, up to a quarter of the screen, the file below
@@ -491,87 +480,92 @@ impl Ghd {
         kit.set_window_size(screen.window, Size::Shared);
     }
 
-    /// Shows the placeholder below, saying `says`.
+    /// Shows below what's said in place of a file: `says`.
     fn show_file_placeholder(&mut self, kit: &mut Kit, says: &str) {
-        let Some(window) = self.files.window() else {
+        let (Some(window), Some((_, file))) = (self.files.window(), self.files.buffers) else {
             return;
         };
-        let placeholder = self.files_placeholder(kit);
-        let shown = kit.buffer_mut(placeholder);
+        let shown = kit.buffer_mut(file);
         shown.set_winbar(None);
         shown.doc_mut().set_blocks(list::message(says, hl::MESSAGE));
-        if kit.window_buffer(window) != Some(placeholder) {
-            kit.show_buffer_in(window, placeholder);
+        if self
+            .files
+            .file_drawn
+            .as_ref()
+            .is_none_or(|drawn| drawn.file.is_some())
+        {
+            kit.set_cursor(window, Cursor::new());
         }
+        self.files.file_drawn = Some(FileDrawn {
+            file: None,
+            width: 0,
+            heat: 0,
+            text: 0,
+            highlighted: 0,
+        });
     }
 
-    /// Shows `file` below, from its own buffer, drawn again when the width, the Heatmap, its text or how far it's
-    /// highlighted changed.
+    /// Shows `file` below: drawn again when the width, the Heatmap, its text or how far it's highlighted changed, and
+    /// from its top when it's another.
     fn show_file(&mut self, kit: &mut Kit, file: &ChangedFile) {
-        let Some(screen) = &self.files.screen else {
+        let (Some(screen), Some((_, buffer))) = (&self.files.screen, self.files.buffers) else {
             return;
         };
         let (thread, window) = (screen.notification.thread, screen.window);
         let showing = self.files.showing(file);
         let key = (thread, file.contents_path.clone(), showing);
-        if !self.files.drawn.contains_key(&key) {
-            self.files.made += 1;
-            let buffer =
-                kit.add_buffer(format!("file {}", self.files.made), Document::new(), false);
-            let highlighting = None;
-            self.files.drawn.insert(
-                key.clone(),
-                FileDrawing {
-                    buffer,
-                    highlighting,
-                    stamp: None,
-                },
-            );
-        }
-        let buffer = self.files.drawn[&key].buffer;
-        if kit.window_buffer(window) != Some(buffer) {
-            in_window(kit, window, |kit| kit.show_buffer_at(buffer, Cursor::new()));
-        }
-        // As far down as it shows, and the window's height more.
-        let height = usize::from(kit.size().1);
-        let top = in_window(kit, window, |kit| kit.top_row(buffer))
-            .flatten()
-            .unwrap_or(0);
-        let down_to = top + height + HIGHLIGHT_AHEAD;
-        self.highlight(file, &key, showing, down_to);
-        let text_state = match self.files.text(thread, file) {
-            None | Some(Fetched::Fetching) => 0,
-            Some(Fetched::Failed(_)) => 1,
-            Some(Fetched::Done(_)) => 2,
-        };
-        let drawing = &self.files.drawn[&key];
-        let highlighted = drawing
-            .highlighting
+        let area = kit.window_text_area(window);
+        let width = area.map_or(kit.size().0, |area| area.width);
+        let another = self
+            .files
+            .file_drawn
             .as_ref()
-            .map_or(0, |highlighting| highlighting.lines().len());
-        let stamp = (kit.size().0, self.heat_version, text_state, highlighted);
-        if drawing.stamp == Some(stamp) {
+            .is_none_or(|drawn| drawn.file.as_ref() != Some(&key));
+        // As far down as the cursor, and the window's height more: the window shows no further.
+        let row = if another {
+            0
+        } else {
+            kit.window_cursor(window).map_or(0, |cursor| {
+                cursor
+                    .screen(&Layout::new(kit.buffer(buffer).doc(), width))
+                    .row
+            })
+        };
+        let height = usize::from(area.map_or(kit.size().1, |area| area.height));
+        self.highlight(file, &key, showing, row + height + HIGHLIGHT_AHEAD);
+        let drawn = FileDrawn {
+            text: match self.files.text(thread, file) {
+                None | Some(Fetched::Fetching) => 0,
+                Some(Fetched::Failed(_)) => 1,
+                Some(Fetched::Done(_)) => 2,
+            },
+            highlighted: self
+                .files
+                .highlighting
+                .get(&key)
+                .and_then(Option::as_ref)
+                .map_or(0, |highlighting| highlighting.lines().len()),
+            file: Some(key),
+            width,
+            heat: self.heat_version,
+        };
+        if self.files.file_drawn.as_ref() == Some(&drawn) {
             return;
         }
-        let lines = self.file_lines(kit, thread, file, showing);
+        let lines = self.file_lines(kit, thread, file, showing, width);
         let shown = kit.buffer_mut(buffer);
         shown.set_winbar(Some(vec![(format!(" {} ", file.path), Group::WIN_BAR)]));
         shown
             .doc_mut()
             .set_blocks([(BlockKey::new("file"), Content::from(lines))]);
-        if let Some(drawing) = self.files.drawn.get_mut(&key) {
-            drawing.stamp = Some(stamp);
+        if another {
+            kit.set_cursor(window, Cursor::new());
         }
+        self.files.file_drawn = Some(drawn);
     }
 
     /// Highlights `file`, shown as `showing`, down to line `down_to`, if ghd knows its language.
-    fn highlight(
-        &mut self,
-        file: &ChangedFile,
-        key: &(ThreadId, String, Showing),
-        showing: Showing,
-        down_to: usize,
-    ) {
+    fn highlight(&mut self, file: &ChangedFile, key: &FileKey, showing: Showing, down_to: usize) {
         if file.is_markdown() && showing == Showing::Whole {
             return;
         }
@@ -583,18 +577,16 @@ impl Ghd {
                 _ => None,
             },
         };
-        let Some(drawing) = self.files.drawn.get_mut(key) else {
-            return;
-        };
-        if drawing.highlighting.is_none()
+        if !self.files.highlighting.contains_key(key)
             && let Some(text) = text
         {
-            drawing.highlighting = match showing {
+            let highlighting = match showing {
                 Showing::Whole => Highlighting::of_file(&file.path, &text),
                 Showing::Diff => Highlighting::of_diff(&file.path, &text),
             };
+            self.files.highlighting.insert(key.clone(), highlighting);
         }
-        if let Some(highlighting) = &mut drawing.highlighting {
+        if let Some(Some(highlighting)) = self.files.highlighting.get_mut(key) {
             highlighting.down_to(down_to);
         }
     }
@@ -607,6 +599,7 @@ impl Ghd {
         thread: ThreadId,
         file: &ChangedFile,
         showing: Showing,
+        width: u16,
     ) -> Vec<Line<Target>> {
         let mut lines = Vec::new();
         match (file.status, &file.previous_path) {
@@ -620,9 +613,9 @@ impl Ghd {
         }
         let highlighted = self
             .files
-            .drawn
+            .highlighting
             .get(&(thread, file.contents_path.clone(), showing))
-            .and_then(|drawing| drawing.highlighting.as_ref())
+            .and_then(Option::as_ref)
             .map(Highlighting::lines);
         let what = match &file.patch {
             _ if file.status == FileStatus::Removed => {
@@ -631,8 +624,10 @@ impl Ghd {
                     hl::AGE,
                 )]
             }
-            _ if showing == Showing::Whole => self.whole_lines(kit, thread, file, highlighted),
-            Some(patch) => diff_lines(kit, patch, highlighted),
+            _ if showing == Showing::Whole => {
+                self.whole_lines(kit, thread, file, highlighted, width)
+            }
+            Some(patch) => diff_lines(kit, patch, highlighted, width),
             // Renamed or copied as it was: that's all there is to say.
             None if file.additions + file.deletions == 0 && !lines.is_empty() => Vec::new(),
             None => vec![said(
@@ -656,6 +651,7 @@ impl Ghd {
         thread: ThreadId,
         file: &ChangedFile,
         highlighted: Option<&[Classes]>,
+        width: u16,
     ) -> Vec<Line<Target>> {
         let (text, truncated) = match self.files.text(thread, file) {
             None | Some(Fetched::Fetching) => return vec![said("Fetching…", hl::MESSAGE)],
@@ -675,10 +671,7 @@ impl Ghd {
         let gutter = !changes.is_empty();
         let (drawn, sources): (Vec<Line<Target>>, Vec<Option<usize>>) = if file.is_markdown() {
             let theme = kit.theme();
-            let width = kit
-                .size()
-                .0
-                .saturating_sub(if gutter { GUTTER_WIDTH } else { 0 });
+            let width = width.saturating_sub(if gutter { GUTTER_WIDTH } else { 0 });
             let key = assessment::Key {
                 thread,
                 as_of: self
@@ -790,9 +783,14 @@ fn said(text: &str, group: Group) -> Line<Target> {
 /// The lines of `patch`, a file's diff, highlighted as far as `highlighted` goes. Lines added and removed are on the
 /// colorscheme's `DiffAdd` and `DiffDelete` background, across the window if they fit in it, their `+` and `-` in
 /// `Added` and `Removed`; hunks' `@@` lines are muted.
-fn diff_lines(kit: &Kit, patch: &str, highlighted: Option<&[Classes]>) -> Vec<Line<Target>> {
+fn diff_lines(
+    kit: &Kit,
+    patch: &str,
+    highlighted: Option<&[Classes]>,
+    width: u16,
+) -> Vec<Line<Target>> {
     let theme = kit.theme();
-    let width = usize::from(kit.size().0);
+    let width = usize::from(width);
     patch
         .lines()
         .enumerate()
@@ -916,7 +914,7 @@ fn gutter_mark(change: Option<LineChange>) -> Span<Target> {
 
 impl Ghd {
     /// What the Files screen shows that voight would assess: the file at the cursor, if it's Markdown shown whole.
-    pub(super) fn file_assessable(&self, kit: &mut Kit) -> Option<(assessment::Key, String)> {
+    pub(super) fn file_assessable(&self, kit: &Kit) -> Option<(assessment::Key, String)> {
         let screen = self.files.screen.as_ref()?;
         let file = self.files.files()?.get(self.selected_file(kit)?)?;
         if !file.is_markdown() || self.files.showing(file) != Showing::Whole {

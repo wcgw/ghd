@@ -1,10 +1,7 @@
 //! The Preview: a window below the list (the kit's D11) showing what the Notification at the list's cursor is about.
 //!
-//! Each Preview fetched gets a buffer of its own, its body and each comment a block, so that `]]` and `[[` step
-//! through the comments and the window opens on the one the Notification is about, and comes back where it was
-//! left. Until it's fetched, or when there's none, a buffer shared by all says why.
-
-use std::collections::HashMap;
+//! Its buffer shows the Preview, its body and each comment a block, so that `]]` and `[[` step through the comments,
+//! and the window opens on the one the Notification is about; until it's fetched, or when there's none, it says why.
 
 use chrono::{DateTime, Utc};
 use ratatui::text::Line as Drawn;
@@ -14,7 +11,7 @@ use wcgw_kit::shell::{Placement, Size, WindowId};
 
 use super::{
     Effect, Effects, Ghd, Kit, Msg, PREVIEW_MIN_HEIGHT, PREVIEW_REST, Target, WantedPreview,
-    counted, in_window, list,
+    counted, list,
 };
 use crate::assessment::{self, Assessed, Window};
 use crate::fetched::Fetched;
@@ -26,19 +23,16 @@ use crate::markdown::{self, Look};
 use crate::preview::{Body, Ci, Mark, Note, Place, Preview, PullRequestSummary, ReviewDecision};
 use crate::state::SubjectState;
 
-/// The Preview's window, and its buffers.
+/// The Preview's window, and its buffer.
 #[derive(Debug)]
 pub(super) struct Pane {
     /// The window, while it's open.
     window: Option<WindowId>,
     /// The user wants it open: it is, unless the terminal is too short.
     wanted: bool,
-    /// The buffer saying why there's no Preview to show.
-    placeholder: BufferId,
-    /// The buffer of each thread's Preview, with the activity it's of, and how it was drawn.
-    buffers: HashMap<ThreadId, Drawing>,
-    /// How many buffers were made, to name the next.
-    made: usize,
+    buffer: BufferId,
+    /// What the buffer was drawn for last.
+    drawn: Option<DrawnFor>,
     /// The thread at the list's cursor, as last seen, and whether the cursor has rested on it.
     at: Option<(ThreadId, bool)>,
     /// Counts the cursor's moves: a rest asked for before the latest is stale.
@@ -47,23 +41,24 @@ pub(super) struct Pane {
     fetching: bool,
 }
 
-/// A Preview's buffer, and what it was drawn for.
-#[derive(Debug)]
-struct Drawing {
-    as_of: DateTime<Utc>,
-    buffer: BufferId,
-    /// The width and the Heatmap's version it was drawn for.
-    stamp: (u16, u64),
+/// What the Preview's buffer was drawn for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrawnFor {
+    /// The thread, with the activity its Preview is of, while its Preview shows; `None` for what's said in its
+    /// place.
+    preview: Option<(ThreadId, DateTime<Utc>)>,
+    /// The width, and the Heatmap's version.
+    width: u16,
+    heat: u64,
 }
 
 impl Pane {
-    pub(super) fn new(placeholder: BufferId) -> Self {
+    pub(super) fn new(buffer: BufferId) -> Self {
         Self {
             window: None,
             wanted: false,
-            placeholder,
-            buffers: HashMap::new(),
-            made: 0,
+            buffer,
+            drawn: None,
             at: None,
             generation: 0,
             fetching: false,
@@ -86,14 +81,14 @@ impl Pane {
         self.at = None;
     }
 
-    /// Opens the window below `list`, showing the placeholder until the next look at the cursor.
+    /// Opens the window below `list`.
     fn open(&mut self, kit: &mut Kit, list: WindowId) {
         if self.window.is_some() {
             return;
         }
         let current = kit.current_window();
         kit.focus_window(list);
-        self.window = Some(kit.open_window(Placement::Below, Size::Percent(75), self.placeholder));
+        self.window = Some(kit.open_window(Placement::Below, Size::Percent(75), self.buffer));
         kit.focus_window(current);
         self.at = None;
     }
@@ -139,14 +134,14 @@ impl Pane {
         self.fetching = false;
     }
 
-    /// Forgets `thread`'s buffer, so that its Preview opens where it opens once fetched again.
+    /// Forgets what's drawn of `thread`, so that its Preview opens where it opens once fetched again.
     pub(super) fn forget(&mut self, thread: ThreadId) {
         if let Some((at, _)) = &mut self.at
             && *at == thread
         {
             self.at = None;
         }
-        self.buffers.remove(&thread);
+        self.drawn = None;
     }
 }
 
@@ -177,6 +172,10 @@ impl Ghd {
         let Some(window) = self.preview.window else {
             return Vec::new();
         };
+        if kit.window_buffer(window) != Some(self.preview.buffer) {
+            // Given back by the Files screen.
+            kit.show_buffer_in(window, self.preview.buffer);
+        }
         let thread = self.views[self.current].cursor;
         let mut effects = Vec::new();
         if self.preview.at.map(|(at, _)| at) != thread {
@@ -228,8 +227,7 @@ impl Ghd {
         }))]
     }
 
-    /// Shows the placeholder in `window`, saying what there is of `notification` until its Preview is fetched, or
-    /// why there's none.
+    /// Shows in `window` what there is of `notification` until its Preview is fetched, or why there's none.
     fn show_placeholder(
         &mut self,
         kit: &mut Kit,
@@ -274,17 +272,27 @@ impl Ghd {
                 ]
             }
         };
-        let buffer = self.preview.placeholder;
-        let doc = kit.buffer_mut(buffer);
-        doc.set_winbar(Some(vec![(" Preview ".to_owned(), Group::WIN_BAR)]));
-        doc.doc_mut().set_blocks(blocks);
-        if kit.window_buffer(window) != Some(buffer) {
-            kit.show_buffer_in(window, buffer);
+        let buffer = self.preview.buffer;
+        let shown = kit.buffer_mut(buffer);
+        shown.set_winbar(Some(vec![(" Preview ".to_owned(), Group::WIN_BAR)]));
+        shown.doc_mut().set_blocks(blocks);
+        if self
+            .preview
+            .drawn
+            .as_ref()
+            .is_none_or(|drawn| drawn.preview.is_some())
+        {
+            kit.set_cursor(window, Cursor::new());
         }
+        self.preview.drawn = Some(DrawnFor {
+            preview: None,
+            width: 0,
+            heat: 0,
+        });
     }
 
-    /// Shows `preview`, of `notification`, in `window`: from its own buffer, drawn again when the width or the
-    /// Heatmap changed, or made and opened where it opens.
+    /// Shows `preview`, of `notification`, in `window`: drawn again when the width or the Heatmap changed, and
+    /// opened where it opens when it's another.
     fn show_preview(
         &mut self,
         kit: &mut Kit,
@@ -292,56 +300,41 @@ impl Ghd {
         notification: &Notification,
         preview: &Preview,
     ) {
-        let thread = notification.thread;
-        let stamp = (kit.size().0, self.heat_version);
-        let kept = self
-            .preview
-            .buffers
-            .get(&thread)
-            .filter(|drawing| drawing.as_of == notification.updated_at)
-            .map(|drawing| (drawing.buffer, drawing.stamp));
-        let (buffer, fresh, drawn) = if let Some((buffer, drawn_for)) = kept {
-            (buffer, false, drawn_for == stamp)
-        } else {
-            self.preview.made += 1;
-            let name = format!("preview {}", self.preview.made);
-            let buffer = kit.add_buffer(name, wcgw_kit::doc::Document::new(), false);
-            (buffer, true, false)
+        let drawn = DrawnFor {
+            preview: Some((notification.thread, notification.updated_at)),
+            width: kit
+                .window_text_area(window)
+                .map_or(kit.size().0, |area| area.width),
+            heat: self.heat_version,
         };
-        if !drawn {
-            let blocks = self.preview_blocks(kit, notification, preview);
-            let count = preview.comments.len() as u64;
-            let winbar = vec![
-                (" Preview ".to_owned(), Group::WIN_BAR),
-                (
-                    if count == 0 {
-                        String::new()
-                    } else {
-                        format!("· {} ", counted(count, "comment"))
-                    },
-                    hl::AGE,
-                ),
-            ];
-            let shown = kit.buffer_mut(buffer);
-            shown.set_winbar(Some(winbar));
-            shown.doc_mut().set_blocks(blocks);
-            self.preview.buffers.insert(
-                thread,
-                Drawing {
-                    as_of: notification.updated_at,
-                    buffer,
-                    stamp,
+        if self.preview.drawn.as_ref() == Some(&drawn) {
+            return;
+        }
+        let another = self
+            .preview
+            .drawn
+            .as_ref()
+            .is_none_or(|before| before.preview != drawn.preview);
+        let blocks = self.preview_blocks(kit, notification, preview, drawn.width);
+        let count = preview.comments.len() as u64;
+        let winbar = vec![
+            (" Preview ".to_owned(), Group::WIN_BAR),
+            (
+                if count == 0 {
+                    String::new()
+                } else {
+                    format!("· {} ", counted(count, "comment"))
                 },
-            );
+                hl::AGE,
+            ),
+        ];
+        let shown = kit.buffer_mut(self.preview.buffer);
+        shown.set_winbar(Some(winbar));
+        shown.doc_mut().set_blocks(blocks);
+        if another {
+            kit.set_cursor(window, Cursor::on_block(place_key(preview.opens_on)));
         }
-        if kit.window_buffer(window) != Some(buffer) {
-            let start = if fresh {
-                Cursor::on_block(place_key(preview.opens_on))
-            } else {
-                Cursor::new()
-            };
-            in_window(kit, window, |kit| kit.show_buffer_at(buffer, start));
-        }
+        self.preview.drawn = Some(drawn);
     }
 
     /// The blocks of `preview`, of `notification`: its header, its body and each comment, each shaded by its
@@ -351,9 +344,9 @@ impl Ghd {
         kit: &Kit,
         notification: &Notification,
         preview: &Preview,
+        width: u16,
     ) -> Vec<(BlockKey, Content<Target>)> {
         let theme = kit.theme();
-        let width = kit.size().0;
         let look = Look::of(theme, heat(theme));
         let thread = notification.thread;
         let now = Utc::now();
@@ -454,18 +447,17 @@ impl Ghd {
     }
 
     /// What the Preview shows that voight would assess: the part of it the Preview's cursor is in.
-    pub(super) fn preview_assessable(&self, kit: &mut Kit) -> Option<(assessment::Key, String)> {
+    pub(super) fn preview_assessable(&self, kit: &Kit) -> Option<(assessment::Key, String)> {
         let window = self.preview.window?;
         let thread = self.views[self.current].cursor?;
         let notification = self.notification(thread)?;
         let Some(Fetched::Done(preview)) = self.previews.get(notification) else {
             return None;
         };
-        let place = in_window(kit, window, |kit| match kit.targets_under_cursor()[1] {
+        let place = match kit.targets_in(window)[1] {
             Some(Target::Place(at, place)) if *at == thread => Some(*place),
             _ => None,
-        })
-        .flatten()
+        }
         .unwrap_or(preview.opens_on);
         let text = match preview.at(place) {
             crate::preview::Shown::Comment(comment) => markdown::as_github_shows(&comment.body),

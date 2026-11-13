@@ -14,6 +14,12 @@ use crate::state::SubjectState;
 /// Widest the repository column gets, in cells; longer names are cut off.
 const MAX_REPOSITORY_WIDTH: usize = 32;
 
+/// The fewest cells the title gets before the repository column is cut to make room.
+const MIN_TITLE_WIDTH: usize = 16;
+
+/// Narrowest the repository column gets to make room for the title.
+const MIN_REPOSITORY_WIDTH: usize = 8;
+
 /// The icons for kinds of Subject and their States (the kit's D9): Octicons as Nerd Fonts (version 3) have them,
 /// else a letter, which any font draws in one cell. The State's colour tells a pull request's or an issue's State
 /// apart where the letter can't.
@@ -92,8 +98,6 @@ pub(super) struct Row<'a> {
     pub(super) notification: &'a Notification,
     pub(super) state: Option<SubjectState>,
     pub(super) selected: bool,
-    /// The cursor is on it: its row is drawn as `CursorLine`.
-    pub(super) cursor: bool,
 }
 
 /// What draws the rows: the colorscheme's styles, the icons as `:set icons` draws them, and the time it is.
@@ -110,20 +114,26 @@ pub(super) fn blocks(
     width: u16,
     look: &Look<'_>,
 ) -> Vec<(BlockKey, Content<Target>)> {
-    let repository_width = rows
-        .iter()
-        .map(|row| row.notification.repository.width())
-        .max()
-        .unwrap_or(0)
-        .min(MAX_REPOSITORY_WIDTH);
     let reason_width = rows
         .iter()
         .map(|row| row.notification.reason.to_string().width())
         .max()
         .unwrap_or(0);
     // `▌● ` and the icon, then a space after the repository, the title and the Reason, then the age.
-    let fixed = 3 + 2 + repository_width + 1 + 1 + reason_width + 1 + 3;
-    let title_width = usize::from(width).saturating_sub(fixed);
+    let others = 3 + 2 + 1 + 1 + reason_width + 1 + 3;
+    // A narrow window cuts the repository before the title.
+    let repository_width = rows
+        .iter()
+        .map(|row| row.notification.repository.width())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_REPOSITORY_WIDTH)
+        .min(
+            usize::from(width)
+                .saturating_sub(others + MIN_TITLE_WIDTH)
+                .max(MIN_REPOSITORY_WIDTH),
+        );
+    let title_width = usize::from(width).saturating_sub(others + repository_width);
     rows.iter()
         .map(|row| {
             let line = row_line(row, repository_width, title_width, reason_width, look);
@@ -148,13 +158,10 @@ fn row_line(
     let theme = look.theme;
     let n = row.notification;
     // Whether it's read goes over each column's own group, so that a colorscheme can, say, grey out read rows;
-    // whether it's selected goes over that, and the cursor over all.
+    // whether it's selected goes over that. The kit draws the cursor's over all.
     let mut row_style = theme.style(if n.unread { hl::UNREAD } else { hl::READ });
     if row.selected {
         row_style = row_style.patch(theme.style(hl::SELECTED));
-    }
-    if row.cursor {
-        row_style = row_style.patch(theme.style(Group::CURSOR_LINE));
     }
     let span = |text: String, group: Group| Span::new(text, group).with_style(row_style);
     // A State's colour goes over the row's, so that a read Subject still shows it, dimmed.

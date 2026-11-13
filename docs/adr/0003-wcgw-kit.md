@@ -13,13 +13,14 @@ Done (ADR 0002), the cache, Previews, Changed files, Assessments.
 
 How ghd's screen became the kit's:
 
-- Each View is a listed buffer, a block per Notification, its columns laid out by ghd for the window's width
-  (`nowrap`), so the cursor stays on its Notification as the Inbox changes.
-- The Preview is a window below the list, a buffer per Preview: its body and each comment a block, `]]` and `[[`
-  between them, opening on the comment the Notification is about. It shows all of them, where ghd showed one at a
-  time and stepped with `J` and `K`.
-- The Files screen shows the list of Changed files in the list's window and the file at its cursor below, a buffer
-  per file as it shows.
+- Each View is a listed buffer, named with how many it shows are unread, a block per Notification, its columns laid out
+  by ghd for its window's width (`nowrap`), so the cursor stays on its Notification as the Inbox changes; the kit
+  draws the Notification at the cursor as `CursorLine`.
+- The Preview is a window below the list, its buffer the Preview of the Notification at the list's cursor: its body
+  and each comment a block, `]]` and `[[` between them, opening on the comment the Notification is about. It shows
+  all of them, where ghd showed one at a time and stepped with `J` and `K`.
+- The Files screen shows the list of Changed files in the list's window and the file at its cursor below, from its
+  top for another file, as before.
 - Every action is an ex command with a default key (the kit's D12: Vim's motions stay Vim's), so `:map` reaches
   anything. The Search becomes `:filter`, a Filter typed for the moment; looking for text is the kit's `/`.
 - Markdown is laid out by `wcgw-kit-text`, after GitHub's rules (`markdown::as_github_shows`); code is highlighted in
@@ -41,13 +42,7 @@ How ghd's screen became the kit's:
 - Keys change where Vim has them: `e` is `x`, `f` is `gf`, `w` is `<leader>w`, `Space` is `s`, `Tab` and `1`–`9`
   are `gt` and `<leader>1`–`9`, `r` is `<C-l>`, `H` is `<leader>h`, `?` is `:help`, `o` and `Enter` are `<CR>` and
   `gX`. `q` closes a window, quitting from the last.
-- A View's tab no longer counts its unread Notifications: buffer names don't change in the kit, so the count is in
-  the statusline, for the View on screen.
-- The row at the cursor is drawn as `CursorLine` by ghd, as the kit has no `'cursorline'` yet.
-- The kit can't hand the application back when it quits: ghd leaves its snapshot and the changes GitHub hasn't
-  answered behind as it's dropped, and `main` waits for those (10 s at most) and keeps the Inbox after the terminal is
-  restored.
-- Only the View on screen comes back where its cursor was from the cache: the kit sets a window's cursor only when it
-  first shows a buffer.
-- A View's lines are laid out for the terminal's width, as the kit doesn't tell a window's: a View in a `:vsplit`
-  wraps.
+- The kit runs until the user quits, then gives ghd back: `main` waits for the changes GitHub hasn't answered (10 s at
+  most) and keeps the Inbox for next time, after the terminal is restored.
+- A buffer shared by two windows of different widths, as a View in a `:vsplit`, is laid out for the first: it wraps
+  in a narrower one.

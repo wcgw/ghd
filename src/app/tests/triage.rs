@@ -75,11 +75,7 @@ fn refused_read_is_undone() {
 
     app.send(refused(id, change));
 
-    assert!(
-        statusline(&app).contains("1 unread"),
-        "{}",
-        statusline(&app)
-    );
+    assert!(rows(&app)[0].contains("Inbox (1)"), "{:?}", rows(&app)[0]);
 }
 
 #[test]
@@ -90,7 +86,7 @@ fn enter_opens_in_the_browser_and_marks_read() {
 
     assert_eq!(opened(&effects), ["https://github.com/wcgw/ghd/pull/1"]);
     assert_eq!(sent(&effects).len(), 1, "marked read");
-    assert!(statusline(&app).contains("0 unread"));
+    assert!(rows(&app)[0].contains("Inbox (0)"), "{:?}", rows(&app)[0]);
 }
 
 #[test]
@@ -297,7 +293,11 @@ fn shift_d_shows_the_done_list_where_x_brings_back() {
         rows(&app)
     );
     assert!(statusline(&app).contains("Done list"));
-    assert!(statusline(&app).contains("1 Done"), "{}", statusline(&app));
+    assert!(
+        rows(&app)[0].contains("Inbox (1)"),
+        "Done, counted: {:?}",
+        rows(&app)[0]
+    );
 
     let effects = app.press("x");
     assert!(sent(&effects).is_empty(), "GitHub can't move it back");
@@ -321,17 +321,13 @@ fn unread_only_is_for_the_inbox() {
 #[test]
 fn quitting_leaves_what_to_keep() {
     let mut app = app();
-    let kept = Rc::new(RefCell::new(Kept::default()));
-    app.app.keep_in(Rc::clone(&kept));
     let (id, _) = sent(&app.press("I")).remove(0);
 
     let effects = app.press(":q<CR>");
-    assert!(effects.contains(&Effect::Quit));
-    drop(app);
 
-    let kept = kept.take();
-    assert_eq!(kept.unsettled, [id], "what GitHub hasn't answered");
-    let snapshot = kept.snapshot.expect("the Inbox");
+    assert!(effects.contains(&Effect::Quit));
+    assert_eq!(app.app.unsettled(), [id], "what GitHub hasn't answered");
+    let snapshot = app.app.snapshot(Utc::now()).expect("the Inbox");
     assert!(
         !snapshot
             .listing
@@ -371,7 +367,7 @@ fn help_lists_ghds_keys_and_commands() {
         ("x", "mark Done, or bring back"),
         ("D", "toggle the Done list"),
         ("gf", "pull request's files"),
-        ("s", ":toggle<CR>j"),
+        ("s", "select or not, and down"),
     ] {
         app.press(&format!(":help {keys}<CR>"));
         assert!(shows(&app, says), "{keys}: {:#?}", rows(&app));

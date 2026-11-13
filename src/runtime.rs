@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use chrono::Utc;
 
-use crate::app::{Ghd, Kept};
+use crate::app::Ghd;
 use crate::cache::{Cache, Snapshot};
 use crate::change::{Change, Reply};
 use crate::config::Config;
@@ -58,28 +58,23 @@ pub async fn run(config: Config, github: GitHub, cache: Cache) -> anyhow::Result
     let voight = assessor.is_some();
     let views = config.into_views();
 
-    let (mut ghd, mut kit) = Ghd::restored(views, voight, cache.load().await);
+    let (ghd, mut kit) = Ghd::restored(views, voight, cache.load().await);
     if !ignored.is_empty() {
         kit.warn(format!(
             "config.toml's {} is read no more: :colorscheme and :set icons= go in init.vim",
             ignored.join(" and ")
         ));
     }
-    let kept = Rc::new(RefCell::new(Kept::default()));
-    ghd.keep_in(Rc::clone(&kept));
     let in_flight = Rc::new(RefCell::new(HashMap::new()));
     let net = Net::new(Arc::new(github), inbox.clone(), Rc::clone(&in_flight));
     #[cfg(feature = "voight")]
     let net = net.with_assessor(assessor);
-    wcgw_kit::runtime::run("ghd", ghd, kit, net, (inbox, mailbox))
+    let (ghd, _) = wcgw_kit::runtime::run_returning("ghd", ghd, kit, net, (inbox, mailbox))
         .await
         .context("running the terminal")?;
 
-    let Kept {
-        snapshot,
-        unsettled,
-    } = kept.take();
-    let mut snapshot = snapshot;
+    let mut snapshot = ghd.snapshot(Utc::now());
+    let unsettled = ghd.unsettled();
     let mut problems = Vec::new();
     // Dropping the changes still in flight could lose ones the screen already showed as made.
     let waiting: Vec<_> = in_flight
@@ -118,12 +113,7 @@ pub async fn run(config: Config, github: GitHub, cache: Cache) -> anyhow::Result
         }
     }
     if let Some(snapshot) = snapshot
-        && let Err(error) = cache
-            .save(&Snapshot {
-                saved_at: Utc::now(),
-                ..snapshot
-            })
-            .await
+        && let Err(error) = cache.save(&snapshot).await
     {
         problems.push(format!("couldn't keep the Inbox for next time: {error:#}"));
     }

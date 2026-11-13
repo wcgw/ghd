@@ -14,15 +14,13 @@ mod preview;
 mod tests;
 mod voight;
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 use wcgw_kit::doc::{Cursor, Document};
-use wcgw_kit::shell::{Segment, Side, WindowId};
+use wcgw_kit::shell::{CursorLine, Segment, Side, WindowId};
 use wcgw_kit::{App, BufferId};
 
 use crate::assessment::{self, Assessments};
@@ -181,16 +179,10 @@ struct ShownView {
     unread_only: bool,
     /// The Notification at its cursor, when it was last on screen.
     cursor: Option<ThreadId>,
-}
-
-/// What ghd keeps for when it quits: the runtime can't hand the application back, so it leaves this behind as it
-/// goes.
-#[derive(Debug, Default)]
-pub struct Kept {
-    /// The Inbox and where each View was; `None` until there's an Inbox.
-    pub snapshot: Option<Snapshot>,
-    /// The changes sent to GitHub that it hasn't answered, by id.
-    pub unsettled: Vec<u64>,
+    /// Where its cursor goes when it's first shown, as kept from last time.
+    restoring: Option<ThreadId>,
+    /// What its buffer was drawn for, besides what ghd knows: the width, the icons, the colorscheme.
+    drawn_for: Option<(u16, String, String)>,
 }
 
 /// What ghd knows that the editor around it does not.
@@ -247,8 +239,6 @@ pub struct Ghd {
     /// The changes sent and not answered, by id.
     unsettled: Vec<u64>,
     next_change: u64,
-    /// Where to leave what's kept for when ghd quits.
-    keep: Option<Rc<RefCell<Kept>>>,
 }
 
 impl Ghd {
@@ -290,11 +280,17 @@ impl Ghd {
         let placeholder = kit.current_buffer();
         let views: Vec<ShownView> = views
             .into_iter()
-            .map(|view| ShownView {
-                buffer: kit.add_buffer(view.name.clone(), Document::new(), true),
-                view,
-                unread_only: false,
-                cursor: None,
+            .map(|view| {
+                let buffer = kit.add_buffer(view.name.clone(), Document::new(), true);
+                kit.buffer_mut(buffer).set_cursorline(CursorLine::Item);
+                ShownView {
+                    buffer,
+                    view,
+                    unread_only: false,
+                    cursor: None,
+                    restoring: None,
+                    drawn_for: None,
+                }
             })
             .collect();
         let mut ghd = Self {
@@ -323,14 +319,10 @@ impl Ghd {
             scheme: String::new(),
             unsettled: Vec::new(),
             next_change: 0,
-            keep: None,
             views,
         };
-        for line in ["set showtabline=2"].into_iter().chain(crate::keymap::MAPS) {
-            kit.run_ex(&mut ghd, line)
-                .expect("ghd's own settings and maps are valid");
-        }
-        let mut start = Cursor::new();
+        kit.run_ex(&mut ghd, "set showtabline=2")
+            .expect("a setting the kit has");
         if let Some(snapshot) = snapshot {
             if let Some(index) = ghd
                 .views
@@ -339,19 +331,11 @@ impl Ghd {
             {
                 ghd.current = index;
             }
-            if let Some(&thread) = snapshot.cursors.get(&snapshot.view) {
-                start = Cursor::on_block(list::key(thread));
-            }
             ghd.restore(&mut kit, snapshot, Utc::now());
         }
-        kit.show_buffer_at(ghd.views[ghd.current].buffer, start);
+        kit.show_buffer(ghd.views[ghd.current].buffer);
         ghd.render_views(&mut kit);
         (ghd, kit)
-    }
-
-    /// Has ghd leave what's kept for when it quits in `keep`.
-    pub fn keep_in(&mut self, keep: Rc<RefCell<Kept>>) {
-        self.keep = Some(keep);
     }
 
     /// Shows `snapshot`'s Inbox, as it was `now`, until a fetched one arrives.
@@ -361,6 +345,7 @@ impl Ghd {
         self.marks = snapshot.marks;
         for shown in &mut self.views {
             shown.cursor = snapshot.cursors.get(&shown.view.name).copied();
+            shown.restoring = shown.cursor;
         }
         let when = match list::age(snapshot.saved_at, now).as_str() {
             "now" => "just now".to_owned(),
@@ -369,6 +354,11 @@ impl Ghd {
         kit.info(format!(
             "Showing the Inbox from {when} until the latest arrives"
         ));
+    }
+
+    /// The changes sent to GitHub that it hasn't answered, by id: for quitting to wait for.
+    pub fn unsettled(&self) -> &[u64] {
+        &self.unsettled
     }
 
     /// What to keep for next time, as of `now`: the Inbox and the Done list, the View on screen and each View's
@@ -547,20 +537,41 @@ impl Ghd {
 
     // --- Drawing the Views. ---
 
-    /// Draws every View's buffer again, from what ghd knows now.
+    /// Draws every View's buffer again, from what ghd knows now, and names it with how many Notifications are
+    /// unread in it, or in the Done list, how many it shows.
     fn render_views(&mut self, kit: &mut Kit) {
         for index in 0..self.views.len() {
             self.render_view(kit, index);
+            let name = match self.inbox {
+                InboxState::Loaded(_) => {
+                    let shown = self.shown_in(index);
+                    let count = if self.showing_done {
+                        shown.count()
+                    } else {
+                        shown.filter(|n| n.unread).count()
+                    };
+                    format!("{} ({count})", self.views[index].view.name)
+                }
+                InboxState::Loading | InboxState::Failed(_) => self.views[index].view.name.clone(),
+            };
+            kit.buffer_mut(self.views[index].buffer).set_name(name);
         }
+    }
+
+    /// What View `index`'s buffer is drawn for besides what ghd knows: the width of its window, the icons as
+    /// `:set icons` draws them, the colorscheme.
+    fn drawn_for(&self, kit: &Kit, index: usize) -> (u16, String, String) {
+        (
+            kit.text_width(self.views[index].buffer),
+            kit.icon("GhdPullRequest"),
+            kit.theme().name().to_owned(),
+        )
     }
 
     /// Draws View `index`'s buffer again: its rows, or what's said in their place.
     fn render_view(&mut self, kit: &mut Kit, index: usize) {
         let buffer = self.views[index].buffer;
-        let cursor = (index == self.current)
-            .then(|| self.views[index].cursor)
-            .flatten()
-            .filter(|_| kit.window_buffer(self.list_window) == Some(buffer));
+        let drawn_for = self.drawn_for(kit, index);
         let blocks = match &self.inbox {
             InboxState::Loading => list::message("Fetching notifications…", crate::hl::MESSAGE),
             InboxState::Failed(error) => list::message(
@@ -574,7 +585,6 @@ impl Ghd {
                         notification: n,
                         state: self.states.get(n),
                         selected: self.selection.contains(&n.thread),
-                        cursor: Some(n.thread) == cursor,
                     })
                     .collect();
                 if rows.is_empty() {
@@ -586,11 +596,12 @@ impl Ghd {
                         icon: &icon,
                         now: Utc::now(),
                     };
-                    list::blocks(&rows, kit.size().0, &look)
+                    list::blocks(&rows, drawn_for.0, &look)
                 }
             }
         };
         kit.buffer_mut(buffer).doc_mut().set_blocks(blocks);
+        self.views[index].drawn_for = Some(drawn_for);
     }
 
     /// What View `index` says when it shows nothing.
@@ -627,18 +638,15 @@ impl Ghd {
 
     /// The Notification at the list's cursor, in the View on screen; `None` while the list shows none, or another
     /// buffer.
-    fn at_cursor(&self, kit: &mut Kit) -> Option<ThreadId> {
+    fn at_cursor(&self, kit: &Kit) -> Option<ThreadId> {
         let buffer = self.views[self.current].buffer;
         if kit.window_buffer(self.list_window) != Some(buffer) {
             return None;
         }
-        in_window(kit, self.list_window, |kit| {
-            match kit.targets_under_cursor()[1] {
-                Some(Target::Notification(thread)) => Some(*thread),
-                _ => None,
-            }
-        })
-        .flatten()
+        match kit.targets_in(self.list_window)[1] {
+            Some(Target::Notification(thread)) => Some(*thread),
+            _ => None,
+        }
     }
 
     /// Puts the windows right after the user closed one ghd needs: when the list's window is gone, the one left
@@ -680,9 +688,12 @@ impl Ghd {
             let buffer = self.views[self.current].buffer;
             if kit.window_buffer(self.list_window) == Some(buffer) {
                 self.views[self.current].cursor = self.at_cursor(kit);
-                // Drawn again each time: the cursor may have moved, an option or the colorscheme changed, and ages
-                // go on.
-                self.render_view(kit, self.current);
+                // Drawn again when its window's width, the icons or the colorscheme changed.
+                if self.views[self.current].drawn_for.as_ref()
+                    != Some(&self.drawn_for(kit, self.current))
+                {
+                    self.render_view(kit, self.current);
+                }
             }
             effects.extend(self.sync_preview(kit));
         }
@@ -701,6 +712,10 @@ impl Ghd {
             }
             self.current = index;
             self.render_view(kit, index);
+            // First shown, it goes where it was last time.
+            if let Some(thread) = self.views[index].restoring.take() {
+                kit.set_cursor(self.list_window, Cursor::on_block(list::key(thread)));
+            }
         }
     }
 
@@ -881,18 +896,6 @@ impl Ghd {
     }
 }
 
-/// Runs `then` with `window` current, and makes the window current before it current again: for what the kit
-/// tells of the current window only. `None` when `window` isn't open.
-fn in_window<R>(kit: &mut Kit, window: WindowId, then: impl FnOnce(&mut Kit) -> R) -> Option<R> {
-    let current = kit.current_window();
-    if !kit.focus_window(window) {
-        return None;
-    }
-    let result = then(kit);
-    kit.focus_window(current);
-    Some(result)
-}
-
 /// `count` of `what`: `1 file`, `3 files`.
 fn counted(count: u64, what: &str) -> String {
     match count {
@@ -901,53 +904,39 @@ fn counted(count: u64, what: &str) -> String {
     }
 }
 
-/// ghd's statusline segments (the kit's D10): what the old borders said, dropped least important first when the
-/// line is short.
+/// ghd's statusline segments (the kit's D10): what the old borders said, in their colours, dropped least important
+/// first when the line is short.
 fn add_segments(kit: &mut Kit) {
     kit.add_segment(Segment::new(Side::Left, 50, |ghd: &Ghd, _| {
         ghd.showing_done.then(|| "Done list".to_owned())
     }));
-    kit.add_segment(Segment::new(Side::Left, 40, |ghd: &Ghd, _| {
-        (!ghd.selection.is_empty()).then(|| format!("{} selected", ghd.selection.len()))
-    }));
-    kit.add_segment(Segment::new(Side::Left, 35, |ghd: &Ghd, _| {
-        ghd.narrowing
-            .as_ref()
-            .map(|(typed, _)| format!("filter {typed}"))
-    }));
-    kit.add_segment(Segment::new(Side::Left, 30, |ghd: &Ghd, _| {
-        ghd.unread_only(ghd.current)
-            .then(|| "● unread only".to_owned())
-    }));
-    kit.add_segment(Segment::new(Side::Right, 25, |ghd: &Ghd, _| {
-        let InboxState::Loaded(_) = ghd.inbox else {
-            return None;
-        };
-        Some(if ghd.showing_done {
-            counted(ghd.shown_in(ghd.current).count() as u64, "Done")
-        } else {
-            format!(
-                "{} unread",
-                ghd.shown_in(ghd.current).filter(|n| n.unread).count()
-            )
+    kit.add_segment(
+        Segment::new(Side::Left, 40, |ghd: &Ghd, _| {
+            (!ghd.selection.is_empty()).then(|| format!("{} selected", ghd.selection.len()))
         })
-    }));
-    kit.add_segment(Segment::new(Side::Right, 10, |ghd: &Ghd, _| {
-        (ghd.fetching || ghd.looking_up).then(|| "fetching…".to_owned())
-    }));
-}
-
-impl Drop for Ghd {
-    /// Leaves what to keep for when ghd quits, if it was asked to.
-    fn drop(&mut self) {
-        if let Some(keep) = &self.keep {
-            let kept = Kept {
-                snapshot: self.snapshot(Utc::now()),
-                unsettled: std::mem::take(&mut self.unsettled),
-            };
-            *keep.borrow_mut() = kept;
-        }
-    }
+        .with_group(crate::hl::SELECTED),
+    );
+    kit.add_segment(
+        Segment::new(Side::Left, 35, |ghd: &Ghd, _| {
+            ghd.narrowing
+                .as_ref()
+                .map(|(typed, _)| format!("filter {typed}"))
+        })
+        .with_group(crate::hl::FILTER),
+    );
+    kit.add_segment(
+        Segment::new(Side::Left, 30, |ghd: &Ghd, _| {
+            ghd.unread_only(ghd.current)
+                .then(|| "● unread only".to_owned())
+        })
+        .with_group(crate::hl::UNREAD_MARKER),
+    );
+    kit.add_segment(
+        Segment::new(Side::Right, 10, |ghd: &Ghd, _| {
+            (ghd.fetching || ghd.looking_up).then(|| "fetching…".to_owned())
+        })
+        .with_group(crate::hl::FETCHING),
+    );
 }
 
 impl App for Ghd {
