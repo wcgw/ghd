@@ -13,7 +13,7 @@ fn thread_of(change: &Change) -> ThreadId {
 fn x_marks_done_at_once_and_it_comes_back_if_refused() {
     let mut app = app();
 
-    let effects = app.press("x");
+    let effects = app.press("a");
 
     let sent = sent(&effects);
     assert_eq!(sent.len(), 1);
@@ -43,7 +43,7 @@ fn accepted_done_stays_done_though_github_lists_it() {
     listed_by_github[0].unread = false;
     let mut app = app_with(views(), false, 80, 24);
     app.send(fetched(listed_by_github.clone()));
-    let (id, change) = sent(&app.press("x")).remove(0);
+    let (id, change) = sent(&app.press("a")).remove(0);
     app.send(accepted(id, change));
 
     // GitHub keeps listing what's Done, read, with no newer activity.
@@ -139,7 +139,7 @@ fn a_double_click_opens_what_it_lands_on() {
 fn s_selects_and_moves_down_and_actions_act_on_the_selection() {
     let mut app = app();
 
-    app.press("s");
+    app.press("x");
     assert_eq!(cursor_title(&mut app).as_deref(), Some("Old news"));
     assert!(
         statusline(&app).contains("1 selected"),
@@ -147,10 +147,10 @@ fn s_selects_and_moves_down_and_actions_act_on_the_selection() {
         statusline(&app)
     );
     assert!(shows(&app, "▌● P wcgw/ghd"), "{:#?}", rows(&app));
-    app.press("s");
+    app.press("x");
     assert!(statusline(&app).contains("2 selected"));
 
-    let effects = app.press("x");
+    let effects = app.press("a");
 
     let threads: Vec<ThreadId> = sent(&effects)
         .iter()
@@ -283,7 +283,7 @@ fn u_shows_only_the_unread_in_the_view_on_screen() {
 #[test]
 fn shift_d_shows_the_done_list_where_x_brings_back() {
     let mut app = app();
-    let (id, change) = sent(&app.press("x")).remove(0);
+    let (id, change) = sent(&app.press("a")).remove(0);
     app.send(accepted(id, change));
 
     app.press("D");
@@ -299,7 +299,7 @@ fn shift_d_shows_the_done_list_where_x_brings_back() {
         rows(&app)[0]
     );
 
-    let effects = app.press("x");
+    let effects = app.press("a");
     assert!(sent(&effects).is_empty(), "GitHub can't move it back");
     assert!(cmdline(&app).contains("Back in ghd's Inbox (GitHub keeps it Done): Add polling"));
     assert!(shows(&app, "Nothing in the Done list."));
@@ -364,10 +364,10 @@ fn help_lists_ghds_keys_and_commands() {
     let mut app = app();
 
     for (keys, says) in [
-        ("x", "mark Done, or bring back"),
+        ("a", "mark Done, or bring back"),
         ("D", "toggle the Done list"),
         ("gf", "pull request's files"),
-        ("s", "select or not, and down"),
+        ("x", "select or not, and down"),
     ] {
         app.press(&format!(":help {keys}<CR>"));
         assert!(shows(&app, says), "{keys}: {:#?}", rows(&app));

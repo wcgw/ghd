@@ -17,7 +17,7 @@ const DEFAULTS: [(&str, &str, &str, Topic); 21] = [
     ("gf", "files", "pull request's files", Topic::OPENING),
     ("p", "preview", "toggle the Preview", Topic::OPENING),
     ("<leader>w", "whole", "files whole or diffs", Topic::OPENING),
-    ("x", "done", "mark Done, or bring back", TRIAGE),
+    ("a", "done", "mark Done, or bring back", TRIAGE),
     ("I", "read", "mark read", TRIAGE),
     ("D", "donelist", "toggle the Done list", TRIAGE),
     ("u", "unreadonly", "toggle unread only", TRIAGE),
@@ -34,10 +34,10 @@ const DEFAULTS: [(&str, &str, &str, Topic); 21] = [
     ("<leader>9", "buffer 9", "View 9", Topic::BUFFERS),
 ];
 
-/// ghd's defaults that go on past a command: `s` selects and moves down, `<leader>f` starts typing a filter. Keys,
+/// ghd's defaults that go on past a command: `x` selects and moves down, as muttrs' does, `<leader>f` starts typing a filter. Keys,
 /// the keys they stand for, what which-key says of them, and their `:help` topic.
 const KEYS: [(&str, &str, &str, Topic); 2] = [
-    ("s", ":toggle<CR>j", "select or not, and down", TRIAGE),
+    ("x", ":toggle<CR>j", "select or not, and down", TRIAGE),
     ("<leader>f", ":filter<Space>", "filter the View", TRIAGE),
 ];
 

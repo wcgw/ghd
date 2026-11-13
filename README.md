@@ -37,7 +37,7 @@ with completion and history, `:map`, `:help`, highlight groups and colorschemes,
 
   ![voight's Heatmap of a comment](docs/screenshots/heatmap.png)
 
-- **Triage**: mark notifications read (`I`) or Done (`x`), one at a time or a selection of them, made by hand or
+- **Triage**: mark notifications read (`I`) or Done (`a`), one at a time or a selection of them, made by hand or
   with a filter (`:select is:closed` selects what's merged or closed); narrow the View to a filter (`:filter`), show
   only what's unread (`u`), and look back at what's Done (`D`).
 
@@ -113,10 +113,10 @@ them. ghd adds these, each running a command `:map` can rebind:
 | `gx` | `:browse link` | open the link under the cursor |
 | `gy` | `:yanklink` | yank the link `gX` opens |
 | `I` | `:read` | mark read |
-| `x` | `:done` | mark Done; in the Done list, back to the Inbox |
+| `a` | `:done` | mark Done; in the Done list, back to the Inbox |
 | `D` | `:donelist` | show the Done list, or the Inbox again |
 | `u` | `:unreadonly` | show unread only, or all again |
-| `s` `A` | `:toggle` `:toggle!` | select or not, and move down; all shown, or none |
+| `x` `A` | `:toggle` `:toggle!` | select or not, and move down; all shown, or none |
 | | `:select` `:unselect` *filter* | select, or unselect, what the [filter](#configuration) matches in the View; all shown, with no filter |
 | `<leader>f` | `:filter` *filter* | narrow whichever View is on screen to what the filter matches; all again, with no filter |
 | `<Esc>` | `:clear` | clear the selection, or else the filter; leave the Files screen |
@@ -127,15 +127,15 @@ them. ghd adds these, each running a command `:map` can rebind:
 | `<C-l>` | `:edit!` | fetch the Inbox now, and the Preview or the files shown |
 | `:q` `:qa` | | close the window; quit |
 
-`I`, `x`, `<CR>` and `gX` act on the selection when there is one. `<leader>` is `<Space>`. On the command line, `Tab`
+`I`, `a`, `<CR>` and `gX` act on the selection when there is one. `<leader>` is `<Space>`. On the command line, `Tab`
 completes commands and a filter's qualifiers or, after one, its values that would select some of the notifications
 shown; `↑` and `↓` go through the commands entered before.
 
 The mouse is wcgw-kit's: the wheel scrolls the window under it, a click moves the cursor there, a double click opens
 what it lands on. Most terminals select text with Shift held; `:set mouse=` leaves the mouse to the terminal.
 
-Keys that changed from before wcgw-kit, as Vim has `e`, `f`, `w`, `g`, `?`, digits and `Space`: `e` is `x`, `f` is
-`gf`, `w` is `<leader>w`, `o` and `Enter` are `<CR>` or `gX`, `Space` is `s`, `Tab` and `1`–`9` are `gt` and
+Keys that changed from before wcgw-kit, as Vim has `e`, `f`, `w`, `g`, `?`, digits and `Space`: `e` is `a`, `f` is
+`gf`, `w` is `<leader>w`, `o` and `Enter` are `<CR>` or `gX`, `Space` is `x`, `Tab` and `1`–`9` are `gt` and
 `<leader>1`–`9`, `r` is `<C-l>`, `H` is `<leader>h`, `?` is `:help`, `J` and `K` are `<C-w>j` and the Preview's own
 motions. `:nnoremap e :done<CR>` in `init.vim` brings one back.
 

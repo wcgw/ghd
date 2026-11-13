@@ -169,7 +169,7 @@ impl Ghd {
         Ok(Vec::new())
     }
 
-    /// `:toggle` (`s`): selects the Notification at the cursor, or unselects it.
+    /// `:toggle` (`x`, which then moves down): selects the Notification at the cursor, or unselects it.
     fn toggle(&mut self, kit: &mut Kit) {
         if let Some(thread) = self.at_cursor(kit) {
             if !self.selection.remove(&thread) {

@@ -272,7 +272,7 @@ fn tabs_count_whats_unread_in_each_view_or_whats_done() {
 
     assert_eq!(rows(&app)[0], " Inbox (1)  Reviews (1)  Read (0)");
 
-    app.press("x");
+    app.press("a");
     app.press("D");
     assert_eq!(
         rows(&app)[0],
