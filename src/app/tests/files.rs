@@ -248,10 +248,10 @@ fn esc_goes_back_to_the_list_and_the_preview() {
 }
 
 #[test]
-fn back_from_the_files_with_ctrl_t_or_gf() {
+fn back_from_the_files_with_ctrl_o_or_gf() {
     let mut app = app_with_files(changed_files());
 
-    app.press("<C-t>");
+    app.press("<C-o>");
     assert!(shows(&app, "Old news"), "{:#?}", rows(&app));
     assert!(
         !shows(&app, "docs/guide.md"),
@@ -325,4 +325,21 @@ fn slash_searches_the_file_shown() {
 
     let cursor = usize::from(app.screen().cursor.1);
     assert_eq!(cursor, row_of(&app, "+new"));
+}
+
+#[test]
+fn closing_the_file_window_leaves_the_files_and_the_preview() {
+    let mut app = app();
+    app.press("p");
+    app.press("gf");
+
+    app.press("<C-w>jq");
+
+    assert!(shows(&app, "Old news"), "{:#?}", rows(&app));
+    assert!(!rows(&app).iter().any(|row| row.starts_with(" Preview")));
+    app.press("p");
+    assert!(
+        rows(&app).iter().any(|row| row.starts_with(" Preview")),
+        "opens again"
+    );
 }

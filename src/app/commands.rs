@@ -74,7 +74,6 @@ pub(super) fn add(kit: &mut Kit) {
             ghd.toggle_files(kit);
             Ok(Vec::new())
         })
-        .jumps()
         .help("the pull request's Changed files, or the list again"),
         Command::<Ghd>::new("whole", 3, |ghd, _, _| ghd.toggle_whole())
             .help("on the Files screen, files whole, or as their diffs again"),

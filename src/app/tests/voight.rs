@@ -233,3 +233,44 @@ fn voight_completes_its_arguments() {
 
     assert_eq!(completions, ["heatmap"]);
 }
+
+#[test]
+fn markdown_files_shown_whole_are_assessed() {
+    let mut app = app_with(views(), true, 80, 24);
+    app.send(fetched(notifications()));
+    app.send(Msg::Voight(Event::Loaded { fallback: None }));
+    let effects = app.press("gf");
+    let as_of = ios(&effects)
+        .into_iter()
+        .find_map(|io| match io {
+            Io::FetchFiles { as_of, .. } => Some(as_of),
+            _ => None,
+        })
+        .expect("fetches the files");
+
+    let effects = app.send(Msg::FilesFetched {
+        thread: ThreadId(1),
+        as_of,
+        files: Ok(vec![crate::files::ChangedFile {
+            path: "README.md".to_owned(),
+            status: crate::files::FileStatus::Added,
+            previous_path: None,
+            additions: 1,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1 @@\n+Read me, all of it.".to_owned()),
+            contents_path: "/repos/wcgw/ghd/contents/README.md?ref=abc".to_owned(),
+        }]),
+    });
+
+    let (key, text) = asked(&effects).expect("asked for the file");
+    assert_eq!(
+        key.part,
+        Part::File("/repos/wcgw/ghd/contents/README.md?ref=abc".to_owned())
+    );
+    assert_eq!(text, "Read me, all of it.\n");
+    assert!(
+        statusline(&app).contains("voight …"),
+        "{}",
+        statusline(&app)
+    );
+}

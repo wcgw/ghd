@@ -301,3 +301,31 @@ fn a_snapshot_shows_until_the_inbox_arrives() {
         cmdline(&restored)
     );
 }
+
+#[test]
+fn a_colorscheme_change_redraws_the_list() {
+    let mut app = app();
+
+    app.press(":colorscheme default<CR>");
+
+    assert_eq!(style_of(&app, "wcgw/other").fg, style(&app, hl::READ).fg);
+    assert_eq!(
+        style(&app, hl::READ).fg,
+        Some(ratatui::style::Color::DarkGray),
+        "ghd's own for it"
+    );
+}
+
+#[test]
+fn segments_go_least_important_first_when_the_line_is_short() {
+    let mut app = app_with(views(), false, 40, 24);
+    app.send(fetched(notifications()));
+    app.press("D");
+    let effects = app.press("<C-l>");
+    assert!(ios(&effects).contains(&Io::FetchInbox(Fetch::Whole)));
+
+    let line = statusline(&app);
+
+    assert!(line.contains("Done list"), "{line:?}");
+    assert!(!line.contains("fetching…"), "{line:?}");
+}

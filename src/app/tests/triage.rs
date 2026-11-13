@@ -377,3 +377,14 @@ fn help_lists_ghds_keys_and_commands() {
         assert!(shows(&app, says), "{keys}: {:#?}", rows(&app));
     }
 }
+
+#[test]
+fn leader_f_starts_typing_a_filter() {
+    let mut app = app();
+
+    app.press("<leader>f");
+
+    assert_eq!(cmdline(&app), ":filter");
+    app.press("is:pr<CR>");
+    assert!(statusline(&app).contains("filter is:pr"));
+}

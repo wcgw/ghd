@@ -263,6 +263,9 @@ impl Ghd {
             } else {
                 kit.close_window_id(screen.window);
             }
+        } else if screen.lent {
+            // The user closed it: the Preview with it.
+            self.preview.closed();
         }
         kit.focus_window(self.list_window);
     }

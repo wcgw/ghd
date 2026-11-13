@@ -26,7 +26,7 @@ with completion and history, `:map`, `:help`, highlight groups and colorschemes,
   ![A pull request's changed file, as its diff](docs/screenshots/files.png)
 
   `<leader>w` shows the files whole instead, Markdown rendered, with a gutter marking the lines added (green),
-  changed (yellow) or removed (red); `/` searches the file shown, as in any buffer. `<Esc>`, `gf` or `<C-t>` go back.
+  changed (yellow) or removed (red); `/` searches the file shown, as in any buffer. `<Esc>`, `gf` or `<C-o>` go back.
 
   ![The same file whole, its changed lines marked in the gutter](docs/screenshots/whole-file.png)
 
