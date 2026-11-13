@@ -1,18 +1,128 @@
 //! The Heatmap: the text of an Assessment, each window voight scored shaded by the share of it an LLM wrote (see
 //! `CONTEXT.md`).
 
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use wcgw_kit::doc;
 
 use crate::assessment::Window;
 use crate::drawn::Finder;
-use crate::theme::Theme;
 
-/// Shades `lines`, which draw `text`, by `windows` of it, in `theme`'s heatmap styles; text outside them, like code,
-/// stays as it is. Nothing is shaded if `windows` aren't of `text`.
+/// How the Heatmap shades text: the styles of text voight scored 0% (`human`), 50% (`even`) and 100% (`llm`), as the
+/// highlight groups `VoightHeatHuman`, `VoightHeatEven` and `VoightHeatLlm` say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Heat {
+    pub human: Style,
+    pub even: Style,
+    pub llm: Style,
+}
+
+impl Heat {
+    /// The style of text that voight scored `share`, between 0 and 1: `human` at 0, `even` at 0.5 and `llm` at 1. In
+    /// between, the nearer one's, with a background blended from both's when they're RGB colors.
+    pub fn style(&self, share: f64) -> Style {
+        let share = share.clamp(0.0, 1.0);
+        let (from, to, toward) = if share < 0.5 {
+            (self.human, self.even, share * 2.0)
+        } else {
+            (self.even, self.llm, share * 2.0 - 1.0)
+        };
+        let nearer = if toward < 0.5 { from } else { to };
+        let (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) = (from.bg, to.bg) else {
+            return nearer;
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rounded, between two `u8`s"
+        )]
+        let blend =
+            |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * toward).round() as u8;
+        nearer.bg(Color::Rgb(blend(r0, r1), blend(g0, g1), blend(b0, b1)))
+    }
+}
+
+/// Shades `lines`, which draw `text`, by `windows` of it, in `heat`'s styles; text outside them, like code, stays as
+/// it is. Nothing is shaded if `windows` aren't of `text`.
 ///
 /// What each line draws is found in `text` in order, span by span. What isn't found nearby, like a list's markers or
 /// a table's borders, is shaded as the text before it on its line, or else as the text after it.
-pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], theme: &Theme) {
+pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], heat: &Heat) {
+    shade_spans(
+        lines.iter_mut().map(|line| &mut line.spans),
+        text,
+        windows,
+        heat,
+    );
+}
+
+/// As [`shade`], for a kit buffer's `lines`: what's cut keeps its group and its target.
+pub fn shade_doc<T: Clone>(
+    lines: &mut [doc::Line<T>],
+    text: &str,
+    windows: &[Window],
+    heat: &Heat,
+) {
+    shade_spans(
+        lines.iter_mut().filter_map(|line| match line {
+            doc::Line::Text(spans) => Some(spans),
+            doc::Line::Image { .. } => None,
+        }),
+        text,
+        windows,
+        heat,
+    );
+}
+
+/// A span of a line, as shading cuts and colours it.
+trait Piece: Sized {
+    /// Its text.
+    fn content(&self) -> &str;
+    /// The same span, of `content` instead.
+    fn with_content(&self, content: String) -> Self;
+    /// The same span, in `style` over its own.
+    fn patched(self, style: Style) -> Self;
+}
+
+impl Piece for Span<'static> {
+    fn content(&self) -> &str {
+        &self.content
+    }
+
+    fn with_content(&self, content: String) -> Self {
+        Span::styled(content, self.style)
+    }
+
+    fn patched(self, style: Style) -> Self {
+        self.patch_style(style)
+    }
+}
+
+impl<T: Clone> Piece for doc::Span<T> {
+    fn content(&self) -> &str {
+        &self.text
+    }
+
+    fn with_content(&self, content: String) -> Self {
+        Self {
+            text: content,
+            ..self.clone()
+        }
+    }
+
+    fn patched(self, style: Style) -> Self {
+        let own = self.style.unwrap_or_default().patch(style);
+        self.with_style(own)
+    }
+}
+
+/// Shades the spans of each line of `lines`, as [`shade`] says.
+fn shade_spans<'l, P: Piece + 'l>(
+    lines: impl Iterator<Item = &'l mut Vec<P>>,
+    text: &str,
+    windows: &[Window],
+    heat: &Heat,
+) {
     if windows.is_empty()
         || windows
             .iter()
@@ -21,20 +131,20 @@ pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], theme:
         return;
     }
     let mut finder = Finder::new(text);
-    for line in lines {
+    for spans in lines {
         finder.next_line();
-        let mut pieces = Vec::with_capacity(line.spans.len());
-        for span in line.spans.drain(..) {
-            match finder.find(&span.content) {
+        let mut pieces = Vec::with_capacity(spans.len());
+        for span in spans.drain(..) {
+            match finder.find(span.content()) {
                 Some(start) => cut(span, start, windows, &mut pieces),
                 None => pieces.push((span, Place::Added)),
             }
         }
         place_added(&mut pieces);
-        line.spans = pieces
+        *spans = pieces
             .into_iter()
             .map(|(span, place)| match place {
-                Place::Found(Some(share)) => span.patch_style(theme.heat(share)),
+                Place::Found(Some(share)) => span.patched(heat.style(share)),
                 Place::Found(None) | Place::Added => span,
             })
             .collect();
@@ -52,13 +162,8 @@ enum Place {
 
 /// Pushes `span`, found at `start` in the text, onto `pieces`: cut where `windows` start or end in it, each piece placed
 /// in its window, if any.
-fn cut(
-    span: Span<'static>,
-    start: usize,
-    windows: &[Window],
-    pieces: &mut Vec<(Span<'static>, Place)>,
-) {
-    let end = start + span.content.len();
+fn cut<P: Piece>(span: P, start: usize, windows: &[Window], pieces: &mut Vec<(P, Place)>) {
+    let end = start + span.content().len();
     let mut from = start;
     while from < end {
         let next = windows.partition_point(|window| window.range.end <= from);
@@ -74,15 +179,15 @@ fn cut(
             return;
         }
         // The windows are of the text, so they start and end between characters.
-        let piece = span.content[from - start..to - start].to_owned();
-        pieces.push((Span::styled(piece, span.style), Place::Found(share)));
+        let piece = span.content()[from - start..to - start].to_owned();
+        pieces.push((span.with_content(piece), Place::Found(share)));
         from = to;
     }
 }
 
 /// Places what the drawing added to a line as the piece found before it, or else after it; outside any window if
 /// nothing on the line was found.
-fn place_added(pieces: &mut [(Span<'static>, Place)]) {
+fn place_added<P>(pieces: &mut [(P, Place)]) {
     let mut before = None;
     for (_, place) in pieces.iter_mut() {
         match *place {
@@ -106,17 +211,14 @@ fn place_added(pieces: &mut [(Span<'static>, Place)]) {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Style};
-
     use super::*;
 
-    /// A theme whose heatmap tells apart text an LLM wrote none, half and all of.
-    fn theme() -> Theme {
-        Theme {
-            heatmap_human: Style::new().bg(Color::Green),
-            heatmap_even: Style::new().bg(Color::Yellow),
-            heatmap_llm: Style::new().bg(Color::Red),
-            ..Theme::default()
+    /// A Heatmap that tells apart text an LLM wrote none, half and all of.
+    fn theme() -> Heat {
+        Heat {
+            human: Style::new().bg(Color::Green),
+            even: Style::new().bg(Color::Yellow),
+            llm: Style::new().bg(Color::Red),
         }
     }
 
@@ -180,8 +282,8 @@ mod tests {
     fn shading_keeps_the_text_style_but_its_colors() {
         let text = "Bold words.";
         let mut lines = vec![Line::from(Span::styled(text, Style::new().blue().bold()))];
-        let theme = Theme {
-            heatmap_llm: Style::new().black().on_red(),
+        let theme = Heat {
+            llm: Style::new().black().on_red(),
             ..theme()
         };
 
@@ -352,5 +454,23 @@ mod tests {
         let mut alone = vec![(Span::raw("───"), Place::Added)];
         place_added(&mut alone);
         assert_eq!(alone[0].1, Place::Found(None), "a table's border line");
+    }
+
+    #[test]
+    fn heat_blends_between_its_colors() {
+        let heat = Heat {
+            human: Style::new().bg(Color::Rgb(0, 200, 0)),
+            even: Style::new().bg(Color::Rgb(200, 200, 0)),
+            llm: Style::new().bg(Color::Rgb(200, 0, 0)),
+        };
+
+        assert_eq!(heat.style(0.0).bg, Some(Color::Rgb(0, 200, 0)));
+        assert_eq!(heat.style(0.25).bg, Some(Color::Rgb(100, 200, 0)));
+        assert_eq!(heat.style(1.0).bg, Some(Color::Rgb(200, 0, 0)));
+        assert_eq!(
+            theme().style(0.3).bg,
+            Some(Color::Yellow),
+            "the nearer, unblended"
+        );
     }
 }

@@ -1,0 +1,51 @@
+# ghd runs on wcgw-kit
+
+ghd, devnull, muttrs and slackers each hand-rolled their terminal loop, keys, command line, themes and chrome, and
+drifted apart. [wcgw-kit](https://github.com/wcgw/wcgw-kit) gives them one Neovim look & feel (its `docs/plan.md`,
+D1–D20): it owns the loop, keys and motions, `:` commands, windows, chrome, colorschemes, pictures and the mouse; an
+application owns its domain and shows it as the kit's buffers, windows, commands and statusline segments. ghd moves
+onto it (the plan's M7).
+
+What goes, for the kit's: ghd's key `match`, `Command` enum, command line and its history, help popup, panes and
+their scrollbars, border badges, `Scrolled`, the Files screen's own search, `themes/*.toml` and `theme.rs`, the
+Search (`search.rs`), and tui-markdown. What stays ghd's: the GitHub client, the Inbox, Filters (ADR 0001), inferring
+Done (ADR 0002), the cache, Previews, Changed files, Assessments.
+
+How ghd's screen became the kit's:
+
+- Each View is a listed buffer, named with how many it shows are unread, a block per Notification, its columns laid out
+  by ghd for its window's width (`nowrap`), so the cursor stays on its Notification as the Inbox changes; the kit
+  draws the Notification at the cursor as `CursorLine`.
+- The Preview is a window below the list, its buffer the Preview of the Notification at the list's cursor: its body
+  and each comment a block, `]]` and `[[` between them, opening on the comment the Notification is about. It shows
+  all of them, where ghd showed one at a time and stepped with `J` and `K`.
+- The Files screen shows the list of Changed files in the list's window and the file at its cursor below, from its
+  top for another file, as before.
+- Every action is an ex command with a default key (the kit's D12: Vim's motions stay Vim's), so `:map` reaches
+  anything. The Search becomes `:filter`, a Filter typed for the moment; looking for text is the kit's `/`.
+- Markdown is laid out by `wcgw-kit-text`, after GitHub's rules (`markdown::as_github_shows`); code is highlighted in
+  the standard syntax groups, links refer to their address for `:open`, and the Heatmap shades spans.
+- Colours are highlight groups (`Ghd*`, `VoightHeat*`) linked to standard ones, with ghd's own colours for
+  `tokyonight-moon` and the ANSI `default` scheme, as its two themes had them.
+- `config.toml` keeps what ghd shows; how it looks and its keys go to the kit's `init.vim`.
+- voight's thread is voight's shared `Assessor`; ghd keeps which text an Assessment is of and those made.
+
+## Considered Options
+
+- **Keep ghd's own UI**: no churn, but the four apps go on drifting, and ghd keeps its own command line, history,
+  help and themes to maintain.
+- **Use the kit's widgets only, keeping ghd's loop**: the kit's D1 rejects it: the feel is in the dispatch, which
+  would drift again.
+
+## Consequences
+
+- Keys change where Vim has them: `e` is `a`, `f` is `gf`, `w` is `<leader>w`, `Space` is `x`, `Tab` and `1`–`9`
+  are `gt` and `<leader>1`–`9`, `r` is `<C-l>`, `H` is `<leader>h`, `?` is `:help`, `o` and `Enter` are `<CR>` and
+  `gX`. `q` closes a window, quitting from the last. `a` and `x` are muttrs': `x` selects, and `a` takes out of the
+  Inbox, archiving there and marking Done here, which leaves `s` to star or flag as in devnull and muttrs.
+- Filtering is `<leader>ff`, as every app finds its own with `<leader>ff`: `<leader>f` is the kit's find prefix, as
+  fzf-lua's in the author's Neovim (`<leader>fb` buffers, `<leader>fh` help, …).
+- The kit runs until the user quits, then gives ghd back: `main` waits for the changes GitHub hasn't answered (10 s at
+  most) and keeps the Inbox for next time, after the terminal is restored.
+- A buffer shared by two windows of different widths, as a View in a `:vsplit`, is laid out for the first: it wraps
+  in a narrower one.

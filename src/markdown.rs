@@ -1,45 +1,122 @@
-//! Markdown as GitHub users write it, drawn for the terminal in a theme's styles.
+//! Markdown as GitHub users write it, drawn as lines of a kit buffer: laid out by `wcgw-kit-text`, in the
+//! colorscheme's groups, with GitHub's own rules applied first (see [`as_github_shows`]), its code highlighted, its
+//! links made something `:open` follows, and voight's Heatmap shading it.
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options as ParseOptions, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options as ParseOptions, Parser, Tag, TagEnd};
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use tui_markdown::{AlertKind, Options, StyleSheet};
+use ratatui::text::Line;
+use wcgw_kit::doc;
+use wcgw_kit::hl::Theme;
+use wcgw_kit_text::{CellSize, Options, Styles};
 
 use crate::assessment::Window;
 use crate::drawn::Finder;
-use crate::heatmap;
-use crate::syntax;
-use crate::theme::Theme;
+use crate::heatmap::{self, Heat};
+use crate::syntax::{self, Class};
 
-/// The lines `markdown` draws in `theme`, its tables fitted to `width` cells, as the Heatmap of `heat`: the windows of
-/// an Assessment of the text [`as_github_shows`] makes of it; none for no Heatmap. Code blocks in a language ghd knows
-/// are highlighted.
+/// How Markdown is drawn: the styles of its parts, of its code by class, and of the Heatmap, as the colorscheme
+/// gives them.
+#[derive(Debug, Clone)]
+pub struct Look {
+    pub styles: Styles,
+    /// The style of each class of code, over the code's own.
+    pub code: Vec<(Class, Style)>,
+    pub heat: Heat,
+}
+
+impl Look {
+    /// The look `theme` gives, `heat` the Heatmap's styles.
+    pub fn of(theme: &Theme, heat: Heat) -> Self {
+        Self {
+            styles: wcgw_kit_text::kit::styles(theme, None),
+            code: Class::all()
+                .map(|class| (class, theme.style(class.group())))
+                .collect(),
+            heat,
+        }
+    }
+
+    /// The style of code of `class`.
+    fn code_style(&self, class: Class) -> Style {
+        self.code
+            .iter()
+            .find(|(of, _)| *of == class)
+            .map_or_else(Style::default, |(_, style)| *style)
+    }
+}
+
+/// Markdown drawn: its lines, and for each the line of the Markdown it draws, if it draws one: not if it only lays
+/// out what's drawn, like a blank line between paragraphs, or a table's borders.
+#[derive(Debug)]
+pub struct Drawing<T> {
+    pub lines: Vec<doc::Line<T>>,
+    pub sources: Vec<Option<usize>>,
+}
+
+/// `markdown` drawn in `look`, `width` cells wide, as the Heatmap of `heat`: the windows of an Assessment of the text
+/// [`as_github_shows`] makes of it; none for no Heatmap. Code blocks in a language ghd knows are highlighted, and a
+/// link's text and number refer to what `link` makes of its address.
 ///
 /// As github.com shows issues, pull requests and comments, a new line within a paragraph breaks the line. HTML outside
 /// code is rewritten, as a terminal can't draw it: comments are dropped, `<br>` breaks the line, `<img>` shows its
 /// description, and any other tag is dropped for its text, so a `<details>` block shows open, its `<summary>` on a
 /// line of its own.
-pub fn lines(markdown: &str, theme: &Theme, width: u16, heat: &[Window]) -> Vec<Line<'static>> {
-    draw(&as_github_shows(markdown), theme, width, heat)
-}
-
-/// The [`lines`] `markdown` draws, each with the index of the line of `markdown` it draws, if it draws one: not if it
-/// only lays out what's drawn, like a blank line between paragraphs, or a table's borders.
-pub fn lines_with_sources(
+pub fn draw<T: Clone>(
     markdown: &str,
-    theme: &Theme,
+    look: &Look,
     width: u16,
     heat: &[Window],
-) -> Vec<(Line<'static>, Option<usize>)> {
+    link: impl Fn(&str) -> T,
+) -> Drawing<T> {
     let rewritten = Rewritten::of(markdown);
+    let mut document = wcgw_kit_text::Document::markdown(&rewritten.text, &look.styles);
+    document.highlight_code(|language, code| highlighted(language?, code, look));
+    let rendering = document.render(&Options {
+        width,
+        cell: CellSize::default(),
+        pixel_ratio: 1.0,
+        max_picture_rows: 0,
+        pictures: &[],
+    });
+    let sources = sources(&rendering.lines, &rewritten, markdown);
+    let mut lines = wcgw_kit_text::kit::linked_lines(
+        &document,
+        &rendering,
+        |_| String::new(),
+        |_, found| Some(link(&found.url)),
+    );
+    // After the links, found by the styles shading changes.
+    heatmap::shade_doc(&mut lines, &rewritten.text, heat, &look.heat);
+    Drawing { lines, sources }
+}
+
+/// `code`, in `language`, in pieces, each in its class's style if ghd knows the language; `None` otherwise.
+fn highlighted(language: &str, code: &str, look: &Look) -> Option<Vec<(String, Style)>> {
+    let classes = syntax::highlight(language, code)?;
+    let mut pieces = Vec::new();
+    for (index, line) in code.split('\n').enumerate() {
+        if index > 0 {
+            pieces.push(("\n".to_owned(), Style::default()));
+        }
+        let line_classes = classes.get(index).map_or(&[][..], Vec::as_slice);
+        for (text, class) in syntax::pieces(line, line_classes) {
+            let style = class.map_or_else(Style::default, |class| look.code_style(class));
+            pieces.push((text.to_owned(), style));
+        }
+    }
+    Some(pieces)
+}
+
+/// The line of `markdown` each of `lines`, which draw `rewritten`, draws, if it draws one.
+fn sources(lines: &[Line<'static>], rewritten: &Rewritten, markdown: &str) -> Vec<Option<usize>> {
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(markdown.match_indices('\n').map(|(at, _)| at + 1))
         .collect();
     let mut finder = Finder::new(&rewritten.text);
-    draw(&rewritten.text, theme, width, heat)
-        .into_iter()
+    lines
+        .iter()
         .map(|line| {
             finder.next_line();
             let mut first = None;
@@ -49,108 +126,12 @@ pub fn lines_with_sources(
                     first.get_or_insert(start);
                 }
             }
-            let source = first.map(|start| {
+            first.map(|start| {
                 let at = rewritten.source_of(start);
                 line_starts.partition_point(|&line_start| line_start <= at) - 1
-            });
-            (line, source)
+            })
         })
         .collect()
-}
-
-/// The lines `markdown`, as [`as_github_shows`] makes it, draws: see [`lines`].
-fn draw(markdown: &str, theme: &Theme, width: u16, heat: &[Window]) -> Vec<Line<'static>> {
-    let options = Options::new(Styles(*theme)).table_width(width);
-    let mut lines: Vec<Line<'static>> = tui_markdown::from_str_with_options(markdown, &options)
-        .lines
-        .into_iter()
-        .map(|line| Line {
-            spans: line
-                .spans
-                .into_iter()
-                .map(|span| Span::styled(span.content.into_owned(), span.style))
-                .collect(),
-            ..line
-        })
-        .collect();
-    highlight_code(&mut lines, markdown, theme);
-    heatmap::shade(&mut lines, markdown, heat, theme);
-    lines
-}
-
-/// Highlights the code blocks of `markdown` in a language ghd knows, in `lines`, which draw it.
-///
-/// `tui-markdown` draws a code block as its fence, ```` ``` ```` and the block's info string, on a line of its own,
-/// then each line of its code as the last span of a line, whatever comes before it in a quote; that's where the
-/// highlighted code goes. A block not drawn so is left as it is.
-fn highlight_code(lines: &mut [Line<'static>], markdown: &str, theme: &Theme) {
-    let mut at = 0;
-    for block in code_blocks(markdown) {
-        let fence = format!("```{}", block.info);
-        let Some(fence_at) =
-            (at..lines.len()).find(|&index| last_text(&lines[index]) == Some(&fence))
-        else {
-            return;
-        };
-        let code_at = fence_at + 1;
-        // The next block's fence is looked for past this one's code, where a line can look like a fence.
-        at = code_at + block.code.lines().count();
-        let language = block.info.split_whitespace().next().unwrap_or_default();
-        let Some(highlighted) = syntax::highlight(language, &block.code) else {
-            continue;
-        };
-        let Some(drawn) = lines.get_mut(code_at..at) else {
-            continue;
-        };
-        if !drawn
-            .iter()
-            .zip(block.code.lines())
-            .all(|(line, code)| last_text(line) == Some(code.trim_end_matches('\r')))
-        {
-            continue;
-        }
-        for (line, classes) in drawn.iter_mut().zip(highlighted.iter()) {
-            let code = line.spans.pop().expect("the code drawn");
-            line.spans
-                .extend(syntax::spans(&code.content, classes, code.style, theme));
-        }
-    }
-}
-
-/// A fenced code block.
-struct CodeBlock {
-    /// What follows its opening fence: its language, and maybe more.
-    info: String,
-    code: String,
-}
-
-/// The fenced code blocks of `markdown`, in order.
-fn code_blocks(markdown: &str) -> Vec<CodeBlock> {
-    let mut blocks = Vec::new();
-    let mut open: Option<CodeBlock> = None;
-    for event in Parser::new_ext(markdown, parse_options()) {
-        match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-                open = Some(CodeBlock {
-                    info: info.into_string(),
-                    code: String::new(),
-                });
-            }
-            Event::Text(text) => {
-                if let Some(block) = &mut open {
-                    block.code.push_str(&text);
-                }
-            }
-            Event::End(TagEnd::CodeBlock) => blocks.extend(open.take()),
-            _ => {}
-        }
-    }
-    blocks
-}
-
-/// The text of the last span of `line`; `None` if it has none.
-fn last_text<'l>(line: &'l Line) -> Option<&'l str> {
-    line.spans.last().map(|span| span.content.as_ref())
 }
 
 /// Whether `markdown` mentions `handle`, a login (`octocat`) or a team (`github/docs`), as GitHub notifies for:
@@ -241,20 +222,12 @@ impl Rewritten {
     }
 }
 
-/// The Markdown extensions `tui-markdown` 0.3 parses with, which decide what's HTML, code or a paragraph: the
-/// rewriting must see the same.
+/// The Markdown extensions `wcgw-kit-text` parses with, which decide what's HTML, code or a paragraph: the rewriting
+/// must see the same.
 fn parse_options() -> ParseOptions {
-    ParseOptions::ENABLE_STRIKETHROUGH
+    ParseOptions::ENABLE_TABLES
+        | ParseOptions::ENABLE_STRIKETHROUGH
         | ParseOptions::ENABLE_TASKLISTS
-        | ParseOptions::ENABLE_HEADING_ATTRIBUTES
-        | ParseOptions::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | ParseOptions::ENABLE_SUPERSCRIPT
-        | ParseOptions::ENABLE_SUBSCRIPT
-        | ParseOptions::ENABLE_MATH
-        | ParseOptions::ENABLE_FOOTNOTES
-        | ParseOptions::ENABLE_DEFINITION_LIST
-        | ParseOptions::ENABLE_GFM
-        | ParseOptions::ENABLE_TABLES
 }
 
 /// `html` as text: comments dropped, `<br>` as `line_break`, `<img>` as `[img]` and its description, the end of a
@@ -347,147 +320,59 @@ fn attribute<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
     None
 }
 
-/// A theme, as `tui-markdown` asks for styles. Every style comes from the theme, so that a theme of the terminal's
-/// own colors stays that way.
-#[derive(Debug, Clone, Copy)]
-struct Styles(Theme);
-
-impl StyleSheet for Styles {
-    fn heading(&self, _level: u8) -> Style {
-        self.0.markdown_heading
-    }
-
-    fn code(&self) -> Style {
-        self.0.markdown_code
-    }
-
-    fn link(&self) -> Style {
-        self.0.markdown_link
-    }
-
-    fn blockquote(&self) -> Style {
-        self.0.markdown_quote
-    }
-
-    fn heading_meta(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn metadata_block(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn html(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn math_inline(&self) -> Style {
-        self.0.markdown_code
-    }
-
-    fn math_display(&self) -> Style {
-        self.0.markdown_code
-    }
-
-    fn footnote_ref(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn footnote_def(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn definition_term(&self) -> Style {
-        self.0.markdown_heading
-    }
-
-    fn definition_description(&self) -> Style {
-        Style::new()
-    }
-
-    fn alert(&self, _kind: AlertKind) -> Style {
-        self.0.markdown_quote
-    }
-
-    /// None: the emoji `tui-markdown` has are two cells wide in some terminals, one in others.
-    fn alert_icon(&self, _kind: AlertKind) -> &'static str {
-        ""
-    }
-
-    fn table_header(&self) -> Style {
-        self.0.markdown_heading
-    }
-
-    fn table_cell(&self) -> Style {
-        Style::new()
-    }
-
-    fn table_border(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn list_marker(&self) -> Style {
-        self.0.markdown_muted
-    }
-
-    fn image_alt(&self) -> Style {
-        self.0.markdown_muted
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::style::Color;
+    use wcgw_kit::hl::Group;
 
     use super::*;
 
+    fn look() -> Look {
+        Look::of(&Theme::new(), Heat::default())
+    }
+
+    /// The text of each line `markdown` draws, 60 cells wide.
     fn text(markdown: &str) -> Vec<String> {
-        lines(markdown, &Theme::default(), 60, &[])
+        lines_of(&draw(markdown, &look(), 60, &[], str::to_owned).lines)
+    }
+
+    fn lines_of(lines: &[doc::Line<String>]) -> Vec<String> {
+        lines
             .iter()
-            .map(ToString::to_string)
+            .map(|line| match line {
+                doc::Line::Text(spans) => spans.iter().map(|span| span.text.as_str()).collect(),
+                doc::Line::Image { .. } => "[picture]".to_owned(),
+            })
             .collect()
+    }
+
+    /// The spans of `lines`.
+    fn spans(lines: &[doc::Line<String>]) -> impl Iterator<Item = &doc::Span<String>> {
+        lines.iter().flat_map(|line| match line {
+            doc::Line::Text(spans) => spans.as_slice(),
+            doc::Line::Image { .. } => &[],
+        })
     }
 
     #[test]
     fn comments_are_dropped() {
         let shown = text("Fixes it.\n\n<!-- Describe your change -->\n\nAnd <!-- this --> that.");
 
-        assert!(
-            !shown.iter().any(|line| line.contains("Describe")),
-            "{shown:#?}"
-        );
-        assert!(shown.contains(&"Fixes it.".to_owned()), "{shown:#?}");
-        assert!(shown.contains(&"And  that.".to_owned()), "{shown:#?}");
-    }
-
-    #[test]
-    fn comment_across_lines_is_dropped() {
-        let shown = text("<!--\nThanks for\ncontributing!\n-->\nBody");
-
-        assert!(
-            !shown.iter().any(|line| line.contains("contributing")),
-            "{shown:#?}"
-        );
-        assert!(shown.iter().any(|line| line.contains("Body")), "{shown:#?}");
+        assert_eq!(shown, ["Fixes it.", "", "And that."]);
+        assert_eq!(text("<!--\nThanks for\ncontributing!\n-->\nBody"), ["Body"]);
     }
 
     #[test]
     fn details_show_open_with_their_summary() {
         let shown = text("<details>\n<summary>Logs</summary>\n\nIt failed.\n\n</details>");
 
-        assert!(shown.contains(&"Logs".to_owned()), "{shown:#?}");
-        assert!(shown.contains(&"It failed.".to_owned()), "{shown:#?}");
-        assert!(!shown.iter().any(|line| line.contains('<')), "{shown:#?}");
+        assert_eq!(shown, ["Logs", "", "It failed."]);
     }
 
     #[test]
     fn new_line_breaks_the_line_as_on_github() {
         assert_eq!(text("one\ntwo"), ["one", "two"]);
-        assert_eq!(
-            text("```\na\nb\n```"),
-            ["```", "a", "b", "```"],
-            "code as it is"
-        );
+        assert_eq!(text("```\na\nb\n```"), ["a", "b"], "code as it is");
     }
 
     #[test]
@@ -512,150 +397,193 @@ mod tests {
     fn code_is_never_rewritten() {
         let shown = text("Use `<br>` here.\n\n```\nVec<T> <!-- kept -->\n```");
 
-        assert!(shown.contains(&"Use <br> here.".to_owned()), "{shown:#?}");
-        assert!(
-            shown
-                .iter()
-                .any(|line| line.contains("Vec<T> <!-- kept -->")),
-            "{shown:#?}"
-        );
+        assert_eq!(shown, ["Use <br> here.", "", "Vec<T> <!-- kept -->"]);
     }
 
     #[test]
-    fn markdown_is_drawn_in_the_theme() {
-        let theme = Theme {
-            markdown_heading: Style::new().fg(Color::Red),
-            markdown_code: Style::new().fg(Color::Green),
-            ..Theme::default()
-        };
+    fn markdown_is_drawn_in_the_colorschemes_groups() {
+        let theme = Theme::new();
+        let drawn = draw("# Title\n\nRun `ghd`.", &look(), 60, &[], str::to_owned);
 
-        let drawn = lines("# Title\n\nRun `ghd`.", &theme, 60, &[]);
-
-        // As drawn: the span's style over its line's.
         let style_of = |text: &str| {
-            drawn.iter().find_map(|line| {
-                let span = line.spans.iter().find(|span| span.content.contains(text))?;
-                Some(line.style.patch(span.style).fg)
-            })
+            spans(&drawn.lines)
+                .find(|span| span.text.contains(text))
+                .and_then(|span| span.style)
         };
-        assert_eq!(style_of("Title"), Some(Some(Color::Red)));
-        assert_eq!(style_of("ghd"), Some(Some(Color::Green)));
-    }
-
-    #[test]
-    fn code_in_a_known_language_is_highlighted() {
-        let theme = Theme {
-            markdown_code: Style::new().fg(Color::White),
-            syntax_keyword: Style::new().fg(Color::Magenta),
-            syntax_comment: Style::new().fg(Color::Gray),
-            ..Theme::default()
-        };
-        let markdown = "Code:\n\n```rust title=x\nlet a = 1; // one\n```\n\n> ```rust\n> fn f() {}\n> ```\n\n```nope\nlet b\n```\n";
-
-        let drawn = lines(markdown, &theme, 60, &[]);
-
-        // Each line's text, and the color of each span on it that isn't the code's own, as drawn.
-        let colored: Vec<(String, Vec<(String, Color)>)> = drawn
-            .iter()
-            .map(|line| {
-                let colors = line
-                    .spans
-                    .iter()
-                    .filter_map(|span| {
-                        let fg = line.style.patch(span.style).fg?;
-                        (fg != Color::White).then(|| (span.content.to_string(), fg))
-                    })
-                    .collect();
-                (line.to_string(), colors)
-            })
-            .collect();
-        let keyword = |text: &str| (text.to_owned(), Color::Magenta);
         assert_eq!(
-            colored,
-            [
-                ("Code:".to_owned(), vec![]),
-                (String::new(), vec![]),
-                ("```rust title=x".to_owned(), vec![]),
-                (
-                    "let a = 1; // one".to_owned(),
-                    vec![keyword("let"), ("// one".to_owned(), Color::Gray)]
-                ),
-                ("```".to_owned(), vec![]),
-                (String::new(), vec![]),
-                ("> ".to_owned(), vec![]),
-                ("> ```rust".to_owned(), vec![]),
-                ("> fn f() {}".to_owned(), vec![keyword("fn")]),
-                ("> ```".to_owned(), vec![]),
-                (String::new(), vec![]),
-                ("```nope".to_owned(), vec![]),
-                ("let b".to_owned(), vec![]),
-                ("```".to_owned(), vec![]),
-            ]
+            style_of("Title").and_then(|style| style.fg),
+            theme.style(Group::MARKUP_HEADING).fg
+        );
+        assert_eq!(
+            style_of("ghd").and_then(|style| style.fg),
+            theme.style(Group::MARKUP_RAW).fg
         );
     }
 
-    /// The color of each span of `lines` that isn't white, as drawn.
-    fn colored(lines: &[Line]) -> Vec<(String, Color)> {
-        lines
-            .iter()
-            .flat_map(|line| {
-                line.spans.iter().filter_map(move |span| {
-                    let fg = line.style.patch(span.style).fg?;
-                    (fg != Color::White).then(|| (span.content.to_string(), fg))
-                })
+    /// The pieces of `lines` in a colour of one of `groups`, with that group.
+    fn coloured<'d>(lines: &'d [doc::Line<String>], groups: &[Group]) -> Vec<(&'d str, Group)> {
+        let theme = Theme::new();
+        spans(lines)
+            .filter_map(|span| {
+                let fg = span.style.and_then(|style| style.fg);
+                let group = groups
+                    .iter()
+                    .find(|group| fg.is_some() && theme.style(**group).fg == fg)?;
+                Some((span.text.as_str(), *group))
             })
             .collect()
     }
 
     #[test]
-    fn every_block_is_highlighted_and_diffs_as_diffs() {
-        let theme = Theme {
-            markdown_code: Style::new().fg(Color::White),
-            syntax_keyword: Style::new().fg(Color::Magenta),
-            diff_added: Style::new().fg(Color::Green),
-            diff_removed: Style::new().fg(Color::Red),
-            ..Theme::default()
-        };
-        // The first block's code looks like the next's fence.
-        let markdown = "````text\n```rust\n````\n\n```rust\nlet a\n```\n\n```rust\nlet b\n```\n\n```diff\n-old\n+new\n```\n";
+    fn code_in_a_known_language_is_highlighted() {
+        let markdown = "Code:\n\n```rust title=x\nlet a = 1; // one\n```\n\n> ```rust\n> fn f() {}\n> ```\n\n```nope\nlet b\n```\n";
 
-        let drawn = lines(markdown, &theme, 60, &[]);
+        let drawn = draw(markdown, &look(), 60, &[], str::to_owned);
+
+        let groups = [
+            Group::KEYWORD,
+            Group::OPERATOR,
+            Group::CONSTANT,
+            Group::FUNCTION,
+        ];
+        assert_eq!(
+            coloured(&drawn.lines, &groups),
+            [
+                ("let", Group::KEYWORD),
+                ("=", Group::OPERATOR),
+                ("1", Group::CONSTANT),
+                ("fn", Group::KEYWORD),
+                ("f", Group::FUNCTION),
+            ]
+        );
+        assert!(
+            spans(&drawn.lines).any(|span| span.text == "// one"
+                && span.style.and_then(|style| style.fg) == Theme::new().style(Group::COMMENT).fg),
+            "comments too"
+        );
+        assert!(
+            lines_of(&drawn.lines).contains(&"let b".to_owned()),
+            "a language ghd doesn't know"
+        );
+    }
+
+    #[test]
+    fn code_too_wide_is_cut_and_stays_highlighted() {
+        let markdown = format!("```rust\nlet {} = 1;\n```\n", "a".repeat(70));
+
+        let drawn = draw(&markdown, &look(), 40, &[], str::to_owned);
+
+        assert!(drawn.lines.len() >= 2, "cut: {:?}", lines_of(&drawn.lines));
+        assert_eq!(
+            coloured(&drawn.lines, &[Group::KEYWORD]),
+            [("let", Group::KEYWORD)]
+        );
+        assert!(
+            !coloured(&drawn.lines, &[Group::CONSTANT]).is_empty(),
+            "past the cut"
+        );
+    }
+
+    #[test]
+    fn diffs_are_highlighted_as_diffs() {
+        let drawn = draw(
+            "```diff\n-old\n+new\n```\n",
+            &look(),
+            60,
+            &[],
+            str::to_owned,
+        );
 
         assert_eq!(
-            colored(&drawn),
+            coloured(&drawn.lines, &[Group::REMOVED, Group::ADDED]),
+            [("-old", Group::REMOVED), ("+new", Group::ADDED)]
+        );
+    }
+
+    #[test]
+    fn links_refer_to_their_address() {
+        let drawn = draw(
+            "See [the docs][docs] and [more](https://more.example).\n\n[docs]: https://example.com\n",
+            &look(),
+            60,
+            &[],
+            str::to_owned,
+        );
+
+        let targets: Vec<(&str, Option<&str>)> = spans(&drawn.lines)
+            .map(|span| (span.text.as_str(), span.target.as_deref()))
+            .collect();
+        assert_eq!(
+            targets,
             [
-                ("let".to_owned(), Color::Magenta),
-                ("let".to_owned(), Color::Magenta),
-                ("-old".to_owned(), Color::Red),
-                ("+new".to_owned(), Color::Green),
+                ("See ", None),
+                ("the docs", Some("https://example.com")),
+                ("[1]", Some("https://example.com")),
+                (" and ", None),
+                ("more", Some("https://more.example")),
+                ("[2]", Some("https://more.example")),
+                (".", None),
             ]
         );
     }
 
     #[test]
-    fn code_drawn_otherwise_is_left_as_it_is() {
-        let theme = Theme {
-            markdown_code: Style::new().fg(Color::White),
-            syntax_keyword: Style::new().fg(Color::Magenta),
-            ..Theme::default()
-        };
-        let mut drawn = vec![Line::from("```rust"), Line::from("let a, drawn otherwise")];
+    fn a_link_wrapped_across_lines_refers_to_its_address_whole() {
+        let drawn = draw(
+            "Read [the long guide to everything there is](https://guide.example).",
+            &look(),
+            30,
+            &[],
+            str::to_owned,
+        );
 
-        highlight_code(&mut drawn, "```rust\nlet a\n```\n", &theme);
-
+        let linked: Vec<&str> = spans(&drawn.lines)
+            .filter(|span| span.target.as_deref() == Some("https://guide.example"))
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(drawn.lines.len() >= 2, "{:?}", lines_of(&drawn.lines));
         assert_eq!(
-            drawn,
-            [Line::from("```rust"), Line::from("let a, drawn otherwise")]
+            linked.concat().replace(' ', ""),
+            "thelongguidetoeverythingthereis[1]"
         );
     }
 
     #[test]
-    fn heatmap_shades_the_text_where_it_is_drawn() {
-        let theme = Theme {
-            heatmap_human: Style::new().bg(Color::Green),
-            heatmap_llm: Style::new().bg(Color::Red),
-            ..Theme::default()
+    fn shading_keeps_links() {
+        let markdown = "See [the docs](https://docs.example) now.";
+        let assessed = as_github_shows(markdown);
+        let windows = [Window {
+            range: 0..assessed.len(),
+            share: 1.0,
+        }];
+        let heat = Heat {
+            llm: ratatui::style::Style::new().bg(Color::Red),
+            ..Heat::default()
         };
+
+        let drawn = draw(
+            markdown,
+            &Look { heat, ..look() },
+            60,
+            &windows,
+            str::to_owned,
+        );
+
+        let docs = spans(&drawn.lines)
+            .find(|span| span.text == "the docs")
+            .expect("the link's text");
+        assert_eq!(docs.target.as_deref(), Some("https://docs.example"));
+        assert_eq!(docs.style.and_then(|style| style.bg), Some(Color::Red));
+    }
+
+    #[test]
+    fn heatmap_shades_the_text_where_it_is_drawn() {
+        let heat = Heat {
+            human: ratatui::style::Style::new().bg(Color::Green),
+            even: ratatui::style::Style::new().bg(Color::Yellow),
+            llm: ratatui::style::Style::new().bg(Color::Red),
+        };
+        let look = Look { heat, ..look() };
         let markdown = "# Title\n\n- An item, and a [link](https://example.com).<br>Same item.\n\n```\ncode\n```\n\nThe end.\n";
         let assessed = as_github_shows(markdown);
         let window = |part: &str, share| {
@@ -665,7 +593,7 @@ mod tests {
                 share,
             }
         };
-        let heat = [
+        let windows = [
             window(
                 "# Title\n\n- An item, and a [link](https://example.com).",
                 1.0,
@@ -674,18 +602,21 @@ mod tests {
             window("The end.", 0.0),
         ];
 
-        let drawn = lines(markdown, &theme, 60, &heat);
+        let drawn = draw(markdown, &look, 60, &windows, str::to_owned);
 
-        // Each line's text, and the background of each span on it, as drawn.
         let shaded: Vec<(String, Vec<Option<Color>>)> = drawn
+            .lines
             .iter()
-            .map(|line| {
-                let bgs = line
-                    .spans
-                    .iter()
-                    .map(|span| line.style.patch(span.style).bg)
-                    .collect();
-                (line.to_string(), bgs)
+            .zip(lines_of(&drawn.lines))
+            .map(|(line, text)| {
+                let bgs = match line {
+                    doc::Line::Text(spans) => spans
+                        .iter()
+                        .map(|span| span.style.and_then(|style| style.bg))
+                        .collect(),
+                    doc::Line::Image { .. } => Vec::new(),
+                };
+                (text, bgs)
             })
             .collect();
         let red = Some(Color::Red);
@@ -693,17 +624,12 @@ mod tests {
         assert_eq!(
             shaded,
             [
-                ("# Title".to_owned(), vec![red, red]),
+                ("Title".to_owned(), vec![red]),
                 (String::new(), vec![]),
-                (
-                    "- An item, and a link (https://example.com).".to_owned(),
-                    vec![red; 7]
-                ),
-                ("Same item.".to_owned(), vec![green]),
+                ("• An item, and a link[1].".to_owned(), vec![red; 5]),
+                ("  Same item.".to_owned(), vec![green, green]),
                 (String::new(), vec![]),
-                ("```".to_owned(), vec![None]),
                 ("code".to_owned(), vec![None]),
-                ("```".to_owned(), vec![None]),
                 (String::new(), vec![]),
                 ("The end.".to_owned(), vec![green]),
             ]
@@ -731,51 +657,29 @@ mod tests {
 
     #[test]
     fn drawn_lines_know_the_lines_they_draw() {
-        let markdown = "# Title\n\n<!--\na comment\n-->\nOne,\ntwo.<br>Three.\n\n- item\n\n```rust\nlet a\n```\n\n| a |\n|---|\n| b |\n";
+        let markdown = "# Title\n\n<!--\na comment\n-->\nOne,\ntwo.<br>Three.\n\n- item\n\n```rust\nlet a\n```\n";
 
-        let drawn = lines_with_sources(markdown, &Theme::default(), 60, &[]);
+        let drawn = draw(markdown, &look(), 60, &[], str::to_owned);
 
-        let sources: Vec<(String, Option<usize>)> = drawn
-            .iter()
-            .map(|(line, source)| (line.to_string(), *source))
+        let sources: Vec<(String, Option<usize>)> = lines_of(&drawn.lines)
+            .into_iter()
+            .zip(drawn.sources)
             .collect();
         let line = |text: &str| markdown.lines().position(|line| line.starts_with(text));
         assert_eq!(
             sources,
             [
-                ("# Title".to_owned(), line("# Title")),
+                ("Title".to_owned(), line("# Title")),
                 (String::new(), None),
                 ("One,".to_owned(), line("One,")),
                 ("two.".to_owned(), line("two.")),
                 ("Three.".to_owned(), line("two.")),
                 (String::new(), None),
-                ("- item".to_owned(), line("- item")),
+                ("• item".to_owned(), line("- item")),
                 (String::new(), None),
-                ("```rust".to_owned(), line("```rust")),
                 ("let a".to_owned(), line("let a")),
-                ("```".to_owned(), None),
-                (String::new(), None),
-                ("┌───┐".to_owned(), None),
-                ("│ a │".to_owned(), line("| a |")),
-                ("├───┤".to_owned(), None),
-                ("│ b │".to_owned(), line("| b |")),
-                ("└───┘".to_owned(), None),
             ]
         );
-    }
-
-    #[test]
-    fn a_line_drawn_is_where_its_first_text_is() {
-        // The link's address is drawn on its line, and found where it's defined.
-        let markdown = "See [the docs][docs].\n\n[docs]: https://example.com\n";
-
-        let drawn = lines_with_sources(markdown, &Theme::default(), 60, &[]);
-
-        assert_eq!(
-            drawn[0].0.to_string(),
-            "See the docs (https://example.com)."
-        );
-        assert_eq!(drawn[0].1, Some(0));
     }
 
     #[test]
@@ -800,13 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn alerts_have_no_icon() {
-        let shown = text("> [!NOTE]\n> Mind the gap.");
-
-        assert!(shown.iter().any(|line| line.contains("Note")), "{shown:#?}");
-        assert!(
-            !shown.iter().any(|line| line.contains('\u{2139}')),
-            "{shown:#?}"
+    fn alerts_show_as_quotes() {
+        assert_eq!(
+            text("> [!NOTE]\n> Mind the gap."),
+            ["▎ [!NOTE]", "▎ Mind the gap."]
         );
     }
 }

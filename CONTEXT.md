@@ -41,19 +41,23 @@ A rule that a **Notification** either matches or doesn't; it has no name and is 
 _Avoid_: query, rule, search
 
 **Cursor**:
-The highlighted row of the **View** on screen: what a single action (open, mark read, mark **Done**) acts on when nothing is selected.
+The highlighted row of the **View** on screen, in the list's window: what a single action (open, mark read, mark **Done**) acts on when nothing is selected.
 _Avoid_: selection, current row
 
 **Selection**:
 The **Notifications** the user has marked to act on together; when there is one, actions act on all of it instead of the **Cursor**.
 _Avoid_: marked, picked, cursor
 
+**Narrowing**:
+A **Filter** the user types (`:filter`), for the moment, to narrow whichever **View** is on screen to the **Notifications** it matches; unlike a **View**'s, it isn't kept anywhere.
+_Avoid_: search, query
+
 **Search**:
-Text the user types, for the moment, to narrow the **View** on screen to the **Notifications** it matches; unlike a **Filter**, it matches parts of words and isn't kept anywhere.
-_Avoid_: filter, query, find
+Text looked for in a buffer with `/` or `?`, as in Vim: the cursor goes to it and it's highlighted; it narrows nothing.
+_Avoid_: filter, find
 
 **Preview**:
-What ghd shows of the **Subject** at the **Cursor** without opening it: a header (number, title, **State**, author, labels, and who merged or closed it), then the **Subject**'s body or one of its comments, which the user steps through. It opens where its **Reason** calls for: on the description for a review request or an assignment, or else on the comment the **Notification** is about, the latest published by the time of its activity, or the body before any. The comments that mention the user are marked as such, for a **Notification** about a mention. Showing it never clears **Unread** nor marks **Done**.
+What ghd shows of the **Subject** at the **Cursor** without opening it, in a window below the list: a header (number, title, **State**, author, labels, and who merged or closed it), then the **Subject**'s body and its comments, which the user steps through. It opens where its **Reason** calls for: on the description for a review request or an assignment, or else on the comment the **Notification** is about, the latest published by the time of its activity, or the body before any. The comments that mention the user are marked as such, for a **Notification** about a mention. Showing it never clears **Unread** nor marks **Done**.
 _Avoid_: details, peek
 
 **Changed file**:
@@ -61,7 +65,7 @@ A file a pull request adds, changes, renames, copies or removes; ghd shows a new
 _Avoid_: diff, patch, file change
 
 **Assessment**:
-voight's estimate, as a percentage, of how much of the text a **Preview** shows was written by an LLM; made only of text with enough prose to mean something. Never evidence of authorship.
+voight's estimate, as a percentage, of how much of a text a **Preview** shows (its body, or one comment) was written by an LLM; made only of text with enough prose to mean something. Never evidence of authorship.
 _Avoid_: score, AI detection, verdict
 
 **Heatmap**:
@@ -69,7 +73,7 @@ The text an **Assessment** is of, each window of prose voight scored on its own 
 _Avoid_: highlighting, heat
 
 **View**:
-A named tab, defined in configuration, that shows the **Inbox** **Notifications** matching its **Filter**.
+A named buffer, defined in configuration and shown in the tabline, that shows the **Inbox** **Notifications** matching its **Filter**.
 _Avoid_: folder, bucket, tab, filter
 
 ## Relationships
@@ -77,15 +81,15 @@ _Avoid_: folder, bucket, tab, filter
 - An **Inbox** belongs to exactly one **Account**
 - A **Notification** is about exactly one **Subject** and carries one **Reason**
 - A **Subject**'s **State** isn't part of its **Notification**: ghd looks it up apart, again whenever the **Notification** has new activity, and shows the last one it knows
-- A **Filter** or a **Search** can ask for a **State**; a **Notification** whose **State** isn't known matches none, only the negation of one
+- A **Filter** can ask for a **State**; a **Notification** whose **State** isn't known matches none, only the negation of one
 - GitHub's API doesn't say which **Notifications** are **Done**: ghd takes for **Done** those it marked **Done** itself (until they get new activity or are **Unread** again) and read ones GitHub has no read time for (see `docs/adr/0002-inferring-done.md`)
 - Bringing a **Notification** back from the **Done list** puts it in ghd's **Inbox** only: GitHub's API can't move a thread back to its inbox, so GitHub keeps it **Done**
 - Opening a **Notification** clears **Unread**; marking it **Done** removes it from the **Inbox** and so from every **View**
 - A **View** has exactly one **Filter**
 - There is always one built-in **View**, named "Inbox", that shows the whole **Inbox**; it comes first and can't be removed or redefined, and configured **Views** follow in config order
 - A **Notification** can appear in zero, one or many configured **Views** (and always in the Inbox **View**); Views do not claim Notifications from each other
-- There is one **Selection** at a time, across **Views** like the **Search**: it can hold **Notifications** the **View** on screen doesn't show, and an action acts on all of them
-- There is at most one **Search** at a time, and it narrows whichever **View** is on screen, so it follows the user from **View** to **View**
+- There is one **Selection** at a time, across **Views** like the **Narrowing**: it can hold **Notifications** the **View** on screen doesn't show, and an action acts on all of them
+- There is at most one **Narrowing** at a time, and it narrows whichever **View** is on screen, so it follows the user from **View** to **View**
 - Each **View** can be narrowed, for the moment, to its **Unread** **Notifications**, independently of the other **Views**; it doesn't narrow the **Done list**
 - **Unread** can only be cleared from ghd, never set again: GitHub's API has no way to mark a **Notification** unread
 
@@ -101,6 +105,5 @@ _Avoid_: folder, bucket, tab, filter
 - "Inbox" names both the set of not-Done **Notifications** and the built-in **View** that shows it. Resolved: **Inbox** is the set; say "the Inbox View" for the tab.
 - "read" and "done" are easy to conflate. Resolved: reading a **Notification** only clears **Unread**; only marking it **Done** removes it from the **Inbox**.
 - "selection" meant the highlighted row until several **Notifications** could be marked. Resolved: the highlighted row is the **Cursor**; the **Selection** is what's marked.
-- "search" could mean a **Filter** or a **Search**. Resolved: a **Filter** belongs to a **View** and is configured; a **Search** is typed, temporary, and narrows the **View** on screen.
-- "search" is also what `/` does on the Files screen: it looks for text in the **Changed file** shown and highlights it there. Resolved: that narrows nothing, so it's no **Search**; say "searching the file".
+- "search" could mean a **Filter**, a **Narrowing** or a **Search**. Resolved: a **Filter** belongs to a **View** and is configured; a **Narrowing** is a **Filter** typed, temporary, that narrows the **View** on screen; a **Search** looks for text in a buffer, the list, a **Preview** or a **Changed file**, and narrows nothing.
 - "filters/views" was used as if they were one concept. Resolved: a **Filter** is the matching rule, a **View** is the named tab in the TUI that applies one.

@@ -50,15 +50,6 @@ impl Preview {
             Place::Body => Shown::Body(&self.body),
         }
     }
-
-    /// The place after `place`: the next comment, the first after the body; `None` after the last.
-    pub fn after(&self, place: Place) -> Option<Place> {
-        let next = match place {
-            Place::Body => 0,
-            Place::Comment(index) => index + 1,
-        };
-        (next < self.comments.len()).then_some(Place::Comment(next))
-    }
 }
 
 /// A place in a Preview: the Subject's body, or one of its comments, by its index in [`Preview::comments`].
@@ -66,17 +57,6 @@ impl Preview {
 pub enum Place {
     Body,
     Comment(usize),
-}
-
-impl Place {
-    /// The place before this one: the previous comment, the body before the first; `None` before the body.
-    pub fn before(self) -> Option<Self> {
-        match self {
-            Self::Body => None,
-            Self::Comment(0) => Some(Self::Body),
-            Self::Comment(index) => Some(Self::Comment(index - 1)),
-        }
-    }
 }
 
 /// How a Subject came to be closed.
@@ -280,18 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn places_go_from_the_body_through_the_comments() {
+    fn places_are_the_body_and_the_comments() {
         let commented = Preview {
             comments: vec![comment("First"), comment("Second")],
             ..preview()
         };
 
-        assert_eq!(commented.after(Place::Body), Some(Place::Comment(0)));
-        assert_eq!(commented.after(Place::Comment(0)), Some(Place::Comment(1)));
-        assert_eq!(commented.after(Place::Comment(1)), None);
-        assert_eq!(Place::Comment(1).before(), Some(Place::Comment(0)));
-        assert_eq!(Place::Comment(0).before(), Some(Place::Body));
-        assert_eq!(Place::Body.before(), None);
         assert_eq!(
             commented.at(Place::Comment(1)),
             Shown::Comment(&commented.comments[1])
@@ -301,7 +275,6 @@ mod tests {
             Shown::Body(&commented.body),
             "a comment it doesn't have"
         );
-        assert_eq!(preview().after(Place::Body), None);
     }
 
     #[test]

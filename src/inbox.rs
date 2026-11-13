@@ -159,20 +159,6 @@ pub enum SubjectKind {
 }
 
 impl SubjectKind {
-    /// The kind's name, as in Filters' `is:` (`pull-request`, `check-suite`, …); a kind ghd doesn't know has the
-    /// API's name for it.
-    pub fn name(&self) -> &str {
-        match self {
-            Self::PullRequest => "pull-request",
-            Self::Issue => "issue",
-            Self::Release => "release",
-            Self::Discussion => "discussion",
-            Self::Commit => "commit",
-            Self::CheckSuite => "check-suite",
-            Self::Other(name) => name,
-        }
-    }
-
     /// The subject type as the API names it; [`SubjectKind::from_api`] maps it back.
     pub fn api_name(&self) -> &str {
         match self {

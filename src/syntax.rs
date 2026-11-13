@@ -1,4 +1,5 @@
-//! Syntax highlighting: what each piece of some code is, for a theme to color.
+//! Syntax highlighting: what each piece of some code is, for the colorscheme to color through the standard syntax
+//! groups (the plan's D7).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -6,14 +7,11 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
-use ratatui::style::Style;
-use ratatui::text::Span;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, StyleModifier, Theme, ThemeItem, ThemeSettings};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
-
-use crate::theme;
+use wcgw_kit::hl::Group;
 
 /// The most code highlighted at once. Highlighting takes about a millisecond for every 6 lines, and is done before the
 /// code is drawn.
@@ -87,6 +85,26 @@ impl Class {
     fn marked(marker: Color) -> Option<Self> {
         let at = usize::from(marker.r).checked_sub(1)?;
         Self::SCOPES.get(at).map(|(class, _)| *class)
+    }
+
+    /// Every class.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::SCOPES.iter().map(|&(class, _)| class)
+    }
+
+    /// The highlight group pieces of this class are drawn in: one of the standard syntax groups, or a diff's.
+    pub fn group(self) -> Group {
+        match self {
+            Self::Comment => Group::COMMENT,
+            Self::Keyword => Group::KEYWORD,
+            Self::String => Group::STRING,
+            Self::Constant => Group::CONSTANT,
+            Self::Function => Group::FUNCTION,
+            Self::Type => Group::TYPE,
+            Self::Operator => Group::OPERATOR,
+            Self::Inserted => Group::ADDED,
+            Self::Deleted => Group::REMOVED,
+        }
     }
 }
 
@@ -330,29 +348,27 @@ impl std::fmt::Debug for Highlighting {
     }
 }
 
-/// `line` as spans in `style`, those of its pieces of a class in that class's `theme` style over it.
-pub fn spans(
-    line: &str,
+/// `line` in pieces, each with its class if it has one, as `classes` say; empty pieces are left out.
+pub fn pieces<'l>(
+    line: &'l str,
     classes: &[(Range<usize>, Class)],
-    style: Style,
-    theme: &theme::Theme,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::with_capacity(classes.len() * 2 + 1);
+) -> Vec<(&'l str, Option<Class>)> {
+    let mut pieces = Vec::with_capacity(classes.len() * 2 + 1);
     let mut from = 0;
     for (range, class) in classes {
+        let Some(piece) = line.get(range.clone()) else {
+            continue;
+        };
         if from < range.start {
-            spans.push(Span::styled(line[from..range.start].to_owned(), style));
+            pieces.push((&line[from..range.start], None));
         }
-        spans.push(Span::styled(
-            line[range.clone()].to_owned(),
-            style.patch(theme.syntax(*class)),
-        ));
+        pieces.push((piece, Some(*class)));
         from = range.end;
     }
     if from < line.len() {
-        spans.push(Span::styled(line[from..].to_owned(), style));
+        pieces.push((&line[from..], None));
     }
-    spans
+    pieces
 }
 
 #[cfg(test)]
@@ -565,22 +581,21 @@ mod tests {
     }
 
     #[test]
-    fn spans_take_their_class_style_over_the_line_style() {
-        let theme = theme::Theme {
-            syntax_keyword: Style::new().fg(ratatui::style::Color::Magenta),
-            ..theme::Theme::default()
-        };
-        let base = Style::new().italic();
-
-        let spans = spans("let a", &[(0..3, Class::Keyword)], base, &theme);
+    fn pieces_are_cut_where_their_classes_are() {
+        let pieces = super::pieces(
+            "let a = 1",
+            &[(0..3, Class::Keyword), (8..9, Class::Constant)],
+        );
 
         assert_eq!(
-            spans,
+            pieces,
             [
-                Span::styled("let", base.fg(ratatui::style::Color::Magenta)),
-                Span::styled(" a", base),
+                ("let", Some(Class::Keyword)),
+                (" a = ", None),
+                ("1", Some(Class::Constant)),
             ]
         );
+        assert_eq!(Class::Keyword.group(), Group::KEYWORD);
     }
 
     #[test]
