@@ -16,7 +16,7 @@ const ARGUMENTS: [&str; 3] = ["heatmap", "on", "off"];
 pub(super) fn install(kit: &mut Kit) {
     kit.add_command(
         Command::<Ghd>::new("voight", 2, |ghd, kit, line| ghd.voight(kit, line.args))
-            .help("voight's Assessment; heatmap shows it on the text, on and off start and stop it")
+            .help("voight: alone, what it says; heatmap shows or hides the Heatmap; on and off start and stop it")
             .complete(|_, _, before, _| {
                 if before.is_empty() {
                     ARGUMENTS.map(str::to_owned).to_vec()
