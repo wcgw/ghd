@@ -1046,6 +1046,14 @@ impl App for Ghd {
         self.sync(kit)
     }
 
+    /// `:bd` (`<leader>bd`): a View stays, as config.toml says which there are; ghd lists no other buffer.
+    fn deleting(&mut self, _kit: &mut Kit, buffer: BufferId) -> Result<Effects, String> {
+        if self.views.iter().any(|view| view.buffer == buffer) {
+            return Err("A View stays: config.toml says which there are".to_owned());
+        }
+        Ok(Vec::new())
+    }
+
     fn keyed(&mut self, kit: &mut Kit) -> Effects {
         self.sync(kit)
     }
