@@ -5414,8 +5414,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voight"
-version = "0.1.0"
-source = "git+file:///home/alxs/src/github.com/wcgw/voight?branch=wcgw-kit#ae23138dd8ddb8561a96ec9b69978cc30f5a8e82"
+version = "0.2.0"
+source = "git+https://github.com/wcgw/voight?tag=v0.2.0#f10f6081d26ca40725d137b16b24381d8fda66f6"
 dependencies = [
  "anyhow",
  "candle-core 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",

@@ -22,8 +22,8 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-width = { version = "0.2", default-features = false }
-# voight's Assessor, on its `wcgw-kit` branch: the library isn't published, and the branch isn't pushed yet.
-voight = { git = "file:///home/alxs/src/github.com/wcgw/voight", branch = "wcgw-kit", default-features = false, optional = true }
+# voight's Assessor, at its release tag.
+voight = { git = "https://github.com/wcgw/voight", tag = "v0.2.0", default-features = false, optional = true }
 # The shared Neovim look & feel, and its rich text, at wcgw-kit's release tag (its D18).
 wcgw-kit = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.0" }
 wcgw-kit-text = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.0" }
