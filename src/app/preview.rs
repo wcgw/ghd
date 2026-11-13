@@ -302,9 +302,11 @@ impl Ghd {
     ) {
         let drawn = DrawnFor {
             preview: Some((notification.thread, notification.updated_at)),
+            // Prose, up to the kit's 'textwidth' (120), as every app lays it out.
             width: kit
                 .window_text_area(window)
-                .map_or(kit.size().0, |area| area.width),
+                .map_or(kit.size().0, |area| area.width)
+                .min(kit.prose_width(self.preview.buffer)),
             heat: self.heat_version,
         };
         if self.preview.drawn.as_ref() == Some(&drawn) {

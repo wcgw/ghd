@@ -185,6 +185,29 @@ fn markdown_is_rendered_its_code_highlighted_and_its_links_followed() {
 }
 
 #[test]
+fn the_preview_s_prose_is_laid_out_no_wider_than_textwidth() {
+    let mut app = previewing();
+    app.update(wcgw_kit::Msg::Resize {
+        width: 200,
+        height: 30,
+    });
+    let mut preview = polling();
+    preview.body = Body::Markdown("words ".repeat(80));
+    arrives_for(&mut app, preview);
+
+    let widest = rows(&app)
+        .iter()
+        .filter(|row| row.contains("words"))
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.trim_end()))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        (101..=120).contains(&widest),
+        "as wide as 'textwidth', 120, in a window of 200: {widest}"
+    );
+}
+
+#[test]
 fn gx_off_a_link_opens_the_comment_s_only_one_or_lists_them() {
     let mut app = previewing();
     let mut preview = polling();
