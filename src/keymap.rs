@@ -10,19 +10,13 @@ pub const TRIAGE: Topic = Topic::new(75, "Notifications");
 pub const VOIGHT: Topic = Topic::new(76, "voight");
 
 /// ghd's default bindings: keys, the ex command each runs, what which-key says of it, and its `:help` topic.
-const DEFAULTS: [(&str, &str, &str, Topic); 22] = [
+const DEFAULTS: [(&str, &str, &str, Topic); 21] = [
     ("gx", "browse link", "open link in browser", Topic::OPENING),
     ("gX", "browse", "open on GitHub", Topic::OPENING),
     ("gy", "yanklink", "yank its link", Topic::YANKING),
     ("gf", "files", "pull request's files", Topic::OPENING),
     ("p", "preview", "toggle the Preview", Topic::OPENING),
     ("<leader>w", "whole", "files whole or diffs", Topic::OPENING),
-    (
-        "<2-LeftMouse>",
-        "open",
-        "open under the mouse",
-        Topic::OPENING,
-    ),
     ("x", "done", "mark Done, or bring back", TRIAGE),
     ("I", "read", "mark read", TRIAGE),
     ("D", "donelist", "toggle the Done list", TRIAGE),
