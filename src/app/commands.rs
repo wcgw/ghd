@@ -1,10 +1,11 @@
 //! ghd's ex commands (the kit's D13): every action on Notifications has one, so `:map` can reach anything a key
 //! does, and `:help` lists them.
 
-use wcgw_kit::shell::Command;
+use wcgw_kit::shell::{Choice, Command, Pick, Picker};
 
 use super::{Effect, Effects, Ghd, Kit, Target};
 use crate::filter::{self, Filter};
+use crate::hl::Group;
 use crate::inbox::ThreadId;
 
 /// Adds ghd's commands to `kit`, with the shortest abbreviation Vim would accept for each.
@@ -79,13 +80,10 @@ pub(super) fn add(kit: &mut Kit) {
             .help("on the Files screen, files whole, or as their diffs again"),
         Command::<Ghd>::new("browse", 3, |ghd, kit, line| match line.args {
             "" => Ok(ghd.browse_subject(kit)),
-            "link" => match kit.target_under_cursor() {
-                Some(Target::Url(url)) => Ok(vec![Effect::OpenUrl(url)]),
-                _ => Err("No link under the cursor".to_owned()),
-            },
+            "link" => ghd.browse_link(kit),
             args => Err(format!("E475: Invalid argument: {args}")),
         })
-        .help("open on GitHub, which marks read; with link, the link under the cursor")
+        .help("open on GitHub, which marks read; with link, the link under the cursor, or one of the comment's")
         .complete(|_, _, before, _| {
             if before.is_empty() {
                 vec!["link".to_owned()]
@@ -119,6 +117,27 @@ pub(super) fn add(kit: &mut Kit) {
 /// that would match some of the Notifications the View on screen shows.
 fn complete_filter(ghd: &Ghd, _: &Kit, _: &[&str], word: &str) -> Vec<String> {
     filter::completions(word, &ghd.shown_with_states())
+}
+
+/// `urls` to pick one of to open, as `:browse link` lists a comment's; `<C-y>` yanks one instead, as in the other
+/// apps.
+fn links(urls: Vec<String>) -> Picker<Ghd> {
+    let choices = urls
+        .into_iter()
+        .map(|url| Choice {
+            label: vec![(url.clone(), Group::NORMAL_FLOAT)],
+            text: url.clone(),
+            pick: Pick::Target(Target::Url(url)),
+        })
+        .collect();
+    Picker::list("Links", choices, "No links").verb("<C-y>", "yank", |_, kit, pick| {
+        let Pick::Target(Target::Url(url)) = pick else {
+            return Vec::new();
+        };
+        kit.close_picker();
+        kit.info(format!("Yanked {url}"));
+        vec![Effect::Copy(url)]
+    })
 }
 
 impl Ghd {
@@ -206,6 +225,29 @@ impl Ghd {
             self.narrowing = None;
         }
         self.render_views(kit);
+    }
+
+    /// `:browse link` (`gx`): the link under the cursor, else one of what holds it, as a comment: the only one, or as
+    /// picked (`<C-y>` yanks one), as in the other apps.
+    fn browse_link(&mut self, kit: &mut Kit) -> Result<Effects, String> {
+        if let Some(Target::Url(url)) = kit.target_under_cursor() {
+            return Ok(vec![Effect::OpenUrl(url)]);
+        }
+        let urls: Vec<String> = kit
+            .targets_in_block_under_cursor()
+            .into_iter()
+            .filter_map(|target| match target {
+                Target::Url(url) => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+        match <[String; 1]>::try_from(urls) {
+            Ok([only]) => Ok(vec![Effect::OpenUrl(only)]),
+            Err(urls) if urls.is_empty() => {
+                Err("No link under the cursor, nor in what holds it".to_owned())
+            }
+            Err(urls) => Ok(kit.open_picker(self, links(urls))),
+        }
     }
 
     /// `:browse` (`gX`): the Subjects acted on in the browser, which marks them read; on the Files screen, the

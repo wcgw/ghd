@@ -185,6 +185,42 @@ fn markdown_is_rendered_its_code_highlighted_and_its_links_followed() {
 }
 
 #[test]
+fn gx_off_a_link_opens_the_comment_s_only_one_or_lists_them() {
+    let mut app = previewing();
+    let mut preview = polling();
+    preview.comments[0].body =
+        "See [one](https://one.example.com) and [two](https://two.example.com).".to_owned();
+    arrives_for(&mut app, preview);
+    app.press("<C-w>j");
+
+    // On the description's heading: its only link.
+    app.press("gg/Why<CR>");
+    assert_eq!(opened(&app.press("gx")), ["https://docs.example.com"]);
+    // On the comment's author: two to choose from.
+    app.press("/@hubot<CR>");
+    assert_eq!(opened(&app.press("gx")), Vec::<String>::new());
+    for text in [
+        "Links",
+        "https://one.example.com",
+        "https://two.example.com",
+    ] {
+        assert!(shows(&app, text), "{text}: {:#?}", rows(&app));
+    }
+    let effects = app.press("<C-y>");
+    assert!(
+        effects.contains(&Effect::Copy("https://one.example.com".to_owned())),
+        "{effects:?}"
+    );
+    // A Notification in the list has none.
+    app.press("<C-w>kgx");
+    assert!(
+        shows(&app, "No link under the cursor, nor in what holds it"),
+        "{:#?}",
+        rows(&app)
+    );
+}
+
+#[test]
 fn a_description_mentioning_you_says_so() {
     let mut app = previewing();
     arrives_for(
