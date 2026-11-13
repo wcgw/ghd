@@ -388,10 +388,10 @@ fn help_lists_ghds_keys_and_commands() {
 }
 
 #[test]
-fn leader_f_starts_typing_a_filter() {
+fn leader_ff_starts_typing_a_filter() {
     let mut app = app();
 
-    app.press("<leader>f");
+    app.press("<leader>ff");
 
     assert_eq!(cmdline(&app), ":filter");
     app.press("is:pr<CR>");

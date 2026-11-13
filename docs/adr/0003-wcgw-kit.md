@@ -43,6 +43,8 @@ How ghd's screen became the kit's:
   are `gt` and `<leader>1`–`9`, `r` is `<C-l>`, `H` is `<leader>h`, `?` is `:help`, `o` and `Enter` are `<CR>` and
   `gX`. `q` closes a window, quitting from the last. `a` and `x` are muttrs': `x` selects, and `a` takes out of the
   Inbox, archiving there and marking Done here, which leaves `s` to star or flag as in devnull and muttrs.
+- Filtering is `<leader>ff`, as every app finds its own with `<leader>ff`: `<leader>f` is the kit's find prefix, as
+  fzf-lua's in the author's Neovim (`<leader>fb` buffers, `<leader>fh` help, …).
 - The kit runs until the user quits, then gives ghd back: `main` waits for the changes GitHub hasn't answered (10 s at
   most) and keeps the Inbox for next time, after the terminal is restored.
 - A buffer shared by two windows of different widths, as a View in a `:vsplit`, is laid out for the first: it wraps

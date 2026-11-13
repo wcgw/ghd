@@ -118,7 +118,7 @@ them. ghd adds these, each running a command `:map` can rebind:
 | `u` | `:unreadonly` | show unread only, or all again |
 | `x` `A` | `:toggle` `:toggle!` | select or not, and move down; all shown, or none |
 | | `:select` `:unselect` *filter* | select, or unselect, what the [filter](#configuration) matches in the View; all shown, with no filter |
-| `<leader>f` | `:filter` *filter* | narrow whichever View is on screen to what the filter matches; all again, with no filter |
+| `<leader>ff` | `:filter` *filter* | narrow whichever View is on screen to what the filter matches; all again, with no filter |
 | `<Esc>` | `:clear` | clear the selection, or else the filter; leave the Files screen |
 | `p` | `:preview` | show or hide the Preview |
 | `gf` `<leader>w` | `:files` `:whole` | a pull request's files; files whole, or their diffs |

@@ -34,11 +34,17 @@ const DEFAULTS: [(&str, &str, &str, Topic); 21] = [
     ("<leader>9", "buffer 9", "View 9", Topic::BUFFERS),
 ];
 
-/// ghd's defaults that go on past a command: `x` selects and moves down, as muttrs' does, `<leader>f` starts typing a filter. Keys,
-/// the keys they stand for, what which-key says of them, and their `:help` topic.
+/// ghd's defaults that go on past a command: `x` selects and moves down, as muttrs' does; `<leader>ff` starts typing a
+/// filter, ghd's way to find, as every app finds its own with `<leader>ff`. Keys, the keys they stand for, what
+/// which-key says of them, and their `:help` topic.
 const KEYS: [(&str, &str, &str, Topic); 2] = [
     ("x", ":toggle<CR>j", "select or not, and down", TRIAGE),
-    ("<leader>f", ":filter<Space>", "filter the View", TRIAGE),
+    (
+        "<leader>ff",
+        ":filter<Space>",
+        "find: filter the View",
+        TRIAGE,
+    ),
 ];
 
 /// The kit's bindings and ghd's.
