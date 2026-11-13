@@ -33,7 +33,7 @@ impl SubjectState {
         Self::NotPlanned,
     ];
 
-    /// The State's name, as in theme files' `[styles.state]` and in the cache.
+    /// The State's name, as in the cache.
     pub fn name(self) -> &'static str {
         match self {
             Self::Open => "open",
@@ -42,14 +42,6 @@ impl SubjectState {
             Self::Closed => "closed",
             Self::Completed => "completed",
             Self::NotPlanned => "not_planned",
-        }
-    }
-
-    /// The State as it's typed in a Filter's `is:` and the Search's `state:`, hyphenated.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::NotPlanned => "not-planned",
-            state => state.name(),
         }
     }
 

@@ -10,7 +10,7 @@ use crate::inbox::{Inbox, Notification, ThreadId};
 
 /// A change to a Notification that is already on screen and on its way to GitHub. It holds the Notification as it
 /// was before the change, so the change can be undone if GitHub refuses it.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     MarkRead(Notification),
     MarkDone(Notification),

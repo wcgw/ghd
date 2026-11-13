@@ -1,19 +1,18 @@
 //! Assessments: voight's estimate of how much of the text a Preview shows was written by an LLM (see
 //! `CONTEXT.md`). Never evidence of authorship.
+//!
+//! voight's `Assessor` does the work, on a thread of its own (see [`start`]); what ghd keeps here is what its
+//! interface needs: which text an Assessment is of, and those made so far. The types voight speaks in are mirrored
+//! here, so that ghd's interface builds, and is tested, without voight too.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::inbox::{Listing, ThreadId};
 use crate::preview::Place;
-
-/// The fewest words of prose worth assessing: on fewer, voight's estimate means little.
-#[cfg(feature = "voight")]
-pub const MIN_WORDS: usize = 50;
 
 /// Where voight runs its model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,18 +79,15 @@ pub enum Part {
     File(String),
 }
 
-/// voight at work on a thread of its own: it loads the model, then assesses the texts it's given, one at a time,
-/// in order.
-#[derive(Debug)]
-pub struct Assessor {
-    texts: std::sync::mpsc::Sender<(Key, String)>,
-    events: UnboundedReceiver<Event>,
-}
-
 /// What voight has to say.
-#[derive(Debug)]
-// Built without voight, nothing says anything but the UI's tests; the UI still knows what it would hear.
-#[cfg_attr(not(feature = "voight"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(feature = "voight"),
+    allow(
+        dead_code,
+        reason = "built without voight, only the tests say anything"
+    )
+)]
 pub enum Event {
     /// The model is loaded. `fallback` says why it runs on the CPU rather than the device asked for, if it does.
     Loaded { fallback: Option<String> },
@@ -123,138 +119,48 @@ pub struct Window {
     pub share: f64,
 }
 
-impl Assessor {
-    /// Fetches voight's model and starts loading it on a thread of its own, to run on `device`. Fetching downloads
-    /// the model the first time (about 1.7 GB), showing voight's progress on stderr: call it before the terminal UI
-    /// takes over the screen. It returns at once otherwise; [`Event::Loaded`] or [`Event::Failed`] says how loading
-    /// went.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the model can't be fetched.
-    #[cfg(feature = "voight")]
-    pub async fn start(device: Device) -> anyhow::Result<Self> {
-        use anyhow::Context as _;
-
-        let model = voight::Model::Gradient;
-        let files = tokio::task::spawn_blocking(move || voight::ModelFiles::fetch(model))
-            .await
-            .context("fetching voight's model stopped")??;
-        let (texts, queued) = std::sync::mpsc::channel();
-        let (events_out, events) = tokio::sync::mpsc::unbounded_channel();
-        let worker_events = events_out.clone();
-        let spawned = std::thread::Builder::new()
-            .name("voight".to_owned())
-            .spawn(move || work(model, &files, device, &queued, &worker_events));
-        if let Err(error) = spawned {
-            // Only the receiver can be gone, and it's right here.
-            let _ = events_out.send(Event::Failed(format!(
-                "couldn't start a thread for voight: {error}"
-            )));
-        }
-        Ok(Self { texts, events })
-    }
-
-    /// Asks for the Assessment of `text`, to come as an [`Event::Assessed`] under `key`, after those asked for
-    /// before it.
-    pub fn assess(&self, key: Key, text: String) {
-        // Once voight's thread has stopped, its failure has been said: the text goes unassessed.
-        let _ = self.texts.send((key, text));
-    }
-
-    /// What voight says next; never `None` while it runs.
-    ///
-    /// # Cancel Safety
-    ///
-    /// Cancel safe: an event not taken stays for the next call.
-    pub async fn next(&mut self) -> Option<Event> {
-        self.events.recv().await
-    }
-}
-
-/// voight's thread: loads `model` from `files` onto `device`, then assesses the texts `queued`, until the UI is
-/// gone. Says how it goes on `events`.
+/// Starts voight's Assessor: fetches its model (downloading it the first time, about 1.7 GB, showing its progress
+/// on stderr: call it before the terminal UI takes the screen), then loads it on `device` on a thread of its own.
+/// `on_event` hears how loading went and every Assessment, on that thread.
+///
+/// # Errors
+///
+/// Fails if the model can't be fetched, or the thread started.
 #[cfg(feature = "voight")]
-fn work(
-    model: voight::Model,
-    files: &voight::ModelFiles,
+pub fn start(
     device: Device,
-    queued: &std::sync::mpsc::Receiver<(Key, String)>,
-    events: &tokio::sync::mpsc::UnboundedSender<Event>,
-) {
-    let (device, fallback) = match device {
-        Device::Cpu => (voight::Device::Cpu, None),
-        Device::Metal => opened(voight::Device::new_metal(0), "Metal"),
-        Device::Cuda => opened(voight::Device::new_cuda(0), "CUDA"),
-        // Only the fork of candle that voight builds on with wgpu has the backend.
-        #[cfg(feature = "wgpu")]
-        Device::Wgpu => opened(voight::Device::new_wgpu(0), "wgpu"),
-        #[cfg(not(feature = "wgpu"))]
-        Device::Wgpu => unreachable!("the configuration can't pick wgpu in a ghd built without it"),
+    on_event: impl Fn(Event) + Send + 'static,
+) -> anyhow::Result<voight::assessor::Assessor<Key>> {
+    use voight::assessor::{self, Processor};
+
+    let processor = match device {
+        Device::Cpu => Processor::Cpu,
+        Device::Metal => Processor::Metal,
+        Device::Cuda => Processor::Cuda,
+        Device::Wgpu => Processor::Wgpu,
     };
-    let detector = match voight::Detector::load(model, files, device) {
-        Ok(detector) => detector,
-        Err(error) => {
-            // The UI is gone if it can't be told: nothing more to do either way.
-            let _ = events.send(Event::Failed(format!("{error:#}")));
-            return;
-        }
-    };
-    if events.send(Event::Loaded { fallback }).is_err() {
-        return;
-    }
-    for (key, text) in queued {
-        let assessment = assess(&detector, &text).map_err(|error| format!("{error:#}"));
-        if events.send(Event::Assessed { key, assessment }).is_err() {
-            return;
-        }
-    }
-}
-
-/// The device `opening` opened, or the CPU, with why, if it failed: voight's own fallback.
-#[cfg(feature = "voight")]
-fn opened(
-    opening: Result<voight::Device, impl std::fmt::Display>,
-    name: &str,
-) -> (voight::Device, Option<String>) {
-    match opening {
-        Ok(device) => (device, None),
-        Err(error) => (
-            voight::Device::Cpu,
-            Some(format!(
-                "couldn't use {name} ({error}), so voight runs on the CPU"
-            )),
-        ),
-    }
-}
-
-/// The Assessment of `text` by `detector`; `None` if it has fewer than [`MIN_WORDS`] words of prose.
-#[cfg(feature = "voight")]
-fn assess(detector: &voight::Detector, text: &str) -> anyhow::Result<Option<Assessment>> {
-    if !worth_assessing(text) {
-        return Ok(None);
-    }
-    let report = detector.report(text)?;
-    Ok(Some(Assessment {
-        share: report.overall().value(),
-        windows: report
-            .windows()
-            .map(|(window, llm)| Window {
-                range: window.range.clone(),
-                share: llm.value(),
-            })
-            .collect(),
-    }))
-}
-
-/// Whether `text` has at least [`MIN_WORDS`] words of prose, as voight counts them: code doesn't count.
-#[cfg(feature = "voight")]
-fn worth_assessing(text: &str) -> bool {
-    voight::segments(text)
-        .iter()
-        .map(|segment| segment.words)
-        .sum::<usize>()
-        >= MIN_WORDS
+    assessor::Assessor::start(voight::Model::Gradient, processor, move |event| {
+        on_event(match event {
+            assessor::Event::Loaded { fallback } => Event::Loaded { fallback },
+            assessor::Event::Failed(why) => Event::Failed(why),
+            assessor::Event::Assessed { key, assessment } => Event::Assessed {
+                key,
+                assessment: assessment.map(|made| {
+                    made.map(|made| Assessment {
+                        share: made.share,
+                        windows: made
+                            .windows
+                            .into_iter()
+                            .map(|window| Window {
+                                range: window.range,
+                                share: window.share,
+                            })
+                            .collect(),
+                    })
+                }),
+            },
+        });
+    })
 }
 
 /// Where an Assessment stands.
@@ -448,16 +354,5 @@ mod tests {
 
         assert_eq!(assessments.get(&key(1)), Some(&Assessed::Assessing));
         assert_eq!(assessments.get(&key(2)), None);
-    }
-
-    #[cfg(feature = "voight")]
-    #[test]
-    fn only_enough_prose_is_worth_assessing() {
-        let words = |count: usize| vec!["word"; count].join(" ");
-        assert!(worth_assessing(&words(MIN_WORDS)));
-        assert!(!worth_assessing(&words(MIN_WORDS - 1)));
-        assert!(!worth_assessing("LGTM"));
-        let mostly_code = format!("{}\n\n```\n{}\n```\n", words(10), words(100));
-        assert!(!worth_assessing(&mostly_code), "code doesn't count");
     }
 }

@@ -1,18 +1,52 @@
 //! The Heatmap: the text of an Assessment, each window voight scored shaded by the share of it an LLM wrote (see
 //! `CONTEXT.md`).
 
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::assessment::Window;
 use crate::drawn::Finder;
-use crate::theme::Theme;
 
-/// Shades `lines`, which draw `text`, by `windows` of it, in `theme`'s heatmap styles; text outside them, like code,
-/// stays as it is. Nothing is shaded if `windows` aren't of `text`.
+/// How the Heatmap shades text: the styles of text voight scored 0% (`human`), 50% (`even`) and 100% (`llm`), as the
+/// highlight groups `VoightHeatHuman`, `VoightHeatEven` and `VoightHeatLlm` say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Heat {
+    pub human: Style,
+    pub even: Style,
+    pub llm: Style,
+}
+
+impl Heat {
+    /// The style of text that voight scored `share`, between 0 and 1: `human` at 0, `even` at 0.5 and `llm` at 1. In
+    /// between, the nearer one's, with a background blended from both's when they're RGB colors.
+    pub fn style(&self, share: f64) -> Style {
+        let share = share.clamp(0.0, 1.0);
+        let (from, to, toward) = if share < 0.5 {
+            (self.human, self.even, share * 2.0)
+        } else {
+            (self.even, self.llm, share * 2.0 - 1.0)
+        };
+        let nearer = if toward < 0.5 { from } else { to };
+        let (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) = (from.bg, to.bg) else {
+            return nearer;
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rounded, between two `u8`s"
+        )]
+        let blend =
+            |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * toward).round() as u8;
+        nearer.bg(Color::Rgb(blend(r0, r1), blend(g0, g1), blend(b0, b1)))
+    }
+}
+
+/// Shades `lines`, which draw `text`, by `windows` of it, in `heat`'s styles; text outside them, like code, stays as
+/// it is. Nothing is shaded if `windows` aren't of `text`.
 ///
 /// What each line draws is found in `text` in order, span by span. What isn't found nearby, like a list's markers or
 /// a table's borders, is shaded as the text before it on its line, or else as the text after it.
-pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], theme: &Theme) {
+pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], heat: &Heat) {
     if windows.is_empty()
         || windows
             .iter()
@@ -34,7 +68,7 @@ pub fn shade(lines: &mut [Line<'static>], text: &str, windows: &[Window], theme:
         line.spans = pieces
             .into_iter()
             .map(|(span, place)| match place {
-                Place::Found(Some(share)) => span.patch_style(theme.heat(share)),
+                Place::Found(Some(share)) => span.patch_style(heat.style(share)),
                 Place::Found(None) | Place::Added => span,
             })
             .collect();
@@ -106,17 +140,14 @@ fn place_added(pieces: &mut [(Span<'static>, Place)]) {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Style};
-
     use super::*;
 
-    /// A theme whose heatmap tells apart text an LLM wrote none, half and all of.
-    fn theme() -> Theme {
-        Theme {
-            heatmap_human: Style::new().bg(Color::Green),
-            heatmap_even: Style::new().bg(Color::Yellow),
-            heatmap_llm: Style::new().bg(Color::Red),
-            ..Theme::default()
+    /// A Heatmap that tells apart text an LLM wrote none, half and all of.
+    fn theme() -> Heat {
+        Heat {
+            human: Style::new().bg(Color::Green),
+            even: Style::new().bg(Color::Yellow),
+            llm: Style::new().bg(Color::Red),
         }
     }
 
@@ -180,8 +211,8 @@ mod tests {
     fn shading_keeps_the_text_style_but_its_colors() {
         let text = "Bold words.";
         let mut lines = vec![Line::from(Span::styled(text, Style::new().blue().bold()))];
-        let theme = Theme {
-            heatmap_llm: Style::new().black().on_red(),
+        let theme = Heat {
+            llm: Style::new().black().on_red(),
             ..theme()
         };
 
@@ -352,5 +383,23 @@ mod tests {
         let mut alone = vec![(Span::raw("───"), Place::Added)];
         place_added(&mut alone);
         assert_eq!(alone[0].1, Place::Found(None), "a table's border line");
+    }
+
+    #[test]
+    fn heat_blends_between_its_colors() {
+        let heat = Heat {
+            human: Style::new().bg(Color::Rgb(0, 200, 0)),
+            even: Style::new().bg(Color::Rgb(200, 200, 0)),
+            llm: Style::new().bg(Color::Rgb(200, 0, 0)),
+        };
+
+        assert_eq!(heat.style(0.0).bg, Some(Color::Rgb(0, 200, 0)));
+        assert_eq!(heat.style(0.25).bg, Some(Color::Rgb(100, 200, 0)));
+        assert_eq!(heat.style(1.0).bg, Some(Color::Rgb(200, 0, 0)));
+        assert_eq!(
+            theme().style(0.3).bg,
+            Some(Color::Yellow),
+            "the nearer, unblended"
+        );
     }
 }
