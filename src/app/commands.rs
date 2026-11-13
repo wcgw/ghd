@@ -40,7 +40,7 @@ pub(super) fn add(kit: &mut Kit) {
             Ok(effects)
         })
         .help("mark Done, or in the Done list, bring back to ghd's Inbox"),
-        Command::<Ghd>::new("read", 1, |ghd, kit, _| {
+        Command::<Ghd>::new("read", 3, |ghd, kit, _| {
             let targets = ghd.take_targets(kit);
             let effects = ghd.mark_read(targets);
             if effects.len() > 1 {

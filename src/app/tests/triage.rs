@@ -69,6 +69,19 @@ fn shift_i_marks_read_only_what_is_unread() {
 }
 
 #[test]
+fn read_takes_three_letters_not_one() {
+    let mut app = app();
+
+    assert!(sent(&app.press(":r<CR>")).is_empty());
+    assert!(
+        shows(&app, "E492: Not an editor command: r"),
+        "{:#?}",
+        rows(&app)
+    );
+    assert_eq!(sent(&app.press(":rea<CR>")).len(), 1);
+}
+
+#[test]
 fn refused_read_is_undone() {
     let mut app = app();
     let (id, change) = sent(&app.press("I")).remove(0);
