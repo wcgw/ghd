@@ -25,11 +25,11 @@ unicode-width = { version = "0.2", default-features = false }
 # voight's Assessor, at its release tag.
 voight = { git = "https://github.com/wcgw/voight", tag = "v0.2.0", default-features = false, optional = true }
 # The shared Neovim look & feel, and its rich text, at wcgw-kit's release tag (its D18).
-wcgw-kit = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.0" }
-wcgw-kit-text = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.0" }
+wcgw-kit = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.1" }
+wcgw-kit-text = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.1" }
 
 [dev-dependencies]
-wcgw-kit = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.0", features = ["testing"] }
+wcgw-kit = { git = "https://github.com/wcgw/wcgw-kit", tag = "v0.1.1", features = ["testing"] }
 wiremock = "0.6.5"
 
 [lints.rust]

@@ -267,6 +267,20 @@ fn states_are_looked_up_once_the_inbox_arrives() {
 }
 
 #[test]
+fn a_view_stays_through_bd_as_config_toml_says_which_there_are() {
+    let mut app = app();
+
+    app.press("<Space>bd");
+
+    assert!(
+        shows(&app, "A View stays: config.toml says which there are"),
+        "{:#?}",
+        rows(&app)
+    );
+    assert_eq!(rows(&app)[0], " Inbox (1)  Reviews (1)  Read (0)");
+}
+
+#[test]
 fn tabs_count_whats_unread_in_each_view_or_whats_done() {
     let mut app = app();
 
