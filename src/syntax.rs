@@ -87,6 +87,11 @@ impl Class {
         Self::SCOPES.get(at).map(|(class, _)| *class)
     }
 
+    /// Every class.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::SCOPES.iter().map(|&(class, _)| class)
+    }
+
     /// The highlight group pieces of this class are drawn in: one of the standard syntax groups, or a diff's.
     pub fn group(self) -> Group {
         match self {

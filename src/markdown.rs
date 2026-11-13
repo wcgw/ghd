@@ -1,10 +1,10 @@
 //! Markdown as GitHub users write it, drawn as lines of a kit buffer: laid out by `wcgw-kit-text`, in the
-//! colorscheme's groups, with GitHub's own rules applied first (see [`as_github_shows`]), then its code highlighted,
-//! its links made something `:open` follows, and voight's Heatmap shading it.
+//! colorscheme's groups, with GitHub's own rules applied first (see [`as_github_shows`]), its code highlighted, its
+//! links made something `:open` follows, and voight's Heatmap shading it.
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options as ParseOptions, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options as ParseOptions, Parser, Tag, TagEnd};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use wcgw_kit::doc;
@@ -16,10 +16,13 @@ use crate::drawn::Finder;
 use crate::heatmap::{self, Heat};
 use crate::syntax::{self, Class};
 
-/// How Markdown is drawn: the styles of its parts and of the Heatmap, as the colorscheme gives them.
+/// How Markdown is drawn: the styles of its parts, of its code by class, and of the Heatmap, as the colorscheme
+/// gives them.
 #[derive(Debug, Clone)]
 pub struct Look {
     pub styles: Styles,
+    /// The style of each class of code, over the code's own.
+    pub code: Vec<(Class, Style)>,
     pub heat: Heat,
 }
 
@@ -28,8 +31,19 @@ impl Look {
     pub fn of(theme: &Theme, heat: Heat) -> Self {
         Self {
             styles: wcgw_kit_text::kit::styles(theme, None),
+            code: Class::all()
+                .map(|class| (class, theme.style(class.group())))
+                .collect(),
             heat,
         }
+    }
+
+    /// The style of code of `class`.
+    fn code_style(&self, class: Class) -> Style {
+        self.code
+            .iter()
+            .find(|(of, _)| *of == class)
+            .map_or_else(Style::default, |(_, style)| *style)
     }
 }
 
@@ -57,7 +71,8 @@ pub fn draw<T>(
     link: impl Fn(&str) -> T,
 ) -> Drawing<T> {
     let rewritten = Rewritten::of(markdown);
-    let document = wcgw_kit_text::Document::markdown(&rewritten.text, &look.styles);
+    let mut document = wcgw_kit_text::Document::markdown(&rewritten.text, &look.styles);
+    document.highlight_code(|language, code| highlighted(language?, code, look));
     let mut lines = document
         .render(&Options {
             width,
@@ -68,19 +83,40 @@ pub fn draw<T>(
         })
         .lines;
     let sources = sources(&lines, &rewritten, markdown);
-    let links: Vec<String> = document
+    let urls: Vec<String> = document
         .links()
         .iter()
         .map(|link| link.url.clone())
         .collect();
-    let marks = marks(&lines, &rewritten.text, &links, &look.styles);
+    // Found by their styles, before the Heatmap changes them.
+    let links: Vec<Vec<(Range<usize>, String)>> = lines
+        .iter()
+        .map(|line| link_marks(line, &urls, &look.styles))
+        .collect();
     heatmap::shade(&mut lines, &rewritten.text, heat, &look.heat);
     let lines = lines
         .into_iter()
-        .zip(marks)
-        .map(|(line, marks)| kit_line(&line, &marks, &link))
+        .zip(links)
+        .map(|(line, links)| kit_line(&line, &links, &link))
         .collect();
     Drawing { lines, sources }
+}
+
+/// `code`, in `language`, in pieces, each in its class's style if ghd knows the language; `None` otherwise.
+fn highlighted(language: &str, code: &str, look: &Look) -> Option<Vec<(String, Style)>> {
+    let classes = syntax::highlight(language, code)?;
+    let mut pieces = Vec::new();
+    for (index, line) in code.split('\n').enumerate() {
+        if index > 0 {
+            pieces.push(("\n".to_owned(), Style::default()));
+        }
+        let line_classes = classes.get(index).map_or(&[][..], Vec::as_slice);
+        for (text, class) in syntax::pieces(line, line_classes) {
+            let style = class.map_or_else(Style::default, |class| look.code_style(class));
+            pieces.push((text.to_owned(), style));
+        }
+    }
+    Some(pieces)
 }
 
 /// The line of `markdown` each of `lines`, which draw `rewritten`, draws, if it draws one.
@@ -108,55 +144,8 @@ fn sources(lines: &[Line<'static>], rewritten: &Rewritten, markdown: &str) -> Ve
         .collect()
 }
 
-/// What parts of a drawn line are, by their byte ranges in its text: links, with their address, and code of a class.
-#[derive(Debug, Default)]
-struct Marks {
-    links: Vec<(Range<usize>, String)>,
-    code: Vec<(Range<usize>, Class)>,
-}
-
-/// The [`Marks`] of each of `lines`, which draw `markdown`, its links' addresses `links` by their number.
-fn marks(lines: &[Line<'static>], markdown: &str, links: &[String], styles: &Styles) -> Vec<Marks> {
-    let mut marks: Vec<Marks> = lines.iter().map(|_| Marks::default()).collect();
-    for (line, marks) in lines.iter().zip(&mut marks) {
-        marks.links = link_marks(line, links, styles);
-    }
-    let texts: Vec<String> = lines.iter().map(line_text).collect();
-    let mut at = 0;
-    for block in code_blocks(markdown) {
-        let code: Vec<String> = block
-            .code
-            .lines()
-            .map(|line| line.replace('\t', "    ").trim_end().to_owned())
-            .collect();
-        let Some(first) = (at..texts.len()).find(|&index| {
-            code.iter().enumerate().all(|(offset, code)| {
-                texts
-                    .get(index + offset)
-                    .is_some_and(|text| text.ends_with(code.as_str()))
-            })
-        }) else {
-            continue;
-        };
-        at = first + code.len();
-        let language = block.info.split_whitespace().next().unwrap_or_default();
-        let Some(highlighted) = syntax::highlight(language, &code.join("\n")) else {
-            continue;
-        };
-        for (offset, (code, classes)) in code.iter().zip(highlighted.iter()).enumerate() {
-            let index = first + offset;
-            let start = texts[index].len() - code.len();
-            marks[index].code = classes
-                .iter()
-                .map(|(range, class)| ((start + range.start)..(start + range.end), *class))
-                .collect();
-        }
-    }
-    marks
-}
-
-/// The links on `line`: each link's number, `[3]`, and its text just before it, with the address of `links` it
-/// numbers.
+/// The links on `line`, by their byte ranges in its text: each link's number, `[3]`, and its text just before it,
+/// with the address of `links` it numbers.
 fn link_marks(
     line: &Line<'static>,
     links: &[String],
@@ -184,27 +173,15 @@ fn link_marks(
     found
 }
 
-/// The text of `line`.
-fn line_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
-}
-
-/// `line` as a kit line, in its own colors, its parts as `marks` say: links referring to what `link` makes of their
-/// address, code in its class's group.
-fn kit_line<T>(line: &Line<'static>, marks: &Marks, link: &impl Fn(&str) -> T) -> doc::Line<T> {
-    let mut cuts: Vec<usize> = marks
-        .links
+/// `line` as a kit line, in its own colours, its `links` referring to what `link` makes of their address.
+fn kit_line<T>(
+    line: &Line<'static>,
+    links: &[(Range<usize>, String)],
+    link: &impl Fn(&str) -> T,
+) -> doc::Line<T> {
+    let mut cuts: Vec<usize> = links
         .iter()
         .flat_map(|(range, _)| [range.start, range.end])
-        .chain(
-            marks
-                .code
-                .iter()
-                .flat_map(|(range, _)| [range.start, range.end]),
-        )
         .collect();
     cuts.sort_unstable();
     let mut spans = Vec::with_capacity(line.spans.len());
@@ -224,67 +201,18 @@ fn kit_line<T>(line: &Line<'static>, marks: &Marks, link: &impl Fn(&str) -> T) -
             {
                 continue;
             }
-            spans.push(piece(&text[from - at..cut - at], from, style, marks, link));
+            let piece = doc::Span::new(&text[from - at..cut - at], Group::NORMAL).with_style(style);
+            spans.push(
+                match links.iter().find(|(range, _)| range.contains(&from)) {
+                    Some((_, url)) => piece.with_target(link(url)),
+                    None => piece,
+                },
+            );
             from = cut;
         }
         at = end;
     }
     doc::Line::Text(spans)
-}
-
-/// The piece `text` of a line, at `at` in its text, in `style` and as `marks` say it is.
-fn piece<T>(
-    text: &str,
-    at: usize,
-    style: Style,
-    marks: &Marks,
-    link: &impl Fn(&str) -> T,
-) -> doc::Span<T> {
-    let class = marks
-        .code
-        .iter()
-        .find(|(range, _)| range.contains(&at))
-        .map(|(_, class)| *class);
-    let span = match class {
-        // The class's color, over the rest of the code's style: its background, say.
-        Some(class) => doc::Span::new(text, class.group()).with_style(Style { fg: None, ..style }),
-        None => doc::Span::new(text, Group::NORMAL).with_style(style),
-    };
-    match marks.links.iter().find(|(range, _)| range.contains(&at)) {
-        Some((_, url)) => span.with_target(link(url)),
-        None => span,
-    }
-}
-
-/// A fenced code block.
-struct CodeBlock {
-    /// What follows its opening fence: its language, and maybe more.
-    info: String,
-    code: String,
-}
-
-/// The fenced code blocks of `markdown`, in order.
-fn code_blocks(markdown: &str) -> Vec<CodeBlock> {
-    let mut blocks = Vec::new();
-    let mut open: Option<CodeBlock> = None;
-    for event in Parser::new_ext(markdown, parse_options()) {
-        match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-                open = Some(CodeBlock {
-                    info: info.into_string(),
-                    code: String::new(),
-                });
-            }
-            Event::Text(text) => {
-                if let Some(block) = &mut open {
-                    block.code.push_str(&text);
-                }
-            }
-            Event::End(TagEnd::CodeBlock) => blocks.extend(open.take()),
-            _ => {}
-        }
-    }
-    blocks
 }
 
 /// Whether `markdown` mentions `handle`, a login (`octocat`) or a team (`github/docs`), as GitHub notifies for:
@@ -572,30 +500,67 @@ mod tests {
         );
     }
 
+    /// The pieces of `lines` in a colour of one of `groups`, with that group.
+    fn coloured<'d>(lines: &'d [doc::Line<String>], groups: &[Group]) -> Vec<(&'d str, Group)> {
+        let theme = Theme::new();
+        spans(lines)
+            .filter_map(|span| {
+                let fg = span.style.and_then(|style| style.fg);
+                let group = groups
+                    .iter()
+                    .find(|group| fg.is_some() && theme.style(**group).fg == fg)?;
+                Some((span.text.as_str(), *group))
+            })
+            .collect()
+    }
+
     #[test]
     fn code_in_a_known_language_is_highlighted() {
         let markdown = "Code:\n\n```rust title=x\nlet a = 1; // one\n```\n\n> ```rust\n> fn f() {}\n> ```\n\n```nope\nlet b\n```\n";
 
         let drawn = draw(markdown, &look(), 60, &[], str::to_owned);
 
-        let classed: Vec<(&str, Group)> = spans(&drawn.lines)
-            .filter(|span| span.group != Group::NORMAL)
-            .map(|span| (span.text.as_str(), span.group))
-            .collect();
+        let groups = [
+            Group::KEYWORD,
+            Group::OPERATOR,
+            Group::CONSTANT,
+            Group::FUNCTION,
+        ];
         assert_eq!(
-            classed,
+            coloured(&drawn.lines, &groups),
             [
                 ("let", Group::KEYWORD),
                 ("=", Group::OPERATOR),
                 ("1", Group::CONSTANT),
-                ("// one", Group::COMMENT),
                 ("fn", Group::KEYWORD),
                 ("f", Group::FUNCTION),
             ]
         );
         assert!(
+            spans(&drawn.lines).any(|span| span.text == "// one"
+                && span.style.and_then(|style| style.fg) == Theme::new().style(Group::COMMENT).fg),
+            "comments too"
+        );
+        assert!(
             lines_of(&drawn.lines).contains(&"let b".to_owned()),
             "a language ghd doesn't know"
+        );
+    }
+
+    #[test]
+    fn code_too_wide_is_cut_and_stays_highlighted() {
+        let markdown = format!("```rust\nlet {} = 1;\n```\n", "a".repeat(70));
+
+        let drawn = draw(&markdown, &look(), 40, &[], str::to_owned);
+
+        assert!(drawn.lines.len() >= 2, "cut: {:?}", lines_of(&drawn.lines));
+        assert_eq!(
+            coloured(&drawn.lines, &[Group::KEYWORD]),
+            [("let", Group::KEYWORD)]
+        );
+        assert!(
+            !coloured(&drawn.lines, &[Group::CONSTANT]).is_empty(),
+            "past the cut"
         );
     }
 
@@ -609,11 +574,10 @@ mod tests {
             str::to_owned,
         );
 
-        let classed: Vec<(&str, Group)> = spans(&drawn.lines)
-            .filter(|span| span.group != Group::NORMAL)
-            .map(|span| (span.text.as_str(), span.group))
-            .collect();
-        assert_eq!(classed, [("-old", Group::REMOVED), ("+new", Group::ADDED)]);
+        assert_eq!(
+            coloured(&drawn.lines, &[Group::REMOVED, Group::ADDED]),
+            [("-old", Group::REMOVED), ("+new", Group::ADDED)]
+        );
     }
 
     #[test]
