@@ -51,8 +51,8 @@ From a clone, with a recent stable Rust (ghd is in the 2024 edition):
 cargo install --locked --path .
 ```
 
-ghd builds against a checkout of [wcgw-kit](https://github.com/wcgw/wcgw-kit) beside its own (`../wcgw-kit`) until
-wcgw-kit is published. That builds voight in, running on the CPU. Add `--features cuda` to run it on an NVIDIA GPU (this needs the CUDA
+ghd builds against [wcgw-kit](https://github.com/wcgw/wcgw-kit) at its `v0.1.0` tag, which cargo fetches. That
+builds voight in, running on the CPU. Add `--features cuda` to run it on an NVIDIA GPU (this needs the CUDA
 toolkit's `nvcc`), `--features metal` on a Mac's GPU (on Apple silicon, voight builds with Metal anyway, unless with
 wgpu), or `--features wgpu` on any other GPU, Intel or AMD say, through Vulkan on Linux. wgpu is experimental:
 candle's wgpu backend is unreleased, so voight builds on [a fork](https://github.com/huggingface/candle/pull/3379). Or
