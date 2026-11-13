@@ -72,7 +72,7 @@ fn shift_i_marks_read_only_what_is_unread() {
 fn read_takes_three_letters_not_one() {
     let mut app = app();
 
-    assert!(sent(&app.press(":r<CR>")).is_empty());
+    assert_eq!(sent(&app.press(":r<CR>")).len(), 0);
     assert!(
         shows(&app, "E492: Not an editor command: r"),
         "{:#?}",
